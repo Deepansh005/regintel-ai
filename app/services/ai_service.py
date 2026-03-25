@@ -3,6 +3,47 @@ from app.core.config import GROQ_API_KEY
 
 client = Groq(api_key=GROQ_API_KEY)
 
+def analyze_impact(changes: str) -> dict:
+    try:
+        prompt = f"""
+You are a financial regulatory expert.
+
+Based on the regulatory changes below, analyze business impact.
+
+Return ONLY JSON:
+
+{{
+  "impact": {{
+    "departments": ["list of departments"],
+    "systems": ["list of systems"],
+    "risk_level": "Low | Medium | High",
+    "summary": "short explanation"
+  }}
+}}
+
+CHANGES:
+{changes}
+"""
+
+        print("📊 Analyzing impact...")
+
+        response = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0
+        )
+
+        content = response.choices[0].message.content
+
+        import json
+        try:
+            return json.loads(content)
+        except:
+            return {"raw": content}
+
+    except Exception as e:
+        return {"error": str(e)}
+
 
 def detect_changes(old_text: str, new_text: str) -> dict:
     try:

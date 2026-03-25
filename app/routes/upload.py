@@ -3,7 +3,8 @@ import os
 import shutil
 
 from app.services.pdf_service import extract_text_from_pdf
-from app.services.ai_service import detect_changes  
+from app.services.ai_service import detect_changes, analyze_impact 
+
 
 router = APIRouter()
 
@@ -31,10 +32,15 @@ async def upload_documents(
         new_text = extract_text_from_pdf(new_path)
 
         #  CALL AI
+        # Detect change 
         changes = detect_changes(old_text, new_text)
+        # Impact analaysis
+        impact = analyze_impact(str(changes))
+
 
         return {
-            "changes": changes
+            "changes": changes,
+            "impact": impact
         }
 
     except Exception as e:

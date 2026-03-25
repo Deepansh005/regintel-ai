@@ -1,22 +1,24 @@
-export default function ChangeCard({ type, items }) {
+export default function ChangeCard({ title, items, color }) {
   const colorMap = {
-    added: "bg-green-100 text-green-700",
-    removed: "bg-red-100 text-red-700",
-    modified: "bg-yellow-100 text-yellow-700",
+    green: "text-green-600",
+    red: "text-red-600",
+    yellow: "text-yellow-600",
   };
 
   return (
-    <div className="p-4 rounded-xl shadow bg-white">
-      <h3 className={`inline-block px-3 py-1 rounded ${colorMap[type]}`}>
-        {type.toUpperCase()}
+    <div className="mb-4">
+      <h3 className={`font-semibold ${colorMap[color]}`}>
+        {title}
       </h3>
 
-      <ul className="mt-3 space-y-2">
-        {items?.map((item, index) => (
-          <li key={index} className="border p-2 rounded">
-            {item}
-          </li>
-        ))}
+      <ul className="mt-2 space-y-1 text-sm text-gray-600">
+        {items?.length > 0 ? (
+          items.map((item, i) => (
+            <li key={i}>• {item.summary || item}</li>
+          ))
+        ) : (
+          <li>No data</li>
+        )}
       </ul>
     </div>
   );

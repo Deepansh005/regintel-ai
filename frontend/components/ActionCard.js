@@ -1,19 +1,13 @@
 export default function ActionCard({ action }) {
-  // Extract values safely from your backend structure
-  const title = action?.step || "No title";
-  const description = action?.description || "No description available";
-
   return (
-    <div className="p-5 rounded-2xl shadow-md bg-white border border-gray-100 hover:shadow-lg transition-all">
-      
-      {/* Title */}
-      <h3 className="text-lg font-semibold text-gray-800">
-        {title}
+    <div className="bg-blue-50 border border-blue-200 p-4 rounded-lg">
+
+      <h3 className="font-semibold text-blue-700">
+        {action.step}
       </h3>
 
-      {/* Description */}
-      <p className="text-sm text-gray-600 mt-2">
-        {description}
+      <p className="text-sm text-gray-600 mt-1">
+        {action.description}
       </p>
 
     </div>

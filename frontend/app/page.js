@@ -2,8 +2,12 @@
 
 import { useState } from "react";
 import { uploadDocuments } from "../services/api";
+import { useRouter } from "next/navigation";
+
+
 
 export default function Home() {
+  const router = useRouter();
   const [oldFile, setOldFile] = useState(null);
   const [newFile, setNewFile] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -19,8 +23,8 @@ export default function Home() {
     try {
       const data = await uploadDocuments(oldFile, newFile);
 
-      localStorage.setItem("result", JSON.stringify(data));
-      window.location.href = "/dashboard";
+      localStorage.setItem("analysisData", JSON.stringify(data));
+      router.push("/dashboard");
     } catch (err) {
       console.error(err);
       alert("Error uploading files");

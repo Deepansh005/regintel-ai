@@ -1,3 +1,5 @@
+import "../styles/globals.css";
+
 export const metadata = {
   title: "RegIntel AI",
   description: "AI-powered regulatory analysis",

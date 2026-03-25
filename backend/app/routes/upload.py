@@ -14,18 +14,18 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 @router.post("/upload-documents")
 async def upload_documents(
-    old_doc: UploadFile = File(...),
-    new_doc: UploadFile = File(...)
+    old_file: UploadFile = File(...),
+    new_file: UploadFile = File(...)
 ):
     try:
-        old_path = os.path.join(UPLOAD_DIR, old_doc.filename)
-        new_path = os.path.join(UPLOAD_DIR, new_doc.filename)
+        old_path = os.path.join(UPLOAD_DIR, old_file.filename)
+        new_path = os.path.join(UPLOAD_DIR, new_file.filename)
 
         with open(old_path, "wb") as buffer:
-            shutil.copyfileobj(old_doc.file, buffer)
+            shutil.copyfileobj(old_file.file, buffer)
 
         with open(new_path, "wb") as buffer:
-            shutil.copyfileobj(new_doc.file, buffer)
+            shutil.copyfileobj(new_file.file, buffer)
 
         #  Extract text
         old_text = extract_text_from_pdf(old_path)

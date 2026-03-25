@@ -1,6 +1,22 @@
+# Environment variables
 .env
-venv/
-__pycache__/
-*.py[cod]
-*.pyo
-*.pyd
+.env.local
+.env.*.local
+
+# IDE & Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+*.iml
+
+# OS
+Thumbs.db
+.AppleDouble
+.LSOverride
+
+# Project-specific ignores
+uploads/
+.venv/

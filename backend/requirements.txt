@@ -4,3 +4,4 @@ python-dotenv
 python-multipart
 pdfplumber
 groq
+chromadb

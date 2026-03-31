@@ -8,6 +8,7 @@ from fastapi import HTTPException
 from db.database import create_task
 from app.services.task_worker import process_task
 from db.database import get_all_tasks
+from app.services.pdf_service import compute_file_hash
 
 router = APIRouter()
 
@@ -56,6 +57,11 @@ async def upload_documents(
     with open(policy_path, "wb") as buffer:
         shutil.copyfileobj(policy_file.file, buffer)
 
+    # Compute content hashes to detect same file uploaded across sections.
+    old_hash = compute_file_hash(old_path)
+    new_hash = compute_file_hash(new_path)
+    policy_hash = compute_file_hash(policy_path)
+
     # ✅ 3. Create DB task
     create_task(task_id)
 
@@ -67,7 +73,12 @@ async def upload_documents(
             "old": old_path,
             "new": new_path,
             "policy": policy_path
-        }
+        },
+        {
+            "old": old_hash,
+            "new": new_hash,
+            "policy": policy_hash,
+        },
     )
 
     # ✅ 5. Instant response

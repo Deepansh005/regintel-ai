@@ -1,5 +1,6 @@
 import fitz  # PyMuPDF
 import logging
+import hashlib
 
 logger = logging.getLogger(__name__)
 
@@ -98,3 +99,14 @@ def clean_markdown(text: str) -> str:
         cleaned_lines.append(line)
 
     return "\n".join(cleaned_lines)
+
+
+def compute_file_hash(file_path: str) -> str:
+    """
+    Compute SHA256 hash for a file.
+    """
+    hasher = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()

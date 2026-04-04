@@ -5,3 +5,6 @@ python-multipart
 groq
 chromadb
 pymupdf4llm
+langchain
+langchain-community
+sentence-transformers

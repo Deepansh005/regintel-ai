@@ -1,5 +1,5 @@
 from fastapi import FastAPI
-from app.routes import upload
+from app.routes import upload, report
 from fastapi.middleware.cors import CORSMiddleware
 from db.database import init_db
 
@@ -19,6 +19,7 @@ app.add_middleware(
 
 # Include routes
 app.include_router(upload.router)
+app.include_router(report.router)
 
 
 

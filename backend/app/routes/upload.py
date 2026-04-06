@@ -1,13 +1,10 @@
 import os
 import uuid
 import shutil
-from fastapi import APIRouter, UploadFile, File, BackgroundTasks
-from db.database import get_task
-from fastapi import HTTPException
-
-from db.database import create_task
+from fastapi import APIRouter, UploadFile, File, BackgroundTasks, Form, HTTPException
+from typing import Optional
+from db.database import get_task, create_task, get_all_tasks
 from app.services.task_worker import process_task
-from db.database import get_all_tasks
 
 router = APIRouter()
 
@@ -31,46 +28,40 @@ def get_status(task_id: str):
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-
 @router.post("/upload-documents")
 async def upload_documents(
     background_tasks: BackgroundTasks,
-    old_file: UploadFile = File(...),
-    new_file: UploadFile = File(...),
-    policy_file: UploadFile = File(...)
+    mode: str = Form("all"),
+    old_file: Optional[UploadFile] = File(None),
+    new_file: Optional[UploadFile] = File(None),
+    policy_file: Optional[UploadFile] = File(None)
 ):
-    # ✅ 1. Generate task_id
     task_id = str(uuid.uuid4())
+    file_paths = {}
 
-    # ✅ 2. Save files
-    old_path = os.path.join(UPLOAD_DIR, f"{task_id}_old.pdf")
-    new_path = os.path.join(UPLOAD_DIR, f"{task_id}_new.pdf")
-    policy_path = os.path.join(UPLOAD_DIR, f"{task_id}_policy.pdf")
+    if old_file and old_file.filename:
+        path = os.path.join(UPLOAD_DIR, f"{task_id}_old.pdf")
+        with open(path, "wb") as buffer:
+            shutil.copyfileobj(old_file.file, buffer)
+        file_paths["old"] = path
 
-    with open(old_path, "wb") as buffer:
-        shutil.copyfileobj(old_file.file, buffer)
+    if new_file and new_file.filename:
+        path = os.path.join(UPLOAD_DIR, f"{task_id}_new.pdf")
+        with open(path, "wb") as buffer:
+            shutil.copyfileobj(new_file.file, buffer)
+        file_paths["new"] = path
 
-    with open(new_path, "wb") as buffer:
-        shutil.copyfileobj(new_file.file, buffer)
+    if policy_file and policy_file.filename:
+        path = os.path.join(UPLOAD_DIR, f"{task_id}_policy.pdf")
+        with open(path, "wb") as buffer:
+            shutil.copyfileobj(policy_file.file, buffer)
+        file_paths["policy"] = path
 
-    with open(policy_path, "wb") as buffer:
-        shutil.copyfileobj(policy_file.file, buffer)
+    file_paths["mode"] = mode
 
-    # ✅ 3. Create DB task
     create_task(task_id)
+    background_tasks.add_task(process_task, task_id, file_paths)
 
-    # ✅ 4. Start background task
-    background_tasks.add_task(
-        process_task,
-        task_id,
-        {
-            "old": old_path,
-            "new": new_path,
-            "policy": policy_path
-        }
-    )
-
-    # ✅ 5. Instant response
     return {
         "task_id": task_id,
         "status": "processing"

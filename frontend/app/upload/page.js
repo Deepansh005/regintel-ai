@@ -4,7 +4,7 @@ import { useState, useEffect } from "react";
 import { uploadDocuments } from "../../services/api";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
-import { Shield, Upload, FileText, CheckCircle2, AlertCircle, Loader2, LogOut, ArrowRight, FileCheck, Building2, User, Search, Bell } from "lucide-react";
+import { Shield, Upload, FileText, CheckCircle2, AlertCircle, Loader2, LogOut, ArrowRight, FileCheck, Building2, User, Search, Bell, Clock } from "lucide-react";
 
 export default function UploadPage() {
     const router = useRouter();
@@ -14,13 +14,19 @@ export default function UploadPage() {
     const [loading, setLoading] = useState(false);
     const [user, setUser] = useState(null);
     const [progress, setProgress] = useState(0);
+    const mode = typeof window !== 'undefined' ? new URLSearchParams(window.location.search).get("mode") || "old" : "old";
 
     useEffect(() => {
         const storedUser = localStorage.getItem("regintel_user");
         if (!storedUser) {
             router.push("/login");
-        } else {
-            setUser(JSON.parse(storedUser));
+            return;
+        } 
+        setUser(JSON.parse(storedUser));
+
+        const params = new URLSearchParams(window.location.search);
+        if (!params.get("mode")) {
+            router.push("/select-mode");
         }
     }, [router]);
 
@@ -30,8 +36,12 @@ export default function UploadPage() {
     };
 
     const handleSubmit = async () => {
-        if (!oldFile || !newFile || !policyFile) {
-            alert("Please upload Old Regulation, New Regulation, and Internal Policy.");
+        if (mode === "old" && (!oldFile || !policyFile)) {
+            alert("Please upload Old Policy and Internal Policy.");
+            return;
+        }
+        if (mode === "new" && (!newFile || !policyFile)) {
+            alert("Please upload New Policy and Internal Policy.");
             return;
         }
 
@@ -40,9 +50,10 @@ export default function UploadPage() {
 
         try {
             const formData = new FormData();
-            formData.append("old_file", oldFile);
-            formData.append("new_file", newFile);
-            formData.append("policy_file", policyFile);
+            formData.append("mode", mode);
+            if (oldFile) formData.append("old_file", oldFile);
+            if (newFile) formData.append("new_file", newFile);
+            if (policyFile) formData.append("policy_file", policyFile);
 
             const res = await fetch("http://127.0.0.1:8000/upload-documents", {
                 method: "POST",
@@ -228,10 +239,21 @@ export default function UploadPage() {
                     </Link>
                 </div>
 
-                <div className="flex-1 max-w-lg mx-6 hidden md:block">
+                <div className="flex items-center gap-6 ml-10 hidden lg:flex">
+                    <Link href="/select-mode" className="text-sm font-bold text-slate-500 hover:text-violet-600 transition-colors flex items-center gap-2">
+                        <Upload className="w-4 h-4" />
+                        New Analysis
+                    </Link>
+                    <Link href="/dashboard#analysis-history" className="text-sm font-bold text-slate-500 hover:text-violet-600 transition-colors flex items-center gap-2">
+                        <Clock className="w-4 h-4" />
+                        History
+                    </Link>
+                </div>
+
+                <div className="flex-1 max-w-sm mx-6 hidden xl:block">
                     <div className="relative group">
                         <Search className="absolute left-3.5 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400 group-focus-within:text-violet-500 transition-colors" />
-                        <input type="text" placeholder="Search insights..."
+                        <input type="text" placeholder="Search..."
                             className="w-full bg-white/50 border border-slate-200 rounded-full py-2 pl-10 pr-4 text-sm text-slate-900 font-medium focus:outline-none focus:ring-2 focus:ring-violet-500/20 transition-all placeholder:text-slate-400 shadow-inner" />
                     </div>
                 </div>
@@ -268,17 +290,21 @@ export default function UploadPage() {
                     </p>
                 </div>
 
-                <div className="w-full grid md:grid-cols-3 gap-8 mb-16 px-4">
+                <div className="w-full grid md:grid-cols-2 gap-8 mb-16 max-w-4xl mx-auto px-4">
+                    {mode === 'old' && (
+                        <FileUploadCard
+                            file={oldFile} setFile={setOldFile} title="Old Regulation" delay={0} icon={FileText}
+                            gradientFrom="from-violet-500" gradientTo="to-indigo-500"
+                        />
+                    )}
+                    {mode === 'new' && (
+                        <FileUploadCard
+                            file={newFile} setFile={setNewFile} title="New Regulation" delay={0} icon={FileCheck}
+                            gradientFrom="from-blue-500" gradientTo="to-cyan-500"
+                        />
+                    )}
                     <FileUploadCard
-                        file={oldFile} setFile={setOldFile} title="Old Regulation" delay={0} icon={FileText}
-                        gradientFrom="from-violet-500" gradientTo="to-indigo-500"
-                    />
-                    <FileUploadCard
-                        file={newFile} setFile={setNewFile} title="New Regulation" delay={0.5} icon={FileCheck}
-                        gradientFrom="from-blue-500" gradientTo="to-cyan-500"
-                    />
-                    <FileUploadCard
-                        file={policyFile} setFile={setPolicyFile} title="Internal Policy" delay={1} icon={Building2}
+                        file={policyFile} setFile={setPolicyFile} title="Internal Policy" delay={0.5} icon={Building2}
                         gradientFrom="from-emerald-400" gradientTo="to-teal-500"
                     />
                 </div>
@@ -286,7 +312,7 @@ export default function UploadPage() {
                 <div className="flex flex-col items-center w-full max-w-[320px] mt-2">
                     <button
                         onClick={handleSubmit}
-                        disabled={loading || !oldFile || !newFile || !policyFile}
+                        disabled={loading || (mode === 'old' ? (!oldFile || !policyFile) : (!newFile || !policyFile))}
                         className="w-full bg-slate-900 text-white py-4.5 rounded-2xl font-bold transition-all 
                         active:scale-[0.98] disabled:opacity-50 disabled:active:scale-100 flex items-center justify-center gap-3 group 
                         shadow-[0_15px_30px_-5px_rgba(0,0,0,0.3)] hover:shadow-[0_20px_40px_-5px_rgba(0,0,0,0.4)] hover:-translate-y-1 relative overflow-hidden"

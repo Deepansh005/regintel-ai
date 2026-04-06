@@ -17,6 +17,8 @@ const RISK_COLORS = { 'Low': '#10B981', 'Medium': '#F59E0B', 'High': '#EF4444' }
 
 export default function Dashboard() {
     const [data, setData] = useState(null);
+    const [history, setHistory] = useState([]);
+    const [currentTaskId, setCurrentTaskId] = useState(null);
     const [user, setUser] = useState(null);
     const router = useRouter();
 
@@ -31,9 +33,14 @@ export default function Dashboard() {
         fetch("http://127.0.0.1:8000/tasks")
         .then((res) => res.json())
         .then((tasks) => {
-            const completed = tasks.find(t => t.status === "completed");
-            if (completed) setData(completed.result);
-            else setData("EMPTY_STATE");
+            setHistory(tasks);
+            const completed = [...tasks].reverse().find(t => t.status === "completed");
+            if (completed) {
+                setData(completed.result);
+                setCurrentTaskId(completed.task_id);
+            } else {
+                setData("EMPTY_STATE");
+            }
         }).catch(() => setData("EMPTY_STATE"));
     }, [router]);
 
@@ -54,7 +61,7 @@ export default function Dashboard() {
                 <p className="text-slate-500 mb-8 max-w-md text-center leading-relaxed">
                     Your compliance dashboard is waiting for data. Upload regulatory circulars to generate AI insights, impact analysis, and compliance workflows.
                 </p>
-                <Link href="/upload" className="px-8 py-3.5 bg-slate-900 text-white rounded-xl font-bold flex items-center gap-3 hover:bg-slate-800 transition-all shadow-md">
+                <Link href="/select-mode" className="px-8 py-3.5 bg-slate-900 text-white rounded-xl font-bold flex items-center gap-3 hover:bg-slate-800 transition-all shadow-md">
                     Compare Circulars
                     <ArrowRight className="w-5 h-5 group-hover:translate-x-1 transition-transform" />
                 </Link>
@@ -107,6 +114,13 @@ export default function Dashboard() {
         name: typeof s === 'string' ? s.split(' ')[0] : (s.name || `Sys ${i}`),
         impact: Math.floor(Math.random() * 40) + 40
     })) || [{name: 'Core DB', impact: 80}, {name: 'API', impact: 65}];
+    const handleExport = (format) => {
+        if (!currentTaskId) {
+            alert("No analysis data available to export.");
+            return;
+        }
+        window.open(`http://127.0.0.1:8000/export/${currentTaskId}/${format}`, '_blank');
+    };
 
     return (
         <div className="min-h-screen bg-[#F8FAFC] text-slate-900 font-sans pb-20">
@@ -121,14 +135,26 @@ export default function Dashboard() {
                         <p className="text-slate-500 font-medium">Monitoring circulars and regulatory adherence for RegIntel AI.</p>
                     </div>
                     <div className="flex gap-3">
-                        <Link href="/upload" className="flex items-center gap-2 bg-white border border-slate-200 hover:bg-slate-50 px-4 py-2.5 rounded-xl text-sm font-semibold text-slate-700 shadow-sm transition-colors">
+                        <Link href="/select-mode" className="flex items-center gap-2 bg-white border border-slate-200 hover:bg-slate-50 px-4 py-2.5 rounded-xl text-sm font-semibold text-slate-700 shadow-sm transition-colors">
                             <Upload className="w-4 h-4" />
                             New Analysis
                         </Link>
-                        <button className="flex items-center gap-2 bg-slate-900 hover:bg-slate-800 text-white px-5 py-2.5 rounded-xl text-sm font-semibold shadow-md transition-all">
-                            <FileText className="w-4 h-4" />
-                            Export Report
-                        </button>
+                        <div className="relative group/export">
+                            <button className="flex items-center gap-2 bg-slate-900 hover:bg-slate-800 text-white px-5 py-2.5 rounded-xl text-sm font-semibold shadow-md transition-all">
+                                <FileText className="w-4 h-4" />
+                                Export Report
+                            </button>
+                            <div className="absolute right-0 top-full mt-2 w-40 bg-white border border-slate-200 rounded-xl shadow-xl opacity-0 invisible group-hover/export:opacity-100 group-hover/export:visible transition-all z-30 overflow-hidden">
+                                <button onClick={() => handleExport('pdf')} className="w-full text-left px-4 py-2.5 text-sm font-semibold text-slate-700 hover:bg-slate-50 border-b border-slate-100 flex items-center gap-2">
+                                    <div className="w-1.5 h-1.5 rounded-full bg-rose-500" />
+                                    Export as PDF
+                                </button>
+                                <button onClick={() => handleExport('docx')} className="w-full text-left px-4 py-2.5 text-sm font-semibold text-slate-700 hover:bg-slate-50 flex items-center gap-2">
+                                    <div className="w-1.5 h-1.5 rounded-full bg-blue-500" />
+                                    Export as Word
+                                </button>
+                            </div>
+                        </div>
                     </div>
                 </div>
 
@@ -233,8 +259,8 @@ export default function Dashboard() {
                                     <div key={i} className={`p-4 rounded-[12px] border ${isHigh ? 'border-rose-100' : 'border-amber-100'} ${bg} flex items-start gap-4`}>
                                         <div className="mt-1"><AlertTriangle className={`w-5 h-5 ${isHigh ? 'text-rose-500' : 'text-amber-500'}`} /></div>
                                         <div className="flex-1">
-                                            <p className="text-sm font-bold text-slate-900 leading-tight mb-1">{gap.gap_identified || gap.gap || "Unknown gap"}</p>
-                                            <p className="text-xs text-slate-600 mb-3 line-clamp-1">{gap.recommendation || "Needs review."}</p>
+                                            <p className="text-sm font-bold text-slate-900 leading-tight mb-1">{gap.gap_identified || gap.gap || "Policy alignment gap identified"}</p>
+                                            <p className="text-xs text-slate-600 mb-3 line-clamp-1">{gap.recommendation || "Review and align internal controls with updated circular."}</p>
                                             <div className="flex items-center gap-2">
                                                 <div className="h-1.5 w-full bg-slate-200/50 rounded-full overflow-hidden border border-black/5">
                                                     <div className={`h-full ${color}`} style={{ width: isHigh ? '90%' : '50%' }} />
@@ -285,7 +311,7 @@ export default function Dashboard() {
                                     return (
                                         <tr key={i} className="hover:bg-slate-50 transition-colors">
                                             <td className="px-6 py-4">
-                                                <p className="text-sm font-bold text-slate-900">{action.action_required || action.action || "Update Policy Document"}</p>
+                                                <p className="text-sm font-bold text-slate-900">{action.action_required || action.action || "Update internal compliance workflow"}</p>
                                                 <p className="text-xs font-medium text-slate-500 mt-0.5">{action.assigned_to || "Compliance Team"}</p>
                                             </td>
                                             <td className="px-6 py-4">
@@ -312,6 +338,61 @@ export default function Dashboard() {
                                             <CheckCircle2 className="w-8 h-8 text-slate-300 mx-auto mb-3" />
                                             <p className="text-slate-500 font-medium text-sm">All systems compliant. No outstanding actions.</p>
                                         </td>
+                                    </tr>
+                                )}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                {/* 8. Recent Analysis History Section */}
+                <div id="analysis-history" className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden mb-12 hover:shadow-md transition-shadow">
+                    <div className="p-6 border-b border-slate-100 flex items-center justify-between">
+                        <div>
+                            <h3 className="font-bold text-slate-900 mb-1">Recent Analysis History</h3>
+                            <p className="text-sm text-slate-500">View and access your previous compliance runs</p>
+                        </div>
+                    </div>
+                    
+                    <div className="overflow-x-auto">
+                        <table className="w-full text-left border-collapse">
+                            <thead>
+                                <tr className="bg-slate-50 border-b border-slate-200">
+                                    <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase tracking-widest text-left">Analysis ID</th>
+                                    <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase tracking-widest">Status</th>
+                                    <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase tracking-widest">Timestamp</th>
+                                    <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase tracking-widest text-right">Action</th>
+                                </tr>
+                            </thead>
+                            <tbody className="divide-y divide-slate-100">
+                                {history.length > 0 ? history.slice().reverse().map((task, i) => (
+                                    <tr key={i} className="hover:bg-slate-50 transition-colors">
+                                        <td className="px-6 py-4">
+                                            <div className="flex items-center gap-3">
+                                                <div className="w-8 h-8 rounded-lg bg-slate-100 flex items-center justify-center">
+                                                    <FileText className="w-4 h-4 text-slate-500" />
+                                                </div>
+                                                <span className="text-sm font-bold text-slate-900 font-mono truncate max-w-[120px]">{task.task_id}</span>
+                                            </div>
+                                        </td>
+                                        <td className="px-6 py-4">
+                                            <span className={`inline-flex px-2.5 py-1 rounded-md text-[10px] font-bold uppercase tracking-widest 
+                                                ${task.status === 'completed' ? 'text-emerald-700 bg-emerald-100/50 border border-emerald-200' 
+                                                : task.status === 'failed' ? 'text-rose-700 bg-rose-100/50 border border-rose-200'
+                                                : 'text-violet-700 bg-violet-100/50 border border-violet-200'}`}>
+                                                {task.status}
+                                            </span>
+                                        </td>
+                                        <td className="px-6 py-4 text-sm font-semibold text-slate-500">
+                                            {new Date().toLocaleDateString()}
+                                        </td>
+                                        <td className="px-6 py-4 text-right">
+                                            <button className="text-violet-600 hover:text-violet-700 text-sm font-bold">View Details</button>
+                                        </td>
+                                    </tr>
+                                )) : (
+                                    <tr>
+                                        <td colSpan={4} className="px-6 py-12 text-center text-slate-500 font-medium text-sm">No analysis history found.</td>
                                     </tr>
                                 )}
                             </tbody>
@@ -347,10 +428,24 @@ function TopNavbar({ user }) {
                 </Link>
             </div>
 
-            <div className="flex-1 max-w-lg mx-6 hidden md:block">
+            <div className="flex items-center gap-6 ml-10 hidden lg:flex">
+                <Link href="/select-mode" className="text-sm font-bold text-slate-500 hover:text-violet-600 transition-colors flex items-center gap-2">
+                    <Upload className="w-4 h-4" />
+                    New Analysis
+                </Link>
+                <button 
+                    onClick={() => document.getElementById('analysis-history')?.scrollIntoView({ behavior: 'smooth' })}
+                    className="text-sm font-bold text-slate-500 hover:text-violet-600 transition-colors flex items-center gap-2"
+                >
+                    <Clock className="w-4 h-4" />
+                    History
+                </button>
+            </div>
+
+            <div className="flex-1 max-w-sm mx-6 hidden xl:block">
                 <div className="relative group">
                     <Search className="absolute left-3.5 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400 group-focus-within:text-violet-500 transition-colors" />
-                    <input type="text" placeholder="Search regulations, tasks, or insights..." 
+                    <input type="text" placeholder="Search..." 
                         className="w-full bg-slate-100 border-none rounded-full py-2.5 pl-10 pr-4 text-sm text-slate-900 font-medium focus:outline-none focus:ring-2 focus:ring-violet-500/20 transition-all placeholder:text-slate-500" />
                 </div>
             </div>

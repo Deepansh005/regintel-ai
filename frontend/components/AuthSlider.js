@@ -42,7 +42,7 @@ export default function AuthSlider({ initialIsSignUp = false }) {
 
         if (user) {
             localStorage.setItem("regintel_user", JSON.stringify({ email: loginEmail, name: user.name || "Demo User" }));
-            window.location.href = "/dashboard";
+            router.push("/select-mode");
         } else {
             alert("Invalid credentials. Please try again or create an account.");
         }
@@ -71,7 +71,7 @@ export default function AuthSlider({ initialIsSignUp = false }) {
         localStorage.setItem("regintel_users", JSON.stringify(users));
         
         localStorage.setItem("regintel_user", JSON.stringify({ email: regEmail, name: regName }));
-        window.location.href = "/dashboard";
+        router.push("/select-mode");
     };
 
     return (

@@ -142,7 +142,6 @@ Your task is to compare OLD vs NEW regulatory context and identify meaningful ch
 
 STRICT RULES:
 - REMOVE duplicates
-- LIMIT to top 5 most critical changes
 - ONLY use the provided context
 - DO NOT hallucinate
 - MUST reference SOURCE tags in "summary"
@@ -207,7 +206,6 @@ STRICT RULES:
 - Identify where policy does NOT meet regulation
 - MUST reference SOURCE tags
 - DO NOT list general rules
-- LIMIT to top 5 critical gaps
 - DO NOT generate new interpretations
 - ONLY extract from given text
 - If unsure, return empty

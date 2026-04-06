@@ -82,13 +82,29 @@ def build_context(chunks, limit=3000):
 # =============================
 # MAIN TASK PROCESSOR
 # =============================
-def process_task(task_id: str, file_paths: dict):
+def process_task(task_id: str, file_paths: dict, file_hashes: dict | None = None):
     try:
         mode = file_paths.get("mode", "all")
         
         old_context = ""
         new_context = ""
         policy_context = ""
+
+        # If any 2+ sections have the same PDF content, return deterministic no-change response.
+        if file_hashes:
+            hashes = [file_hashes.get("old"), file_hashes.get("new"), file_hashes.get("policy")]
+            hashes = [h for h in hashes if h]
+            if len(hashes) >= 2 and len(set(hashes)) < len(hashes):
+                result = {
+                    "changes_detected": 0,
+                    "message": "Same PDF uploaded in multiple sections. No changes or impact detected.",
+                    "changes": [],
+                    "compliance_gaps": [],
+                    "impact": [],
+                    "actions": [],
+                }
+                update_task(task_id, status="completed", result=result)
+                return
 
         # -----------------------------
         # 1-4. EXTRACT, CHUNK, STORE & RETRIEVE

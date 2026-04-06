@@ -84,9 +84,11 @@ def build_context(chunks, limit=3000):
 # =============================
 def process_task(task_id: str, file_paths: dict, file_hashes: dict | None = None):
     try:
-        old_path = file_paths["old"]
-        new_path = file_paths["new"]
-        policy_path = file_paths["policy"]
+        mode = file_paths.get("mode", "all")
+        
+        old_context = ""
+        new_context = ""
+        policy_context = ""
 
         # If any 2+ sections have the same PDF content, return deterministic no-change response.
         if file_hashes:
@@ -105,62 +107,46 @@ def process_task(task_id: str, file_paths: dict, file_hashes: dict | None = None
                 return
 
         # -----------------------------
-        # 1. EXTRACT TEXT (MARKDOWN)
+        # 1-4. EXTRACT, CHUNK, STORE & RETRIEVE
         # -----------------------------
-        old_text = extract_text_from_pdf(old_path)
-        new_text = extract_text_from_pdf(new_path)
-        policy_text = extract_text_from_pdf(policy_path)
+        if "policy" in file_paths:
+            policy_text = extract_text_from_pdf(file_paths["policy"])
+            policy_chunks = chunk_markdown_text(policy_text)
+            store_chunks(policy_chunks, "internal_policy", file_paths["policy"])
+            policy_context = build_context(retrieve_with_metadata("internal compliance rules", "internal_policy"))
+            
+        if "old" in file_paths:
+            old_text = extract_text_from_pdf(file_paths["old"])
+            old_chunks = chunk_markdown_text(old_text)
+            store_chunks(old_chunks, "old_regulation", file_paths["old"])
+            old_context = build_context(retrieve_with_metadata("key regulatory clauses", "old_regulation"))
 
-        # -----------------------------
-        # 2. SEMANTIC CHUNKING
-        # -----------------------------
-        old_chunks = chunk_markdown_text(old_text)
-        new_chunks = chunk_markdown_text(new_text)
-        policy_chunks = chunk_markdown_text(policy_text)
-
-        print(f"\n📦 OLD chunks: {len(old_chunks)}")
-        print(f"📦 NEW chunks: {len(new_chunks)}")
-        print(f"📦 POLICY chunks: {len(policy_chunks)}")
-
-        print("\n🧠 Sample Chunk:\n", new_chunks[0][:500])
-
-        # -----------------------------
-        # 3. STORE IN RAG (IMPROVED)
-        # -----------------------------
-        store_chunks(old_chunks, "old_regulation", old_path)
-        store_chunks(new_chunks, "new_regulation", new_path)
-        store_chunks(policy_chunks, "internal_policy", policy_path)
-
-        # -----------------------------
-        # 4. RETRIEVE CONTEXT
-        # -----------------------------
-        old_context = build_context(
-            retrieve_with_metadata("key regulatory clauses", "old_regulation")
-        )
-
-        new_context = build_context(
-            retrieve_with_metadata("latest regulatory changes", "new_regulation")
-        )
-
-        policy_context = build_context(
-            retrieve_with_metadata("internal compliance rules", "internal_policy")
-        )
+        if "new" in file_paths:
+            new_text = extract_text_from_pdf(file_paths["new"])
+            new_chunks = chunk_markdown_text(new_text)
+            store_chunks(new_chunks, "new_regulation", file_paths["new"])
+            new_context = build_context(retrieve_with_metadata("latest regulatory changes", "new_regulation"))
 
         # -----------------------------
         # 5. AI PROCESSING
         # -----------------------------
-        changes = detect_changes(old_context, new_context)
+        changes = "No temporal comparison was requested for this analysis mode."
+        compliance_gaps = "No compliance gap analysis was requested for this analysis mode."
+        
+        if mode == "all":
+            if old_context and new_context:
+                changes = detect_changes(old_context, new_context)
+            if new_context and policy_context:
+                compliance_gaps = detect_compliance_gaps(new_context, policy_context)
+        elif mode == "old":
+            if old_context and policy_context:
+                compliance_gaps = detect_compliance_gaps(old_context, policy_context)
+        elif mode == "new":
+            if new_context and policy_context:
+                compliance_gaps = detect_compliance_gaps(new_context, policy_context)
 
-        compliance_gaps = detect_compliance_gaps(new_context, policy_context)
-
-        impact = analyze_impact(
-            str(changes) + "\n" + str(compliance_gaps)
-        )
-
-        actions = generate_actions(
-            str(changes),
-            str(impact) + "\n" + str(compliance_gaps)
-        )
+        impact = analyze_impact(str(changes) + "\n" + str(compliance_gaps))
+        actions = generate_actions(str(changes), str(impact) + "\n" + str(compliance_gaps))
 
         result = {
             "changes": changes,

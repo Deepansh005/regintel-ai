@@ -49,3 +49,7 @@ coverage/
 .env.local
 .env.development.local
 .env.production.local
+
+
+*.db
+backend/tasks.db

@@ -1,6 +1,7 @@
 import fitz  # PyMuPDF
 import logging
 import hashlib
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -11,7 +12,17 @@ def extract_text_from_pdf(file_path: str) -> str:
     Priority:
     1. pymupdf4llm (best structure)
     2. PyMuPDF fallback (basic structure)
+    
+    Raises RuntimeError if extraction fails or PDF is empty.
     """
+    
+    # Check if file exists
+    if not os.path.exists(file_path):
+        raise RuntimeError(f"PDF file not found: {file_path}")
+    
+    file_size = os.path.getsize(file_path)
+    if file_size == 0:
+        raise RuntimeError("PDF file is empty (0 bytes)")
 
     # =============================
     # ✅ TRY pymupdf4llm (BEST)
@@ -22,12 +33,18 @@ def extract_text_from_pdf(file_path: str) -> str:
         logger.info("✅ Using pymupdf4llm for Markdown extraction")
 
         md_text = pymupdf4llm.to_markdown(file_path)
-
-        cleaned = clean_markdown(md_text)
-
-        print("\n🔍 MARKDOWN PREVIEW:\n", cleaned[:500])
-
-        return cleaned
+        
+        # Validate extracted text
+        if not md_text or not md_text.strip():
+            logger.warning("⚠️ pymupdf4llm returned empty text, falling back to PyMuPDF")
+        else:
+            cleaned = clean_markdown(md_text)
+            
+            if not cleaned or not cleaned.strip():
+                logger.warning("⚠️ Cleaned markdown is empty, falling back to PyMuPDF")
+            else:
+                logger.info(f"✅ Successfully extracted {len(cleaned)} characters from PDF")
+                return cleaned
 
     except Exception as e:
         logger.warning(f"⚠️ pymupdf4llm failed, falling back. Error: {e}")
@@ -39,6 +56,10 @@ def extract_text_from_pdf(file_path: str) -> str:
         logger.info("🔁 Using PyMuPDF fallback extraction")
 
         doc = fitz.open(file_path)
+        
+        if len(doc) == 0:
+            raise RuntimeError("PDF has no pages")
+        
         md_parts = []
 
         for page_num, page in enumerate(doc):
@@ -63,16 +84,21 @@ def extract_text_from_pdf(file_path: str) -> str:
                         md_parts.append(line_text)
 
         raw_text = "\n".join(md_parts)
+        
+        if not raw_text or not raw_text.strip():
+            raise RuntimeError("No text content extracted from PDF (PDF may be image-only or corrupted)")
 
         cleaned = clean_markdown(raw_text)
-
-        print("\n🔍 FALLBACK PREVIEW:\n", cleaned[:500])
-
+        
+        if not cleaned or not cleaned.strip():
+            raise RuntimeError("Cleaned text is empty after processing")
+        
+        logger.info(f"✅ Successfully extracted {len(cleaned)} characters from PDF using fallback")
         return cleaned
 
     except Exception as e:
         logger.error(f"❌ PDF extraction completely failed: {e}")
-        raise RuntimeError("PDF extraction failed")
+        raise RuntimeError(f"PDF extraction failed: {str(e)}")
 
 
 # =============================

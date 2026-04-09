@@ -4,6 +4,12 @@ from fastapi.responses import FileResponse
 from fpdf import FPDF
 from docx import Document
 from db.database import get_task
+from app.rag.vector_store import (
+    list_collections,
+    delete_collection,
+    delete_all_collections,
+    reset_chroma_db,
+)
 
 router = APIRouter()
 
@@ -31,6 +37,38 @@ def export_report(task_id: str, format: str):
         raise HTTPException(status_code=500, detail=f"Failed to generate report: {str(e)}")
 
     return FileResponse(filepath, filename=filename, media_type='application/octet-stream')
+
+
+@router.get("/chroma/collections")
+def chroma_collections():
+    collections = list_collections()
+    return {
+        "collections": [
+            {"name": collection.name, "metadata": collection.metadata}
+            for collection in collections
+        ]
+    }
+
+
+@router.delete("/chroma/collections")
+def chroma_delete_all_collections():
+    delete_all_collections()
+    return {"message": "All collections deleted successfully"}
+
+
+@router.delete("/chroma/collections/{collection_name}")
+def chroma_delete_collection(collection_name: str):
+    try:
+        delete_collection(collection_name)
+        return {"message": f"Collection '{collection_name}' deleted successfully"}
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail=f"Collection not found or could not be deleted: {str(exc)}")
+
+
+@router.delete("/chroma/reset")
+def chroma_reset():
+    reset_chroma_db()
+    return {"message": "ChromaDB folder deleted and fresh database initialized"}
 
 def generate_pdf(data, path):
     pdf = FPDF()

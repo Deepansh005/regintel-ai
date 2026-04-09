@@ -14,23 +14,44 @@ def get_vector_db(collection_name):
 
 # ✅ BASIC RETRIEVAL (optional)
 def retrieve_from_collection(query: str, collection_name: str, k: int = 5):
-    vectordb = get_vector_db(collection_name)
-    results = vectordb.similarity_search(query, k=k)
-    return [r.page_content for r in results]
+    """Retrieve k most similar chunks from collection"""
+    try:
+        vectordb = get_vector_db(collection_name)
+        results = vectordb.similarity_search(query, k=k)
+        
+        if not results:
+            return []
+        
+        return [r.page_content for r in results if r.page_content and r.page_content.strip()]
+    except Exception as e:
+        print(f"Retrieval error from {collection_name}: {e}")
+        return []
 
 
 # ✅ SOURCE-GROUNDED RETRIEVAL (MAIN FUNCTION)
 def retrieve_with_metadata(query: str, collection_name: str, k: int = 5):
-    vectordb = get_vector_db(collection_name)
-    results = vectordb.similarity_search(query, k=k)
+    """Retrieve k most similar chunks with source metadata"""
+    try:
+        vectordb = get_vector_db(collection_name)
+        results = vectordb.similarity_search(query, k=k)
 
-    formatted_chunks = []
+        if not results:
+            return []
 
-    for i, r in enumerate(results):
-        chunk_text = r.page_content
+        formatted_chunks = []
 
-        formatted_chunks.append(
-            f"[SOURCE {i+1} | {collection_name}]\n{chunk_text}"
-        )
+        for i, r in enumerate(results):
+            chunk_text = r.page_content
+            
+            if not chunk_text or not chunk_text.strip():
+                continue
 
-    return formatted_chunks
+            formatted_chunks.append(
+                f"[SOURCE {i+1} | {collection_name}]\n{chunk_text}"
+            )
+
+        return formatted_chunks
+    
+    except Exception as e:
+        print(f"Retrieval error from {collection_name}: {e}")
+        return []

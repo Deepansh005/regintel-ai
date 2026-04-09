@@ -8,3 +8,5 @@ pymupdf4llm
 langchain
 langchain-community
 sentence-transformers
+fpdf2
+python-docx

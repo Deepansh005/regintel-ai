@@ -2,11 +2,14 @@
 # Python (Backend)
 # ----------------------
 venv/
+.venv/
 .env
+.env*
 __pycache__/
 *.pyc
 *.pyo
 chroma_db/
+backend/chroma_db/
 
 # ----------------------
 # Node (Frontend)
@@ -31,6 +34,16 @@ Thumbs.db
 # Uploads (your PDFs)
 # ----------------------
 uploads/
+backend/uploads/
+backend/exports/
+
+# ----------------------
+# Data Dumps / Local Outputs
+# ----------------------
+tasks.json
+backend/db_dump.json
+backend/db_dump_utf8.json
+backend/out.json
 
 # ----------------------
 # VS Code
@@ -49,7 +62,14 @@ coverage/
 .env.local
 .env.development.local
 .env.production.local
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
 
 
 *.db
+*.sqlite
+*.sqlite3
 backend/tasks.db

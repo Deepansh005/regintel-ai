@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
+import { fetchTasks, clearTaskHistory, deleteOldTasks } from "../../services/api";
 import { 
     Search, Bell, User, Upload, ArrowRight, Shield, AlertTriangle, 
     CheckCircle2, Clock, AlertCircle, RefreshCw, XCircle, FileText
@@ -15,12 +16,311 @@ import {
 const COLORS = ['#7C3AED', '#A78BFA', '#C4B5FD', '#EDE9FE'];
 const RISK_COLORS = { 'Low': '#10B981', 'Medium': '#F59E0B', 'High': '#EF4444' };
 
+function toArray(value) {
+    return Array.isArray(value) ? value : [];
+}
+
+function parseMaybeJson(value) {
+    if (typeof value !== 'string') return value;
+    const trimmed = value.trim();
+    if (!trimmed) return value;
+    if (!(trimmed.startsWith('{') || trimmed.startsWith('['))) return value;
+
+    try {
+        return JSON.parse(trimmed);
+    } catch (error) {
+        return value;
+    }
+}
+
+function deepParse(value, maxDepth = 2) {
+    let current = value;
+    for (let i = 0; i < maxDepth; i += 1) {
+        if (current && typeof current === 'object' && typeof current.raw === 'string') {
+            const parsedRaw = parseMaybeJson(current.raw);
+            if (parsedRaw !== current.raw) {
+                current = parsedRaw;
+                continue;
+            }
+        }
+
+        const parsed = parseMaybeJson(current);
+        if (parsed === current) break;
+        current = parsed;
+    }
+    return current;
+}
+
+function findFirstArrayCandidate(value, seen = new Set()) {
+    const parsed = deepParse(value, 3);
+
+    if (Array.isArray(parsed)) {
+        return parsed;
+    }
+
+    if (!parsed || typeof parsed !== 'object') {
+        return null;
+    }
+
+    if (seen.has(parsed)) {
+        return null;
+    }
+
+    seen.add(parsed);
+
+    const keys = [
+        'actions',
+        'generated_actions',
+        'remediation_actions',
+        'result',
+        'analysis',
+        'data',
+        'raw',
+    ];
+
+    for (const key of keys) {
+        if (parsed[key] === undefined || parsed[key] === null) {
+            continue;
+        }
+
+        const candidate = findFirstArrayCandidate(parsed[key], seen);
+        if (Array.isArray(candidate)) {
+            return candidate;
+        }
+    }
+
+    if (Array.isArray(parsed.actions)) {
+        return parsed.actions;
+    }
+
+    return null;
+}
+
+function unwrapTaskResult(source) {
+    const parsed = parseMaybeJson(source);
+    if (!parsed || typeof parsed !== 'object') {
+        return parsed || {};
+    }
+
+    return parsed.result && typeof parsed.result === 'object'
+        ? parsed.result
+        : parsed.analysis && typeof parsed.analysis === 'object'
+            ? parsed.analysis
+            : parsed.data && typeof parsed.data === 'object'
+                ? parsed.data
+                : parsed;
+}
+
+function pickLatestCompletedTask(tasks) {
+    const completedTasks = toArray(tasks).filter((task) => task?.status === 'completed');
+    if (completedTasks.length === 0) {
+        return null;
+    }
+
+    return completedTasks.reduce((latest, task) => {
+        if (!latest) return task;
+        const latestTime = new Date(latest.updated_at || latest.created_at || 0).getTime();
+        const taskTime = new Date(task.updated_at || task.created_at || 0).getTime();
+        return taskTime >= latestTime ? task : latest;
+    }, null);
+}
+
+function normalizeChanges(payload) {
+    const root = unwrapTaskResult(payload)?.changes ?? unwrapTaskResult(payload) ?? [];
+    if (typeof root === 'string') return [];
+    if (Array.isArray(root)) {
+        return root.map((c) => ({
+            ...c,
+            type: (c?.type || '').toString().toLowerCase()
+        }));
+    }
+
+    if (Array.isArray(root.changes)) {
+        return root.changes.map((c) => ({
+            ...c,
+            type: (c?.type || '').toString().toLowerCase()
+        }));
+    }
+
+    const added = toArray(root.added).map((c) => ({ ...c, type: c?.type || 'added' }));
+    const modified = toArray(root.modified).map((c) => ({ ...c, type: c?.type || 'modified' }));
+    const removed = toArray(root.removed).map((c) => ({ ...c, type: c?.type || 'removed' }));
+    return [...added, ...modified, ...removed].map((c) => ({
+        ...c,
+        type: (c?.type || '').toString().toLowerCase()
+    }));
+}
+
+function normalizeGaps(payload) {
+    const root = unwrapTaskResult(payload)?.compliance_gaps ?? unwrapTaskResult(payload) ?? [];
+    if (typeof root === 'string') return [];
+    if (Array.isArray(root)) {
+        return root;
+    }
+    if (Array.isArray(root.gaps)) {
+        return root.gaps;
+    }
+    return [];
+}
+
+function normalizeImpact(payload) {
+    let root = unwrapTaskResult(payload)?.impact ?? unwrapTaskResult(payload) ?? {};
+    if (root.raw && typeof root.raw === 'string') {
+        try { root = JSON.parse(root.raw); } catch (e) {}
+    }
+    return root.impact && typeof root.impact === 'object' ? root.impact : root;
+}
+
+function normalizeImpactResult(payload) {
+    const impact = normalizeImpact(payload);
+
+    if (impact && typeof impact === 'object' && impact.impact && typeof impact.impact === 'object') {
+        return impact.impact;
+    }
+
+    return impact || {};
+}
+
+function normalizeActions(payload) {
+    const normalized = unwrapTaskResult(payload);
+    const candidatePaths = {
+        actions: normalized?.actions,
+        resultActions: normalized?.result?.actions,
+        analysisActions: normalized?.analysis?.actions,
+        generatedActions: normalized?.generated_actions,
+        remediationActions: normalized?.remediation_actions,
+    };
+
+    console.log("ACTIONS PATH CHECK:", {
+        actions1: candidatePaths.actions,
+        actions2: candidatePaths.resultActions,
+        actions3: candidatePaths.analysisActions,
+        actions4: candidatePaths.generatedActions,
+        actions5: candidatePaths.remediationActions,
+    });
+
+    const actions =
+        findFirstArrayCandidate(candidatePaths.actions)
+        || findFirstArrayCandidate(candidatePaths.resultActions)
+        || findFirstArrayCandidate(candidatePaths.analysisActions)
+        || findFirstArrayCandidate(candidatePaths.generatedActions)
+        || findFirstArrayCandidate(candidatePaths.remediationActions)
+        || findFirstArrayCandidate(normalized)
+        || [];
+
+    if (!Array.isArray(actions)) {
+        console.warn("Actions is not array", actions);
+        return [];
+    }
+
+    return actions;
+}
+
+function normalizeComplianceTrend(payload) {
+    const normalized = unwrapTaskResult(payload);
+    const trendRoot = normalized?.compliance_trend
+        ?? normalized?.impact_analysis?.compliance_trend
+        ?? normalized?.impact?.compliance_trend
+        ?? [];
+
+    const rawTrend = Array.isArray(trendRoot)
+        ? trendRoot
+        : Array.isArray(trendRoot?.trend)
+            ? trendRoot.trend
+            : Array.isArray(trendRoot?.data)
+                ? trendRoot.data
+                : [];
+
+    return rawTrend
+        .map((item, index) => ({
+            date: item?.day || item?.date || item?.name || `Point ${index + 1}`,
+            score: Number(item?.value ?? item?.score ?? item?.compliance_score ?? 0)
+        }))
+        .filter((item) => Number.isFinite(item.score));
+}
+
+function normalizeImpactedDepartments(payload, normalizedImpact) {
+    const normalized = unwrapTaskResult(payload);
+    const rootDepartments = normalized?.impacted_departments
+        ?? normalized?.impact_analysis?.departments
+        ?? normalizedImpact?.departments
+        ?? [];
+
+    return toArray(rootDepartments)
+        .map((entry) => (typeof entry === 'string' ? entry : entry?.name))
+        .filter(Boolean);
+}
+
+function formatStatus(status) {
+    const value = (status || '').toString().toLowerCase();
+    if (value === 'completed') return 'Completed';
+    if (value === 'in_progress' || value === 'in-progress') return 'In Progress';
+    if (value === 'overdue') return 'Overdue';
+    if (value === 'blocked') return 'Blocked';
+    return 'Pending';
+}
+
+function getRiskValue(gap) {
+    return (gap?.risk_level || gap?.risk || '').toString().toLowerCase();
+}
+
+function getCompletionScore(result) {
+    const gaps = normalizeGaps(unwrapTaskResult(result));
+    const high = gaps.filter((g) => getRiskValue(g) === 'high').length;
+    const medium = gaps.filter((g) => getRiskValue(g) === 'medium').length;
+    const low = gaps.filter((g) => getRiskValue(g) === 'low').length;
+    const penalty = (high * 25) + (medium * 10) + (low * 4);
+    return Math.max(0, 100 - penalty);
+}
+
+function formatAxisLabel(label, max = 18) {
+    const text = (label ?? '').toString().trim();
+    if (text.length <= max) return text;
+    return `${text.slice(0, max - 1)}…`;
+}
+
 export default function Dashboard() {
     const [data, setData] = useState(null);
+    const [loading, setLoading] = useState(true);
+    const [error, setError] = useState(null);
+    const [banner, setBanner] = useState(null);
+    const [isClearingHistory, setIsClearingHistory] = useState(false);
+    const [isDeletingOld, setIsDeletingOld] = useState(false);
     const [history, setHistory] = useState([]);
     const [currentTaskId, setCurrentTaskId] = useState(null);
     const [user, setUser] = useState(null);
     const router = useRouter();
+
+    const loadDashboardData = async (activeRef = { current: true }) => {
+        const response = await fetchTasks();
+        console.log("Dashboard API response:", response);
+
+        if (!activeRef.current) return;
+
+        setData(null);
+        setCurrentTaskId(null);
+
+        const tasks = Array.isArray(response) ? response : [];
+        setHistory(tasks);
+        const completed = pickLatestCompletedTask(tasks);
+
+        if (completed) {
+            const normalizedResult = unwrapTaskResult(completed.result);
+            console.log("Dashboard selected task result:", normalizedResult);
+            console.log("FULL API:", normalizedResult);
+            console.log("ACTIONS PATH CHECK:", {
+                actions1: normalizedResult?.actions,
+                actions2: normalizedResult?.result?.actions,
+                actions3: normalizedResult?.analysis?.actions,
+                actions4: normalizedResult?.generated_actions,
+                actions5: normalizedResult?.remediation_actions,
+            });
+            setData(normalizedResult);
+            setCurrentTaskId(completed.task_id);
+        } else {
+            setData("EMPTY_STATE");
+        }
+    };
 
     useEffect(() => {
         const storedUser = localStorage.getItem("regintel_user");
@@ -28,25 +328,54 @@ export default function Dashboard() {
             router.push("/login");
             return;
         }
-        setUser(JSON.parse(storedUser));
 
-        fetch("http://127.0.0.1:8000/tasks")
-        .then((res) => res.json())
-        .then((tasks) => {
-            setHistory(tasks);
-            const completed = [...tasks].reverse().find(t => t.status === "completed");
-            if (completed) {
-                setData(completed.result);
-                setCurrentTaskId(completed.task_id);
-            } else {
-                setData("EMPTY_STATE");
-            }
-        }).catch(() => setData("EMPTY_STATE"));
+        setUser(JSON.parse(storedUser));
+        setLoading(true);
+        setError(null);
+        setData(null);
+        setHistory([]);
+        setCurrentTaskId(null);
+
+        const activeRef = { current: true };
+
+        loadDashboardData(activeRef)
+        .then(() => {
+            if (!activeRef.current) return;
+            setLoading(false);
+        })
+        .catch((err) => {
+            console.error("Dashboard load error:", err);
+            if (!activeRef.current) return;
+            setError("Unable to load dashboard data");
+            setData("EMPTY_STATE");
+            setLoading(false);
+        });
+
+        return () => {
+            activeRef.current = false;
+        };
     }, [router]);
 
-    if (!data) return (
+    if (loading || data === null) return (
         <div className="min-h-screen bg-[#F8FAFC] flex items-center justify-center">
             <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-violet-600"></div>
+        </div>
+    );
+
+    if (error && data === "EMPTY_STATE") return (
+        <div className="min-h-screen bg-[#F8FAFC] text-slate-900 font-sans">
+            <TopNavbar user={user} />
+            <div className="max-w-[1400px] mx-auto p-8 mt-16">
+                <div className="bg-white border border-rose-200 rounded-2xl p-8 text-center shadow-sm">
+                    <AlertTriangle className="w-8 h-8 text-rose-500 mx-auto mb-3" />
+                    <h2 className="text-xl font-bold text-slate-900 mb-2">Dashboard data unavailable</h2>
+                    <p className="text-slate-500 mb-6">{error}. Please retry after your analysis completes.</p>
+                    <Link href="/select-mode" className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-slate-900 text-white text-sm font-semibold hover:bg-slate-800 transition-colors">
+                        <Upload className="w-4 h-4" />
+                        Start New Analysis
+                    </Link>
+                </div>
+            </div>
         </div>
     );
 
@@ -69,51 +398,184 @@ export default function Dashboard() {
         </div>
     );
 
-    // DYNAMIC DATA MAPPING
-    const changesRaw = data.changes?.changes || data.changes || [];
-    const changesArray = Array.isArray(changesRaw) ? changesRaw : [...(changesRaw.added||[]), ...(changesRaw.modified||[]), ...(changesRaw.removed||[])];
-    
-    const gapsRaw = data.compliance_gaps?.gaps || data.compliance_gaps || [];
-    const gapsArray = Array.isArray(gapsRaw) ? gapsRaw : [];
-    
-    const impactData = data.impact?.impact || data.impact || { departments: [], systems: [], summary: "" };
-    const impactSystems = impactData.systems || [];
-    
-    const actionsRaw = data.actions?.actions || data.actions || [];
-    const actionsData = Array.isArray(actionsRaw) ? actionsRaw : [];
+    // DYNAMIC DATA MAPPING (BACKEND-DRIVEN)
+    const normalizedData = unwrapTaskResult(data);
+    const changesArray = normalizeChanges(normalizedData);
+    const backendChangesList = toArray(normalizedData?.changes?.changes).map((item) => ({
+        ...item,
+        type: (item?.type || '').toString().toLowerCase()
+    }));
+    const changesList = backendChangesList.length > 0 ? backendChangesList : changesArray;
+    const visibleChanges = changesList.slice(0, 5);
+    const gapsArray = normalizeGaps(normalizedData);
+    const impactData = normalizeImpactResult(normalizedData) || {};
+    const impactSystems = toArray(impactData.systems);
+    const impactDepartments = normalizeImpactedDepartments(normalizedData, impactData);
+    const actionsData = normalizeActions(normalizedData);
+    console.log("ACTIONS PROPS:", actionsData);
+    const complianceTrendData = normalizeComplianceTrend(normalizedData);
 
-    const criticalGapsCount = gapsArray.filter(g => g.risk_level?.toLowerCase() === 'high' || g.risk?.toLowerCase() === 'high').length;
+    const criticalGapsCount = gapsArray.filter((g) => getRiskValue(g) === 'high').length;
     const overallRisk = criticalGapsCount > 0 ? "High" : gapsArray.length > 0 ? "Medium" : "Low";
 
-    const totalChanges = changesArray.length;
-    const completedTasks = Math.max(0, actionsData.filter(a => a.status?.toLowerCase() === 'completed').length || 1);
-    const activeTasks = actionsData.length;
+    const completedTasks = actionsData.filter((a) => (a.status || '').toLowerCase() === 'completed').length;
+    const activeTasks = actionsData.filter((a) => (a.status || '').toLowerCase() !== 'completed').length;
+    const dueTodayCount = actionsData.filter((a) => (a.priority || '').toLowerCase() === 'high').length || criticalGapsCount;
+    const overdueCount = actionsData.filter((a) => (a.status || '').toLowerCase() === 'overdue').length;
     
-    const addedCount = changesArray.filter(c => c.type === 'added').length || 2;
-    const updatedCount = changesArray.filter(c => c.type === 'modified').length || 5;
-    const removedCount = changesArray.filter(c => c.type === 'removed').length || 1;
-    const regChartData = [
-        { name: 'Added', count: addedCount, fill: '#10B981' },
-        { name: 'Updated', count: updatedCount, fill: '#F59E0B' },
-        { name: 'Removed', count: removedCount, fill: '#EF4444' },
-    ];
+    const counts = {
+        added: changesList.filter((c) => c.type === 'added').length,
+        removed: changesList.filter((c) => c.type === 'removed').length,
+        modified: changesList.filter((c) => c.type === 'modified').length,
+    };
 
     const riskData = [
-        { name: 'Low', value: gapsArray.filter(g => g.risk_level?.toLowerCase() === 'low').length || 30, fill: '#10B981' },
-        { name: 'Medium', value: gapsArray.filter(g => g.risk_level?.toLowerCase() === 'medium').length || 45, fill: '#F59E0B' },
-        { name: 'High', value: criticalGapsCount || 25, fill: '#EF4444' }
+        { name: 'Low', value: gapsArray.filter((g) => getRiskValue(g) === 'low').length, fill: '#10B981' },
+        { name: 'Medium', value: gapsArray.filter((g) => getRiskValue(g) === 'medium').length, fill: '#F59E0B' },
+        { name: 'High', value: criticalGapsCount, fill: '#EF4444' }
     ];
 
-    const trendData = [
-        { date: 'Mon', score: 85 }, { date: 'Tue', score: 86 }, 
-        { date: 'Wed', score: 82 }, { date: 'Thu', score: 89 }, 
-        { date: 'Fri', score: 92 }, { date: 'Sat', score: 94 }, { date: 'Sun', score: 96 }
-    ];
+    const historyScores = history
+        .filter((t) => t.status === 'completed' && t.result)
+        .slice(0, 7)
+        .reverse()
+        .map((t, index) => ({
+            date: new Date(t.created_at || Date.now()).toLocaleDateString('en-US', { weekday: 'short' }) || `Run ${index + 1}`,
+            score: getCompletionScore(t.result)
+        }));
 
-    const impactChartData = impactSystems.slice(0,4).map((s, i) => ({
-        name: typeof s === 'string' ? s.split(' ')[0] : (s.name || `Sys ${i}`),
-        impact: Math.floor(Math.random() * 40) + 40
-    })) || [{name: 'Core DB', impact: 80}, {name: 'API', impact: 65}];
+    const trendData = complianceTrendData.length > 0 ? complianceTrendData : historyScores;
+
+    const systems = toArray(normalizedData?.impact?.impact?.systems).length > 0
+        ? toArray(normalizedData?.impact?.impact?.systems)
+        : impactSystems.length > 0
+            ? impactSystems
+            : ['Core System'];
+    const gaps = toArray(normalizedData?.compliance_gaps?.gaps).length > 0
+        ? toArray(normalizedData?.compliance_gaps?.gaps)
+        : gapsArray;
+
+    const getDeterministicJitter = (name, index) => {
+        const seed = `${name}-${index}`;
+        let hash = 0;
+        for (let i = 0; i < seed.length; i += 1) {
+            hash = ((hash << 5) - hash) + seed.charCodeAt(i);
+            hash |= 0;
+        }
+        return ((Math.abs(hash) % 1000) / 1000 - 0.5) * 10;
+    };
+
+    const getSystemScore = (systemName) => {
+        let score = 0;
+        const sys = systemName.toLowerCase();
+
+        gaps.forEach((gap) => {
+            const text = (gap?.issue || gap?.gap_identified || gap?.gap || '').toString().toLowerCase();
+
+            if (sys.includes('kyc') && text.includes('kyc')) score += 3;
+            else if (sys.includes('transaction') && text.includes('transaction')) score += 3;
+            else if (sys.includes('report') && text.includes('report')) score += 2;
+            else score += 0.2;
+        });
+
+        return score;
+    };
+
+    const impactTargets = systems.length > 0 ? systems : impactDepartments;
+    const systemScores = impactTargets.slice(0, 4).map((item, i) => {
+        const systemName = typeof item === 'string'
+            ? item
+            : (item?.name || `Target ${i + 1}`);
+
+        if (gaps.length === 0) {
+            return { name: systemName, score: 0 };
+        }
+
+        return { name: systemName, score: getSystemScore(systemName) };
+    });
+
+    const maxScore = Math.max(...systemScores.map((s) => s.score), 1);
+    const impactChartData = systemScores.length > 0 ? systemScores.map((s, i) => {
+        const jitter = getDeterministicJitter(s.name, i);
+
+        if (gaps.length === 0) {
+            return { name: s.name, value: Math.round(Math.max(25, Math.min(60, 30 + jitter))) };
+        }
+
+        const normalized = s.score / maxScore;
+        let value = 30 + (normalized * 20);
+        value += jitter;
+
+        return {
+            name: s.name,
+            value: Math.round(Math.max(25, Math.min(value, 60)))
+        };
+    }) : [{ name: 'Core System', value: 35 }];
+
+    const hasTrendData = trendData.length > 0;
+    const hasImpactData = impactChartData.length > 0;
+    const hasActions = actionsData.length > 0;
+
+    const handleClearHistory = async () => {
+        const confirmed = window.confirm("Are you sure you want to delete all task history?");
+        if (!confirmed) return;
+
+        setIsClearingHistory(true);
+        setBanner(null);
+
+        try {
+            const result = await clearTaskHistory();
+            console.log("Clear history response:", result);
+            setHistory([]);
+            setCurrentTaskId(null);
+            setData({});
+            setBanner({ type: "success", message: "Task history cleared successfully" });
+        } catch (err) {
+            console.error("Clear history failed:", err);
+            setBanner({ type: "error", message: "Failed to clear task history" });
+        } finally {
+            setIsClearingHistory(false);
+        }
+    };
+
+    const handleDeleteOldTasks = async () => {
+        const confirmed = window.confirm("Delete tasks older than 7 days?");
+        if (!confirmed) return;
+
+        setIsDeletingOld(true);
+        setBanner(null);
+
+        try {
+            const result = await deleteOldTasks(7);
+            console.log("Delete old tasks response:", result);
+            const activeRef = { current: true };
+            await loadDashboardData(activeRef);
+            setBanner({ type: "success", message: `Deleted ${result?.deleted_tasks ?? 0} old tasks` });
+        } catch (err) {
+            console.error("Delete old tasks failed:", err);
+            setBanner({ type: "error", message: "Failed to delete old tasks" });
+        } finally {
+            setIsDeletingOld(false);
+        }
+    };
+
+    const handleReloadData = async () => {
+        setLoading(true);
+        setError(null);
+
+        const activeRef = { current: true };
+
+        try {
+            await loadDashboardData(activeRef);
+        } catch (err) {
+            console.error("Reload data failed:", err);
+            setError("Unable to reload dashboard data");
+            setData("EMPTY_STATE");
+        } finally {
+            setLoading(false);
+        }
+    };
+
     const handleExport = (format) => {
         if (!currentTaskId) {
             alert("No analysis data available to export.");
@@ -135,6 +597,30 @@ export default function Dashboard() {
                         <p className="text-slate-500 font-medium">Monitoring circulars and regulatory adherence for RegIntel AI.</p>
                     </div>
                     <div className="flex gap-3">
+                        <button
+                            onClick={handleClearHistory}
+                            disabled={isClearingHistory || isDeletingOld}
+                            className="flex items-center gap-2 bg-rose-600 hover:bg-rose-700 disabled:opacity-60 disabled:cursor-not-allowed text-white px-4 py-2.5 rounded-xl text-sm font-semibold shadow-md transition-colors"
+                        >
+                            {isClearingHistory ? <RefreshCw className="w-4 h-4 animate-spin" /> : <XCircle className="w-4 h-4" />}
+                            Clear History
+                        </button>
+                        <button
+                            onClick={handleDeleteOldTasks}
+                            disabled={isClearingHistory || isDeletingOld}
+                            className="flex items-center gap-2 bg-amber-500 hover:bg-amber-600 disabled:opacity-60 disabled:cursor-not-allowed text-white px-4 py-2.5 rounded-xl text-sm font-semibold shadow-md transition-colors"
+                        >
+                            {isDeletingOld ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Clock className="w-4 h-4" />}
+                            Delete Old (7 days)
+                        </button>
+                        <button
+                            onClick={handleReloadData}
+                            disabled={loading}
+                            className="flex items-center gap-2 bg-slate-100 hover:bg-slate-200 disabled:opacity-60 disabled:cursor-not-allowed text-slate-700 px-4 py-2.5 rounded-xl text-sm font-semibold shadow-sm transition-colors"
+                        >
+                            <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
+                            Reload Data
+                        </button>
                         <Link href="/select-mode" className="flex items-center gap-2 bg-white border border-slate-200 hover:bg-slate-50 px-4 py-2.5 rounded-xl text-sm font-semibold text-slate-700 shadow-sm transition-colors">
                             <Upload className="w-4 h-4" />
                             New Analysis
@@ -158,11 +644,17 @@ export default function Dashboard() {
                     </div>
                 </div>
 
+                {banner && (
+                    <div className={`mb-6 rounded-xl border px-4 py-3 text-sm font-medium ${banner.type === 'success' ? 'bg-emerald-50 border-emerald-200 text-emerald-700' : 'bg-rose-50 border-rose-200 text-rose-700'}`}>
+                        {banner.message}
+                    </div>
+                )}
+
                 {/* 1. KPI Row */}
                 <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
-                    <KPICard title="Due Today" value={criticalGapsCount} icon={<AlertCircle className="w-5 h-5 text-rose-500" />} color="rose" />
+                    <KPICard title="Due Today" value={dueTodayCount} icon={<AlertCircle className="w-5 h-5 text-rose-500" />} color="rose" />
                     <KPICard title="Active Tasks" value={activeTasks} icon={<Clock className="w-5 h-5 text-violet-500" />} color="violet" />
-                    <KPICard title="Overdue Tasks" value={0} icon={<XCircle className="w-5 h-5 text-amber-500" />} color="amber" />
+                    <KPICard title="Overdue Tasks" value={overdueCount} icon={<XCircle className="w-5 h-5 text-amber-500" />} color="amber" />
                     <KPICard title="Completed Tasks" value={completedTasks} icon={<CheckCircle2 className="w-5 h-5 text-emerald-500" />} color="emerald" />
                 </div>
 
@@ -192,40 +684,69 @@ export default function Dashboard() {
                     <div className="bg-white rounded-2xl p-6 border border-slate-200 shadow-sm col-span-1 lg:col-span-2 flex flex-col hover:shadow-md transition-shadow">
                         <h3 className="font-bold text-slate-900 mb-1">Compliance Performance</h3>
                         <p className="text-sm text-slate-500 mb-6">7-day adherence trend</p>
-                        <div className="flex-grow min-h-[200px] w-full">
-                            <ResponsiveContainer width="100%" height="100%">
-                                <LineChart data={trendData} margin={{ top: 30, right: 30, left: 0, bottom: 30 }}>
-                                    <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#E2E8F0" />
-                                    <XAxis dataKey="date" axisLine={{ stroke: '#E2E8F0' }} tickLine={false} tick={{ fontSize: 13, fill: '#64748B', fontWeight: 500 }} padding={{ left: 30, right: 30 }} dy={15} />
-                                    <YAxis type="number" domain={[0, 100]} ticks={[0, 25, 50, 75, 100]} axisLine={false} tickLine={false} tick={{ fontSize: 13, fill: '#64748B', fontWeight: 500 }} dx={-10} />
-                                    <Tooltip 
-                                        contentStyle={{ borderRadius: '12px', border: '1px solid #E2E8F0', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)', background: '#fff' }}
-                                        itemStyle={{ color: '#0F172A', fontWeight: 600 }}
-                                    />
-                                    <Line type="monotone" dataKey="score" stroke="#8B5CF6" strokeWidth={3} dot={{ r: 5, fill: '#fff', stroke: '#8B5CF6', strokeWidth: 2 }} activeDot={{ r: 7 }} />
-                                </LineChart>
-                            </ResponsiveContainer>
-                        </div>
+                        {hasTrendData ? (
+                            <div className="flex-grow min-h-[200px] w-full">
+                                <ResponsiveContainer width="100%" height="100%">
+                                    <LineChart data={trendData} margin={{ top: 30, right: 30, left: 0, bottom: 30 }}>
+                                        <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#E2E8F0" />
+                                        <XAxis dataKey="date" axisLine={{ stroke: '#E2E8F0' }} tickLine={false} tick={{ fontSize: 13, fill: '#64748B', fontWeight: 500 }} padding={{ left: 30, right: 30 }} dy={15} />
+                                        <YAxis type="number" domain={[0, 100]} ticks={[0, 25, 50, 75, 100]} axisLine={false} tickLine={false} tick={{ fontSize: 13, fill: '#64748B', fontWeight: 500 }} dx={-10} />
+                                        <Tooltip 
+                                            contentStyle={{ borderRadius: '12px', border: '1px solid #E2E8F0', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)', background: '#fff' }}
+                                            itemStyle={{ color: '#0F172A', fontWeight: 600 }}
+                                        />
+                                        <Line type="monotone" dataKey="score" stroke="#8B5CF6" strokeWidth={3} dot={{ r: 5, fill: '#fff', stroke: '#8B5CF6', strokeWidth: 2 }} activeDot={{ r: 7 }} />
+                                    </LineChart>
+                                </ResponsiveContainer>
+                            </div>
+                        ) : (
+                            <div className="flex-grow min-h-[200px] border border-dashed border-slate-200 rounded-xl flex items-center justify-center text-sm font-medium text-slate-500">
+                                No data available
+                            </div>
+                        )}
                     </div>
                 </div>
 
                 <div className="grid lg:grid-cols-3 gap-6 mb-8">
-                    {/* 5. Regulatory Changes Bar Chart */}
-                    <div className="bg-white rounded-2xl p-6 border border-slate-200 shadow-sm flex flex-col hover:shadow-md transition-shadow">
-                        <h3 className="font-bold text-slate-900 mb-1">Regulatory Updates</h3>
-                        <p className="text-sm text-slate-500 mb-6">Polices modified recently</p>
-                        <div className="flex-grow min-h-[200px]">
-                            <ResponsiveContainer width="100%" height="100%">
-                                <BarChart data={regChartData} margin={{ top: 0, right: 0, left: -20, bottom: 0 }}>
-                                    <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#E2E8F0" />
-                                    <XAxis dataKey="name" axisLine={false} tickLine={false} tick={{ fontSize: 12, fill: '#64748B', fontWeight: 500 }} dy={10} />
-                                    <YAxis axisLine={false} tickLine={false} tick={{ fontSize: 12, fill: '#64748B' }} />
-                                    <Tooltip cursor={{ fill: '#F8FAFC' }} contentStyle={{ borderRadius: '12px', border: '1px solid #E2E8F0', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)' }} />
-                                    <Bar dataKey="count" radius={[6, 6, 0, 0]}>
-                                        {regChartData.map((entry, index) => <Cell key={`cell-${index}`} fill={entry.fill} />)}
-                                    </Bar>
-                                </BarChart>
-                            </ResponsiveContainer>
+                    {/* 5. Regulatory Changes List */}
+                    <div className="bg-white rounded-2xl p-6 border border-slate-200 shadow-sm flex flex-col max-h-[350px] overflow-hidden hover:shadow-md transition-shadow">
+                        <h3 className="font-bold text-slate-900 mb-1">Regulatory Changes</h3>
+                        <p className="text-sm text-slate-500 mb-4">Recent policy deltas from latest analysis</p>
+
+                        <div className="flex items-center gap-2 mb-4 text-xs font-semibold text-slate-600">
+                            <span className="px-2 py-1 rounded-full bg-green-100 text-green-700">Added: {counts.added}</span>
+                            <span className="px-2 py-1 rounded-full bg-red-100 text-red-700">Removed: {counts.removed}</span>
+                            <span className="px-2 py-1 rounded-full bg-yellow-100 text-yellow-700">Modified: {counts.modified}</span>
+                        </div>
+
+                        <div className="overflow-y-auto pr-2">
+                            {visibleChanges.length > 0 ? (
+                                visibleChanges.map((item, index) => (
+                                    <div key={`${item.section || 'change'}-${index}`} className="border-b border-slate-100 pb-2 mb-2 last:border-b-0 last:mb-0">
+                                        <div className="flex justify-between items-center gap-3">
+                                            <span className="font-medium text-sm text-slate-800 truncate">
+                                                {item.section || item.category || 'General Update'}
+                                            </span>
+
+                                            <span className={`text-xs px-2 py-1 rounded-full capitalize ${
+                                                item.type === 'added'
+                                                    ? 'bg-green-100 text-green-700'
+                                                    : item.type === 'removed'
+                                                        ? 'bg-red-100 text-red-700'
+                                                        : 'bg-yellow-100 text-yellow-700'
+                                            }`}>
+                                                {item.type || 'modified'}
+                                            </span>
+                                        </div>
+
+                                        <p className="text-sm text-gray-600 mt-1">
+                                            {item.summary || 'No summary provided'}
+                                        </p>
+                                    </div>
+                                ))
+                            ) : (
+                                <p className="text-sm text-slate-500">No changes detected</p>
+                            )}
                         </div>
                     </div>
 
@@ -233,17 +754,32 @@ export default function Dashboard() {
                     <div className="bg-white rounded-2xl p-6 border border-slate-200 shadow-sm lg:col-span-1 flex flex-col hover:shadow-md transition-shadow">
                         <h3 className="font-bold text-slate-900 mb-1">Systems Impact</h3>
                         <p className="text-sm text-slate-500 mb-6">Severity across infrastructure</p>
-                        <div className="flex-grow min-h-[200px]">
-                            <ResponsiveContainer width="100%" height="100%">
-                                <BarChart layout="vertical" data={impactChartData} margin={{ top: 0, right: 30, left: 10, bottom: 0 }} barSize={16}>
-                                    <CartesianGrid strokeDasharray="3 3" horizontal={false} stroke="#E2E8F0" />
-                                    <XAxis type="number" hide />
-                                    <YAxis dataKey="name" type="category" axisLine={false} tickLine={false} tick={{ fontSize: 13, fill: '#0F172A', fontWeight: 500 }} />
-                                    <Tooltip cursor={{ fill: '#F8FAFC' }} contentStyle={{ borderRadius: '12px', border: '1px solid #E2E8F0', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)' }} />
-                                    <Bar dataKey="impact" fill="#A78BFA" radius={[0, 4, 4, 0]} label={{ position: 'right', fill: '#64748B', fontSize: 12, formatter: (val) => `${val}%` }} />
-                                </BarChart>
-                            </ResponsiveContainer>
-                        </div>
+                        {hasImpactData ? (
+                            <div className="flex-grow min-h-[200px]">
+                                <ResponsiveContainer width="100%" height="100%">
+                                    <BarChart layout="vertical" data={impactChartData} margin={{ top: 0, right: 24, left: 0, bottom: 0 }} barSize={16}>
+                                        <CartesianGrid strokeDasharray="3 3" horizontal={false} stroke="#E2E8F0" />
+                                        <XAxis type="number" hide />
+                                        <YAxis
+                                            dataKey="name"
+                                            type="category"
+                                            width={130}
+                                            interval={0}
+                                            tickFormatter={(label) => formatAxisLabel(label, 18)}
+                                            axisLine={false}
+                                            tickLine={false}
+                                            tick={{ fontSize: 13, fill: '#0F172A', fontWeight: 500 }}
+                                        />
+                                        <Tooltip cursor={{ fill: '#F8FAFC' }} contentStyle={{ borderRadius: '12px', border: '1px solid #E2E8F0', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)' }} />
+                                        <Bar dataKey="value" fill="#A78BFA" radius={[0, 4, 4, 0]} label={{ position: 'right', fill: '#64748B', fontSize: 12, formatter: (val) => `${val}%` }} />
+                                    </BarChart>
+                                </ResponsiveContainer>
+                            </div>
+                        ) : (
+                            <div className="flex-grow min-h-[200px] border border-dashed border-slate-200 rounded-xl flex items-center justify-center text-sm font-medium text-slate-500">
+                                No data available
+                            </div>
+                        )}
                     </div>
 
                     {/* 4. Compliance Gaps List */}
@@ -256,11 +792,11 @@ export default function Dashboard() {
                                 const color = isHigh ? 'bg-rose-500' : 'bg-amber-500';
                                 const bg = isHigh ? 'bg-rose-50' : 'bg-amber-50';
                                 return (
-                                    <div key={i} className={`p-4 rounded-[12px] border ${isHigh ? 'border-rose-100' : 'border-amber-100'} ${bg} flex items-start gap-4`}>
+                                    <div key={gap.id || gap.issue || `${currentTaskId || 'gap'}-${i}`} className={`p-4 rounded-[12px] border ${isHigh ? 'border-rose-100' : 'border-amber-100'} ${bg} flex items-start gap-4`}>
                                         <div className="mt-1"><AlertTriangle className={`w-5 h-5 ${isHigh ? 'text-rose-500' : 'text-amber-500'}`} /></div>
                                         <div className="flex-1">
-                                            <p className="text-sm font-bold text-slate-900 leading-tight mb-1">{gap.gap_identified || gap.gap || "Policy alignment gap identified"}</p>
-                                            <p className="text-xs text-slate-600 mb-3 line-clamp-1">{gap.recommendation || "Review and align internal controls with updated circular."}</p>
+                                            <p className="text-sm font-bold text-slate-900 leading-tight mb-1">{gap.issue || gap.gap_identified || gap.gap || "Policy alignment gap identified"}</p>
+                                            <p className="text-xs text-slate-600 mb-3 line-clamp-1">{gap.policy_reference ? `Ref: ${gap.policy_reference} (${gap.regulation_reference})` : gap.recommendation || "Review and align internal controls with updated circular."}</p>
                                             <div className="flex items-center gap-2">
                                                 <div className="h-1.5 w-full bg-slate-200/50 rounded-full overflow-hidden border border-black/5">
                                                     <div className={`h-full ${color}`} style={{ width: isHigh ? '90%' : '50%' }} />
@@ -280,6 +816,24 @@ export default function Dashboard() {
                     </div>
                 </div>
 
+                <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-6 mb-8 hover:shadow-md transition-shadow">
+                    <h3 className="font-bold text-slate-900 mb-1">Impacted Departments</h3>
+                    <p className="text-sm text-slate-500 mb-4">Teams affected by current regulatory updates</p>
+                    {impactDepartments.length > 0 ? (
+                        <div className="flex flex-wrap gap-2">
+                            {impactDepartments.map((department, idx) => (
+                                <span key={`${department}-${idx}`} className="inline-flex items-center px-3 py-1.5 rounded-full border border-indigo-200 bg-indigo-50 text-indigo-700 text-xs font-bold uppercase tracking-wider">
+                                    {department}
+                                </span>
+                            ))}
+                        </div>
+                    ) : (
+                        <div className="border border-dashed border-slate-200 rounded-xl px-4 py-6 text-sm font-medium text-slate-500 text-center">
+                            No data available
+                        </div>
+                    )}
+                </div>
+
                 {/* 7. Action Plan / Remediation Timeline */}
                 <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden mb-12 hover:shadow-md transition-shadow">
                     <div className="p-6 border-b border-slate-100 flex items-center justify-between">
@@ -294,41 +848,39 @@ export default function Dashboard() {
                         <table className="w-full text-left border-collapse">
                             <thead>
                                 <tr className="bg-slate-50 border-b border-slate-200">
-                                    <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase tracking-widest text-left">Task Description</th>
+                                    <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase tracking-widest text-left">Title</th>
+                                    <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase tracking-widest min-w-[300px]">Description</th>
                                     <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase tracking-widest w-40">Status</th>
-                                    <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase tracking-widest min-w-[200px]">Progress</th>
                                     <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase tracking-widest text-right">Deadline</th>
                                 </tr>
                             </thead>
                             <tbody className="divide-y divide-slate-100">
-                                {actionsData.length > 0 ? actionsData.slice(0,5).map((action, i) => {
-                                    const progress = action.status === 'completed' ? 100 : i % 2 === 0 ? 65 : 20;
-                                    const statusText = action.status === 'completed' ? 'Completed' : progress > 50 ? 'In Progress' : 'Pending Review';
-                                    const statusColor = progress === 100 ? 'text-emerald-700 bg-emerald-100/50 border border-emerald-200' 
-                                            : progress > 50 ? 'text-violet-700 bg-violet-100/50 border border-violet-200' 
+                                {hasActions ? actionsData.slice(0,5).map((action, i) => {
+                                    const status = (action?.status || '').toLowerCase();
+                                    const statusText = formatStatus(action?.status);
+                                    const statusColor = status === 'completed' ? 'text-emerald-700 bg-emerald-100/50 border border-emerald-200' 
+                                            : status === 'in_progress' || status === 'in-progress' ? 'text-violet-700 bg-violet-100/50 border border-violet-200'
+                                            : status === 'overdue' || status === 'blocked' ? 'text-rose-700 bg-rose-100/50 border border-rose-200'
                                             : 'text-amber-700 bg-amber-100/50 border border-amber-200';
+                                    const title = action?.title || action?.step || action?.action || action?.action_required || 'Untitled action';
+                                    const description = action?.description || action?.summary || 'No description provided';
+                                    const deadline = action?.deadline || action?.timeline || action?.due_date || 'TBD';
                                     
                                     return (
-                                        <tr key={i} className="hover:bg-slate-50 transition-colors">
+                                        <tr key={action.id || action.step || action.title || `${currentTaskId || 'action'}-${i}`} className="hover:bg-slate-50 transition-colors">
                                             <td className="px-6 py-4">
-                                                <p className="text-sm font-bold text-slate-900">{action.action_required || action.action || "Update internal compliance workflow"}</p>
-                                                <p className="text-xs font-medium text-slate-500 mt-0.5">{action.assigned_to || "Compliance Team"}</p>
+                                                <p className="text-sm font-bold text-slate-900">{title}</p>
+                                            </td>
+                                            <td className="px-6 py-4">
+                                                <p className="text-sm text-slate-600 leading-relaxed">{description}</p>
                                             </td>
                                             <td className="px-6 py-4">
                                                 <span className={`inline-flex px-2.5 py-1 rounded-md text-[11px] font-bold uppercase tracking-widest ${statusColor}`}>
                                                     {statusText}
                                                 </span>
                                             </td>
-                                            <td className="px-6 py-4">
-                                                <div className="flex items-center gap-3">
-                                                    <div className="h-2 w-full bg-slate-100 rounded-full overflow-hidden border border-black/5">
-                                                        <div className={`h-full ${progress === 100 ? 'bg-emerald-500' : 'bg-violet-500'}`} style={{ width: `${progress}%` }} />
-                                                    </div>
-                                                    <span className="text-xs font-bold text-slate-600">{progress}%</span>
-                                                </div>
-                                            </td>
                                             <td className="px-6 py-4 text-right">
-                                                <span className="text-sm font-semibold text-slate-700">{action.deadline || "Within 30 Days"}</span>
+                                                <span className="text-sm font-semibold text-slate-700">{deadline}</span>
                                             </td>
                                         </tr>
                                     );
@@ -336,7 +888,7 @@ export default function Dashboard() {
                                     <tr>
                                         <td colSpan={4} className="px-6 py-12 text-center">
                                             <CheckCircle2 className="w-8 h-8 text-slate-300 mx-auto mb-3" />
-                                            <p className="text-slate-500 font-medium text-sm">All systems compliant. No outstanding actions.</p>
+                                            <p className="text-slate-500 font-medium text-sm">No actions generated</p>
                                         </td>
                                     </tr>
                                 )}
@@ -366,7 +918,7 @@ export default function Dashboard() {
                             </thead>
                             <tbody className="divide-y divide-slate-100">
                                 {history.length > 0 ? history.slice().reverse().map((task, i) => (
-                                    <tr key={i} className="hover:bg-slate-50 transition-colors">
+                                    <tr key={task.task_id || `${task.created_at || 'task'}-${i}`} className="hover:bg-slate-50 transition-colors">
                                         <td className="px-6 py-4">
                                             <div className="flex items-center gap-3">
                                                 <div className="w-8 h-8 rounded-lg bg-slate-100 flex items-center justify-center">
@@ -384,7 +936,7 @@ export default function Dashboard() {
                                             </span>
                                         </td>
                                         <td className="px-6 py-4 text-sm font-semibold text-slate-500">
-                                            {new Date().toLocaleDateString()}
+                                            {new Date(task.created_at || Date.now()).toLocaleString()}
                                         </td>
                                         <td className="px-6 py-4 text-right">
                                             <button className="text-violet-600 hover:text-violet-700 text-sm font-bold">View Details</button>

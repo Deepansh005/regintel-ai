@@ -110,9 +110,9 @@ def generate_combined_hash(file_hashes: list[str], mode: str) -> str:
 async def upload_documents(
     background_tasks: BackgroundTasks,
     mode: str = Form("all"),
-    old_file: Optional[UploadFile] = File(None),
-    new_file: Optional[UploadFile] = File(None),
-    policy_file: Optional[UploadFile] = File(None)
+    old_file: Optional[list[UploadFile]] = File(None),
+    new_file: Optional[list[UploadFile]] = File(None),
+    policy_file: Optional[list[UploadFile]] = File(None)
 ):
     task_id = str(uuid.uuid4())
     file_paths = {}
@@ -135,23 +135,32 @@ async def upload_documents(
         with open(path, "wb") as buffer:
             buffer.write(content)
 
-        file_paths[section] = path
-        file_hashes[section] = file_hash
+        if section not in file_paths:
+            file_paths[section] = []
+        if section not in file_hashes:
+            file_hashes[section] = []
+
+        file_paths[section].append(path)
+        file_hashes[section].append(file_hash)
         return file_hash
 
-    if old_file and old_file.filename:
-        await _read_and_store(old_file, "old", "old")
+    old_files = [f for f in (old_file or []) if f and f.filename]
+    new_files = [f for f in (new_file or []) if f and f.filename]
+    policy_files = [f for f in (policy_file or []) if f and f.filename]
 
-    if new_file and new_file.filename:
-        await _read_and_store(new_file, "new", "new")
+    for index, upload_file in enumerate(old_files, start=1):
+        await _read_and_store(upload_file, f"old_{index}", "old")
 
-    if policy_file and policy_file.filename:
-        await _read_and_store(policy_file, "policy", "policy")
+    for index, upload_file in enumerate(new_files, start=1):
+        await _read_and_store(upload_file, f"new_{index}", "new")
+
+    for index, upload_file in enumerate(policy_files, start=1):
+        await _read_and_store(upload_file, f"policy_{index}", "policy")
 
     file_paths["mode"] = mode
 
     combined_hash = generate_combined_hash(
-        [file_hashes.get("old"), file_hashes.get("new"), file_hashes.get("policy")],
+        (file_hashes.get("old") or []) + (file_hashes.get("new") or []) + (file_hashes.get("policy") or []),
         mode,
     )
 

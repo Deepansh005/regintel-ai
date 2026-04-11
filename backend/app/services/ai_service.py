@@ -1,10 +1,464 @@
-from groq import Groq
-from app.core.config import GROQ_API_KEY
+﻿import asyncio
+import hashlib
 import json
+import logging
+import math
 import re
+import time
 from typing import Any
 
-client = Groq(api_key=GROQ_API_KEY)
+from pydantic import BaseModel, Field, ValidationError
+
+from app.services.llm_router import call_groq_with_retry
+
+logger = logging.getLogger(__name__)
+
+MAX_CALLS = 5
+DEFAULT_BATCH_SIZE = 3
+INTER_CALL_DELAY_SECONDS = 2
+MAX_INPUT_TOKENS = 2000
+MAX_TOTAL_TOKENS_PER_REQUEST = 5000
+BATCH_OUTPUT_TOKENS = 350
+SUMMARY_OUTPUT_TOKENS = 250
+MERGE_OUTPUT_TOKENS = 450
+SAFE_TRUNCATE_CHARS = 2000
+TOP_ITEM_LIMIT = 10
+STRICT_JSON_INSTRUCTION = (
+    "Return ONLY valid JSON. No explanation. No markdown. No text outside JSON. "
+    "Do not include summary strings or prose outside JSON."
+)
+STRICT_SCHEMA_INSTRUCTION = (
+    "Always respond with this top-level JSON schema exactly: "
+    '{"changes": [], "compliance_gaps": [], "impacts": [], "actions": []}'
+)
+
+
+class UnifiedResponseSchema(BaseModel):
+    changes: list[dict] = Field(default_factory=list)
+    compliance_gaps: list[dict] = Field(default_factory=list)
+    impacts: list[dict] = Field(default_factory=list)
+    actions: list[dict] = Field(default_factory=list)
+
+
+def empty_schema_response() -> dict:
+    return UnifiedResponseSchema().model_dump()
+
+
+def _schema_response(
+    changes: list[dict] | None = None,
+    compliance_gaps: list[dict] | None = None,
+    impacts: list[dict] | None = None,
+    actions: list[dict] | None = None,
+) -> dict:
+    payload = UnifiedResponseSchema(
+        changes=changes or [],
+        compliance_gaps=compliance_gaps or [],
+        impacts=impacts or [],
+        actions=actions or [],
+    )
+    return payload.model_dump()
+
+
+def deduplicate_items(items: list[dict]) -> list[dict]:
+    if not isinstance(items, list):
+        return []
+
+    deduped = []
+    seen = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+
+        issue = str(
+            item.get("issue")
+            or item.get("description")
+            or item.get("action")
+            or item.get("summary")
+            or item.get("title")
+            or ""
+        ).strip().lower()
+        regulation_requirement = str(item.get("regulation_requirement") or item.get("area") or item.get("owner") or "").strip().lower()
+        digest = hashlib.sha256(f"{issue}|{regulation_requirement}".encode("utf-8")).hexdigest()
+
+        if digest in seen:
+            continue
+        seen.add(digest)
+        deduped.append(item)
+
+    return deduped
+
+
+def _normalize_severity(value: Any) -> str:
+    level = str(value or "").strip().lower()
+    if level == "high":
+        return "High"
+    if level == "medium":
+        return "Medium"
+    if level == "low":
+        return "Low"
+    return "Medium"
+
+
+def _normalize_impact_item(item: dict) -> dict:
+    if not isinstance(item, dict):
+        return {
+            "title": "Compliance Impact",
+            "description": "Impact identified from regulatory changes and policy gaps",
+            "severity": "Medium",
+            "impacted_departments": [],
+        }
+
+    departments = item.get("impacted_departments")
+    if not isinstance(departments, list):
+        departments = item.get("departments")
+    if not isinstance(departments, list):
+        departments = item.get("department")
+
+    if isinstance(departments, str):
+        departments = [departments]
+    if not isinstance(departments, list):
+        departments = []
+
+    normalized_departments = []
+    seen_departments = set()
+    for department in departments:
+        label = str(department or "").strip()
+        if not label:
+            continue
+        key = label.lower()
+        if key in seen_departments:
+            continue
+        seen_departments.add(key)
+        normalized_departments.append(label)
+
+    title = str(item.get("title") or item.get("area") or "Compliance Impact").strip()
+    description = str(item.get("description") or item.get("summary") or "Impact identified from regulatory changes and policy gaps").strip()
+
+    return {
+        "title": title,
+        "description": description,
+        "severity": _normalize_severity(item.get("severity")),
+        "impacted_departments": normalized_departments,
+    }
+
+
+def _normalize_impacts_list(items: list[dict]) -> list[dict]:
+    if not isinstance(items, list):
+        return []
+
+    normalized = [_normalize_impact_item(item) for item in items if isinstance(item, dict)]
+    if not normalized:
+        return []
+
+    # Keep severity distribution realistic: mostly Medium, some Low, limited High.
+    total = len(normalized)
+    max_high = max(1, math.ceil(total * 0.3))
+    min_high = max(1, math.floor(total * 0.2)) if total >= 4 else 1
+
+    high_indices = [index for index, item in enumerate(normalized) if item.get("severity") == "High"]
+    medium_indices = [index for index, item in enumerate(normalized) if item.get("severity") == "Medium"]
+    low_indices = [index for index, item in enumerate(normalized) if item.get("severity") == "Low"]
+
+    if len(high_indices) > max_high:
+        for index in high_indices[max_high:]:
+            normalized[index]["severity"] = "Medium"
+
+    elif len(high_indices) < min_high and medium_indices:
+        needed = min_high - len(high_indices)
+        for index in medium_indices[:needed]:
+            normalized[index]["severity"] = "High"
+
+    # Ensure there is at least one Low impact when we have enough entries.
+    if total >= 3 and not any(item.get("severity") == "Low" for item in normalized):
+        demote_index = next((idx for idx, item in enumerate(normalized) if item.get("severity") == "Medium"), None)
+        if demote_index is None:
+            demote_index = next((idx for idx, item in enumerate(normalized) if item.get("severity") == "High"), None)
+        if demote_index is not None:
+            normalized[demote_index]["severity"] = "Low"
+
+    return normalized
+
+
+def _parse_json_without_duplicate_keys(raw: str):
+    def _dedupe_pairs(pairs):
+        merged = {}
+        for key, value in pairs:
+            if key not in merged:
+                merged[key] = value
+        return merged
+
+    return json.loads(raw, object_pairs_hook=_dedupe_pairs)
+
+
+def _strip_trailing_commas(raw: str) -> str:
+    if not isinstance(raw, str):
+        return raw
+    return re.sub(r",\s*([}\]])", r"\1", raw)
+
+
+def clean_llm_json(raw_response: str) -> dict | None:
+    if not raw_response or not isinstance(raw_response, str):
+        return None
+
+    original = raw_response.strip()
+    candidate = _strip_trailing_commas(original)
+
+    parsed = None
+
+    # Attempt 1: direct parse.
+    try:
+        parsed = _parse_json_without_duplicate_keys(candidate)
+    except Exception:
+        parsed = None
+
+    # Attempt 2: fenced JSON block extraction.
+    if parsed is None:
+        fenced_match = re.search(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", candidate, re.IGNORECASE)
+        if fenced_match:
+            extracted = _strip_trailing_commas(fenced_match.group(1).strip())
+            try:
+                parsed = _parse_json_without_duplicate_keys(extracted)
+            except Exception:
+                parsed = None
+
+    # Attempt 3: first object-like region extraction.
+    if parsed is None:
+        json_match = re.search(r"\{[\s\S]*\}", candidate)
+        if json_match:
+            extracted = _strip_trailing_commas(json_match.group(0).strip())
+            try:
+                parsed = _parse_json_without_duplicate_keys(extracted)
+            except Exception:
+                parsed = None
+
+    if parsed is None:
+        return UnifiedResponseSchema().model_dump()
+
+    if isinstance(parsed, list):
+        parsed = {"compliance_gaps": parsed}
+
+    if not isinstance(parsed, dict):
+        return None
+
+    normalized = {
+        "changes": parsed.get("changes") if isinstance(parsed.get("changes"), list) else [],
+        "compliance_gaps": parsed.get("compliance_gaps") if isinstance(parsed.get("compliance_gaps"), list) else [],
+        "impacts": parsed.get("impacts") if isinstance(parsed.get("impacts"), list) else [],
+        "actions": parsed.get("actions") if isinstance(parsed.get("actions"), list) else [],
+    }
+
+    if not normalized["compliance_gaps"] and isinstance(parsed.get("gaps"), list):
+        normalized["compliance_gaps"] = parsed.get("gaps") or []
+
+    legacy_impact = parsed.get("impact")
+    if not normalized["impacts"]:
+        if isinstance(legacy_impact, list):
+            normalized["impacts"] = legacy_impact
+        elif isinstance(legacy_impact, dict):
+            normalized["impacts"] = [legacy_impact]
+
+    if isinstance(parsed.get("actions"), dict):
+        normalized["actions"] = [parsed.get("actions")]
+
+    normalized["compliance_gaps"] = deduplicate_items(normalized["compliance_gaps"])
+    normalized["impacts"] = deduplicate_items(_normalize_impacts_list(normalized["impacts"]))
+    normalized["actions"] = deduplicate_items(normalized["actions"])
+
+    try:
+        return UnifiedResponseSchema.model_validate(normalized).model_dump()
+    except ValidationError:
+        return None
+
+
+def estimate_tokens(text: str) -> int:
+    return len(text or "") // 4
+
+
+def _item_text(item) -> str:
+    if isinstance(item, dict):
+        if "left" in item or "right" in item:
+            return f"OLD:\n{item.get('left') or ''}\n\nNEW:\n{item.get('right') or ''}"
+        return str(item.get("page_content") or item.get("text") or item.get("content") or "")
+    if isinstance(item, (list, tuple)):
+        return "\n\n".join(str(part or "") for part in item)
+    return str(getattr(item, "page_content", getattr(item, "text", item)) or "")
+
+
+def _truncate_text_for_tokens(text: str, max_tokens: int = MAX_INPUT_TOKENS) -> str:
+    value = (text or "").strip()
+    if not value:
+        return ""
+    if estimate_tokens(value) <= max_tokens:
+        return value
+    return value[:SAFE_TRUNCATE_CHARS]
+
+
+def _truncate_item_for_tokens(item):
+    if isinstance(item, dict):
+        truncated = dict(item)
+        if "left" in truncated:
+            truncated["left"] = _truncate_text_for_tokens(str(truncated.get("left") or ""))
+        if "right" in truncated:
+            truncated["right"] = _truncate_text_for_tokens(str(truncated.get("right") or ""))
+        if "text" in truncated:
+            truncated["text"] = _truncate_text_for_tokens(str(truncated.get("text") or ""))
+        if "page_content" in truncated:
+            truncated["page_content"] = _truncate_text_for_tokens(str(truncated.get("page_content") or ""))
+        return truncated
+
+    if isinstance(item, tuple):
+        return tuple(_truncate_text_for_tokens(str(part or "")) for part in item)
+
+    if isinstance(item, list):
+        return [_truncate_text_for_tokens(str(part or "")) for part in item]
+
+    if isinstance(item, str):
+        return _truncate_text_for_tokens(item)
+
+    return item
+
+
+def _score_relevance(text: str) -> int:
+    value = (text or "").lower()
+    score = 0
+    for keyword in (
+        "must",
+        "shall",
+        "required",
+        "prohibited",
+        "compliance",
+        "policy",
+        "regulation",
+        "report",
+        "risk",
+        "audit",
+        "deadline",
+        "penalty",
+        "threshold",
+        "section",
+    ):
+        if keyword in value:
+            score += 3
+    if re.search(r"\b\d+%\b", value) or re.search(r"\b\d+(?:\.\d+)?\b", value):
+        score += 4
+    if value.isupper() and len(value) < 120:
+        score += 2
+    score += min(len(value) // 500, 4)
+    return score
+
+
+def _score_item(item) -> int:
+    return _score_relevance(_item_text(item))
+
+
+def _rank_and_limit_items(items: list, limit: int = TOP_ITEM_LIMIT) -> list:
+    ranked = sorted(
+        items or [],
+        key=lambda item: (_score_item(item), estimate_tokens(_item_text(item))),
+        reverse=True,
+    )
+    return ranked[:limit]
+
+
+def create_token_safe_batches(items, max_input_tokens: int = MAX_INPUT_TOKENS):
+    batches = []
+    current_batch = []
+    current_tokens = 0
+
+    for item in items or []:
+        normalized_item = item
+        item_text = _item_text(normalized_item)
+        item_tokens = estimate_tokens(item_text)
+
+        if item_tokens > max_input_tokens:
+            normalized_item = _truncate_item_for_tokens(normalized_item)
+            item_text = _item_text(normalized_item)
+            item_tokens = estimate_tokens(item_text)
+
+        if current_batch and current_tokens + item_tokens > max_input_tokens:
+            batches.append(current_batch)
+            current_batch = [normalized_item]
+            current_tokens = item_tokens
+        else:
+            current_batch.append(normalized_item)
+            current_tokens += item_tokens
+
+    if current_batch:
+        batches.append(current_batch)
+
+    return batches
+
+
+def _derive_batch_input_budget(item_count: int, use_summary: bool) -> int:
+    batch_calls = max(1, min(MAX_CALLS - 1 - (1 if use_summary else 0), item_count))
+    planned_calls = batch_calls + 1 + (1 if use_summary else 0)
+    reserved_output = batch_calls * BATCH_OUTPUT_TOKENS + MERGE_OUTPUT_TOKENS + (SUMMARY_OUTPUT_TOKENS if use_summary else 0)
+    available_input = max(800, MAX_TOTAL_TOKENS_PER_REQUEST - reserved_output)
+    return max(500, min(MAX_INPUT_TOKENS, available_input // planned_calls))
+
+
+def _ensure_prompt_token_safe(prompt: str) -> str:
+    value = prompt or ""
+    if estimate_tokens(value) > MAX_INPUT_TOKENS:
+        return value[:MAX_INPUT_TOKENS * 4]
+    return value
+
+
+def split_into_chunks(text: str, chunk_size: int = 2500) -> list[str]:
+    """Split text into manageable chunks for Groq (TPM safe)."""
+    if not text or not isinstance(text, str):
+        return []
+
+    text = text.strip()
+    if len(text) <= chunk_size:
+        return [text]
+
+    chunks = []
+    words = text.split()
+    current_chunk = []
+    current_length = 0
+
+    for word in words:
+        word_len = len(word) + 1
+        if current_length + word_len > chunk_size and current_chunk:
+            chunks.append(" ".join(current_chunk))
+            current_chunk = [word]
+            current_length = word_len
+        else:
+            current_chunk.append(word)
+            current_length += word_len
+
+    if current_chunk:
+        chunks.append(" ".join(current_chunk))
+
+    return chunks
+
+
+def merge_chunk_results(results: list[dict], result_key: str) -> list[dict]:
+    """Merge results from multiple analyses, removing duplicates."""
+    merged = []
+    seen_keys = set()
+
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+
+        items = result.get(result_key, [])
+        if not isinstance(items, list):
+            continue
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+
+            key_fields = [str(item.get("issue") or item.get("summary") or "").lower().strip()[:100]]
+            key = "|".join(key_fields)
+
+            if key not in seen_keys:
+                merged.append(item)
+                seen_keys.add(key)
+
+    return merged
 
 
 def trim_text(text, max_len: int = 300):
@@ -12,49 +466,42 @@ def trim_text(text, max_len: int = 300):
     return value[:max_len]
 
 
-def safe_llm_call(fn):
-    try:
-        result = fn()
-        if not result:
-            raise Exception("Empty response")
-        return result
-    except Exception as e:
-        print("LLM ERROR:", e)
-        return None
-
-
 def default_impact(systems=None):
-    return {
-        "impact": {
-            "departments": ["Compliance", "Risk"],
-            "systems": systems if isinstance(systems, list) and systems else ["Core System"],
-            "risk_level": "Medium",
-            "priority": "Medium",
-            "summary": "Impact generated using fallback due to size constraints",
-        }
-    }
+    default_departments = []
+    if isinstance(systems, list):
+        default_departments = [str(system).strip() for system in systems if str(system or "").strip()]
+
+    return _schema_response(
+        impacts=[
+            {
+                "title": "Compliance Impact",
+                "description": "Impact assessment based on identified compliance gaps",
+                "severity": "Medium",
+                "impacted_departments": default_departments,
+            }
+        ]
+    )
 
 
 def default_actions():
-    return {
-        "actions": [
+    return _schema_response(
+        actions=[
             {
-                "title": "Review regulatory gaps",
-                "description": "Analyze and update policy accordingly",
+                "action": "Review regulatory gaps and update policy accordingly",
                 "priority": "Medium",
-                "status": "Pending",
-                "deadline": "1-2 weeks",
+                "owner": "Compliance",
+                "timeline": "1-2 weeks",
             }
         ]
-    }
+    )
 
 
 def _default_changes_response() -> dict:
-    return {"changes": []}
+    return _schema_response()
 
 
 def _default_gaps_response() -> dict:
-    return {"gaps": []}
+    return _schema_response()
 
 
 def _extract_changes(payload) -> list:
@@ -69,7 +516,9 @@ def _extract_changes(payload) -> list:
 
 def _extract_gaps(payload) -> list:
     if isinstance(payload, dict):
-        gaps = payload.get("gaps")
+        gaps = payload.get("compliance_gaps")
+        if not isinstance(gaps, list):
+            gaps = payload.get("gaps")
         if isinstance(gaps, list):
             return gaps
     if isinstance(payload, list):
@@ -84,42 +533,6 @@ def _priority_value(risk: Any) -> int:
     if level == "medium":
         return 2
     return 1
-
-
-def _limit_changes(changes) -> list:
-    return _extract_changes(changes)[:5]
-
-
-def _limit_gaps(gaps) -> list:
-    items = _extract_gaps(gaps)
-    items = sorted(
-        items,
-        key=lambda item: _priority_value((item or {}).get("risk") or (item or {}).get("risk_level")),
-        reverse=True,
-    )
-    return items[:8]
-
-
-def _gap_texts(gaps) -> list:
-    texts = []
-    for gap in _limit_gaps(gaps):
-        if not isinstance(gap, dict):
-            continue
-        issue = trim_text(gap.get("issue") or gap.get("gap") or "", 200)
-        if issue:
-            texts.append(issue)
-    return texts[:5]
-
-
-def _change_texts(changes) -> list:
-    texts = []
-    for change in _limit_changes(changes):
-        if not isinstance(change, dict):
-            continue
-        summary = trim_text(change.get("summary") or change.get("section") or "", 200)
-        if summary:
-            texts.append(summary)
-    return texts[:5]
 
 
 def _normalize_action(item: dict) -> dict:
@@ -141,16 +554,15 @@ def _normalize_impact_payload(payload, systems=None) -> dict:
     if not isinstance(payload, dict):
         return base
 
-    inner = payload.get("impact") if isinstance(payload.get("impact"), dict) else payload
-    return {
-        "impact": {
-            "departments": inner.get("departments") if isinstance(inner.get("departments"), list) else base["impact"]["departments"],
-            "systems": inner.get("systems") if isinstance(inner.get("systems"), list) and inner.get("systems") else base["impact"]["systems"],
-            "risk_level": inner.get("risk_level") or base["impact"]["risk_level"],
-            "priority": inner.get("priority") or base["impact"]["priority"],
-            "summary": trim_text(inner.get("summary") or base["impact"]["summary"], 300),
-        }
-    }
+    legacy_impact = payload.get("impact")
+    if isinstance(legacy_impact, dict):
+        return _schema_response(impacts=_normalize_impacts_list([legacy_impact]))
+
+    impacts = payload.get("impacts")
+    if isinstance(impacts, list):
+        return _schema_response(impacts=_normalize_impacts_list(impacts))
+
+    return base
 
 
 def _parse_json_response(content):
@@ -162,331 +574,778 @@ def _parse_json_response(content):
         return None
 
     try:
-        return json.loads(match.group(0))
+        return _parse_json_without_duplicate_keys(match.group(0))
     except Exception:
         return None
 
 
-def detect_changes(old_text: str, new_text: str) -> dict:
+def _call_groq_safe(
+    prompt: str,
+    system_prompt: str = "You are a regulatory analysis AI.",
+    max_tokens: int = 1000,
+    retries: int = 3,
+    expect_schema: bool = True,
+    preferred_key_index: int | None = None,
+    invalid_previous_response: bool = False,
+) -> dict:
+    """Safe Groq call with error handling and JSON parsing."""
     try:
-        old_text = trim_text(old_text, 2200)
-        new_text = trim_text(new_text, 2200)
+        retry_message = "\nPrevious response invalid. Return only JSON." if invalid_previous_response else ""
+        strict_schema_message = f"\n{STRICT_SCHEMA_INSTRUCTION}" if expect_schema else ""
+        messages = [
+            {
+                "role": "system",
+                "content": f"{system_prompt}\n{STRICT_JSON_INSTRUCTION}{strict_schema_message}{retry_message}",
+            },
+            {"role": "user", "content": prompt},
+        ]
 
-        prompt = f"""
-You are a senior regulatory analyst specializing in financial regulations (RBI, SEBI, Basel, etc.).
+        try:
+            content = call_groq_with_retry(
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=0.0,
+                retries=retries,
+                initial_backoff=2.0,
+                preferred_key_index=preferred_key_index,
+                response_format={"type": "json_object"},
+            )
+        except Exception as json_mode_error:
+            error_text = str(json_mode_error).lower()
+            json_generation_failed = (
+                "json_validate_failed" in error_text
+                or "failed to generate json" in error_text
+                or "invalid_request_error" in error_text
+            )
 
-TASK: Identify ONLY material regulatory changes between OLD and NEW context.
+            if not json_generation_failed:
+                raise
 
-CRITICAL RULES:
-1. Use ONLY information explicitly present in provided context
-2. Do NOT invent or assume missing details
-3. Focus on HIGH-IMPORTANCE changes only (ignore minor wording variations)
-4. Remove exact duplicates before output
-5. Each change must be ≤2 lines, specific and actionable
-6. If NO material changes found, return empty array
+            # Fallback: drop API-level response_format and rely on strict prompt + parser.
+            logger.warning("json_object mode failed, falling back to prompt-only JSON parsing: %s", json_mode_error)
+            content = call_groq_with_retry(
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=0.0,
+                retries=1,
+                initial_backoff=1.0,
+                preferred_key_index=preferred_key_index,
+            )
 
-MATERIAL CHANGE TYPES:
-- New regulatory requirements added
-- Existing requirements removed or relaxed
-- Thresholds, deadlines, or criteria changed
-- New penalties, fines, or consequences introduced
-- Scope or applicability widened/narrowed
+        if not content:
+            return {"error": "Empty response from Groq"}
 
-IGNORE:
-- Rewordings without substance change
-- Clarifications that don't change meaning
-- Administrative format changes
+        logger.info("llm_raw_response=%s", content[:1200])
 
-Return ONLY valid JSON with NO additional text:
+        if expect_schema:
+            parsed = clean_llm_json(content)
+        else:
+            parsed = _parse_json_response(content)
+
+        if parsed is None:
+            logger.warning("Could not parse JSON response: %s", content[:200])
+            return UnifiedResponseSchema().model_dump() if expect_schema else {"error": "Could not parse JSON response"}
+
+        if expect_schema:
+            parsed = UnifiedResponseSchema.model_validate(parsed).model_dump()
+
+        logger.info("llm_cleaned_json=%s", json.dumps(parsed, ensure_ascii=True)[:1200])
+
+        return parsed
+
+    except Exception as exc:
+        logger.error("Groq call failed: %s", exc)
+        return {"error": str(exc)}
+
+
+def _safe_call(
+    prompt: str,
+    max_tokens: int = 1300,
+    retries: int = 3,
+    initial_backoff: int = 5,
+    expect_schema: bool = True,
+    preferred_key_index: int | None = None,
+) -> dict:
+    prompt = _ensure_prompt_token_safe(prompt)
+    backoff = initial_backoff
+    last_error = "Groq failed after retries"
+
+    for attempt in range(retries):
+        # Retry never accumulates partial outputs; only the final successful payload is returned.
+        result = _call_groq_safe(
+            prompt=prompt,
+            max_tokens=max_tokens,
+            retries=2,
+            expect_schema=expect_schema,
+            preferred_key_index=preferred_key_index,
+            invalid_previous_response=(attempt > 0),
+        )
+        if isinstance(result, dict) and "error" not in result:
+            return result
+
+        if isinstance(result, dict) and isinstance(result.get("error"), str):
+            last_error = result.get("error")
+
+        logger.warning("safe_call failed on attempt %s/%s. Backoff=%ss", attempt + 1, retries, backoff)
+        is_last_attempt = attempt >= (retries - 1)
+        if is_last_attempt:
+            break
+
+        time.sleep(backoff)
+        backoff *= 2
+
+    return {"error": f"Groq failed after retries: {last_error}"}
+
+
+def _optional_summary(label: str, text: str, call_budget: int) -> str:
+    """Build a compact context summary when input is large and there is call budget left."""
+    value = (text or "").strip()
+    if call_budget < 3 or estimate_tokens(value) < 800:
+        return ""
+
+    prompt = f"""
+Summarize key regulatory points from this {label} document.
+Avoid repetition. Be concise but complete.
+
+Return ONLY valid JSON. No explanation. No markdown. No text outside JSON.\n\nJSON schema:
+{{
+  "summary": "Compact summary preserving key obligations, thresholds, timelines, penalties, and scope"
+}}
+
+DOCUMENT:
+{_truncate_text_for_tokens(value, max_tokens=MAX_INPUT_TOKENS)}
+"""
+
+    result = _safe_call(prompt=prompt, max_tokens=450, retries=2, initial_backoff=4, expect_schema=False)
+    if isinstance(result, dict) and "error" not in result:
+        summary_text = result.get("summary") if isinstance(result.get("summary"), str) else None
+        if summary_text and summary_text.strip():
+            return summary_text.strip()
+
+    return ""
+
+
+def _final_merge_changes(partials: list[dict]) -> dict:
+    if not partials:
+        return {"changes": []}
+
+    prompt = f"""
+Combine the following analyses into one final JSON response.
+Avoid repetition. Be concise but complete.
+Keep only material, non-duplicate regulatory changes.
+
+Return ONLY valid JSON. No explanation. No markdown. No text outside JSON.\n\nJSON schema:
 {{
   "changes": [
     {{
       "type": "added | removed | modified",
       "category": "KYC | Risk | Capital | Reporting | Governance | Audit | Other",
-      "summary": "Specific change in ≤2 lines. E.g., 'KYC refresh required every 2 years (was 3) for retail customers'",
-      "impact": "Brief note of significance"
+      "summary": "Specific change in <=2 lines",
+      "impact": "Brief significance note"
     }}
   ]
 }}
 
-If context insufficient for reliable analysis, return empty changes array.
-
-OLD REGULATORY CONTEXT:
-{old_text}
-
-NEW REGULATORY CONTEXT:
-{new_text}
+PARTIAL_ANALYSES:
+{json.dumps(partials, ensure_ascii=True)}
 """
 
-        response = safe_llm_call(lambda: client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[
-                {"role": "system", "content": "You are a regulatory analysis AI. You MUST return ONLY valid JSON with zero extra text, explanation, or markdown. No preamble, no postscript."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.0,
-            max_tokens=2500,
-        ))
+    merged = _safe_call(prompt=prompt, max_tokens=1200, retries=2, initial_backoff=4)
+    if isinstance(merged, dict) and "error" not in merged and isinstance(merged.get("changes"), list):
+        return {"changes": merged.get("changes", [])[:5]}
 
-        if response is None:
+    fallback = merge_chunk_results(partials, "changes")
+    return {"changes": fallback[:5] if fallback else []}
+
+
+def _final_merge_gaps(partials: list[dict]) -> dict:
+    if not partials:
+        return _schema_response()
+
+    prompt = f"""
+Combine the following analyses into one final JSON response.
+Avoid repetition. Be concise but complete.
+Keep only material, non-duplicate compliance gaps.
+
+Return ONLY valid JSON. No explanation. No markdown. No text outside JSON.\n\nJSON schema:
+{{
+  "compliance_gaps": [
+    {{
+      "issue": "Gap description <=2 lines",
+      "risk": "High | Medium | Low",
+      "regulation_requirement": "What regulation requires",
+      "policy_current_state": "What policy says/doesn't say"
+    }}
+  ]
+}}
+
+PARTIAL_ANALYSES:
+{json.dumps(partials, ensure_ascii=True)}
+"""
+
+    merged = _safe_call(prompt=prompt, max_tokens=1200, retries=2, initial_backoff=4)
+    if isinstance(merged, dict) and "error" not in merged and isinstance(merged.get("compliance_gaps"), list):
+        gaps = merged.get("compliance_gaps", [])
+        gaps = sorted(gaps, key=lambda g: _priority_value((g or {}).get("risk", "Low")), reverse=True)
+        return _schema_response(compliance_gaps=gaps[:6])
+
+    fallback = merge_chunk_results(partials, "compliance_gaps")
+    fallback = sorted(fallback, key=lambda g: _priority_value((g or {}).get("risk", "Low")), reverse=True)
+    return _schema_response(compliance_gaps=fallback[:6] if fallback else [])
+
+
+
+
+MAX_PARALLEL_CALLS = 3
+
+
+def build_batches(chunks, max_tokens_per_batch: int):
+    return create_token_safe_batches(chunks, max_input_tokens=max_tokens_per_batch)
+
+
+async def process_in_parallel(tasks: list[dict], label: str = "pipeline") -> list[Any]:
+    semaphore = asyncio.Semaphore(MAX_PARALLEL_CALLS)
+
+    async def run_task(position: int, task: dict):
+        async with semaphore:
+            callable_fn = task.get("callable")
+            args = task.get("args") or []
+            kwargs = dict(task.get("kwargs") or {})
+            kwargs.setdefault("preferred_key_index", position % MAX_PARALLEL_CALLS)
+            started = time.perf_counter()
+            logger.info(
+                "%s_task_start position=%s preferred_key_index=%s",
+                label,
+                position,
+                kwargs.get("preferred_key_index"),
+            )
+            result = await asyncio.to_thread(callable_fn, *args, **kwargs)
+            elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
+            logger.info("%s_task_done position=%s elapsed_ms=%s", label, position, elapsed_ms)
+            return position, result
+
+    futures = [asyncio.create_task(run_task(index, task)) for index, task in enumerate(tasks)]
+    results = await asyncio.gather(*futures, return_exceptions=False)
+    results.sort(key=lambda item: item[0])
+    return [item[1] for item in results]
+
+
+async def process_batches_parallel(batch_entries: list[dict], label: str = "batch") -> list[dict]:
+    semaphore = asyncio.Semaphore(MAX_PARALLEL_CALLS)
+
+    async def run_entry(position: int, entry: dict):
+        async with semaphore:
+            prompt = entry.get("prompt") or ""
+            max_tokens = int(entry.get("max_tokens") or BATCH_OUTPUT_TOKENS)
+            retries = int(entry.get("retries") or 3)
+            backoff = float(entry.get("initial_backoff") or 5)
+            batch_size = entry.get("batch_size") or 0
+            estimated_tokens = entry.get("estimated_tokens") or estimate_tokens(prompt)
+            started = time.perf_counter()
+            logger.info(
+                "%s_parallel_start position=%s batch_size=%s estimated_tokens=%s max_tokens=%s",
+                label,
+                position,
+                batch_size,
+                estimated_tokens,
+                max_tokens,
+            )
+            result = await asyncio.to_thread(
+                _safe_call,
+                prompt,
+                max_tokens,
+                retries,
+                backoff,
+                True,
+                position % MAX_PARALLEL_CALLS,
+            )
+            elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
+            logger.info(
+                "%s_parallel_done position=%s batch_size=%s estimated_tokens=%s elapsed_ms=%s",
+                label,
+                position,
+                batch_size,
+                estimated_tokens,
+                elapsed_ms,
+            )
+            return position, result
+
+    tasks = [asyncio.create_task(run_entry(index, entry)) for index, entry in enumerate(batch_entries)]
+    results = await asyncio.gather(*tasks, return_exceptions=False)
+    results.sort(key=lambda item: item[0])
+    return [item[1] for item in results]
+
+
+def _build_change_prompt(batch_index: int, pair_batches: list, batch: list, summary: str) -> str:
+    old_batch = "\n\n".join([f"[OLD_{i + 1}]\n{item['left']}" for i, item in enumerate(batch)])
+    new_batch = "\n\n".join([f"[NEW_{i + 1}]\n{item['right']}" for i, item in enumerate(batch)])
+    return f"""
+You are a regulatory analyst. Compare OLD and NEW context and identify ONLY material changes.
+Avoid repetition. Be concise but complete.
+Limit response to essential insights only. Avoid long explanations.
+
+CRITICAL:
+1. Use ONLY info from provided text
+2. Focus on HIGH-IMPORTANCE changes only
+3. Return empty changes array if no material changes
+4. Do NOT invent details
+
+REFERENCE SUMMARY:
+{summary or "N/A"}
+
+BATCH {batch_index}/{len(pair_batches)}
+
+OLD:
+{old_batch[:7000]}
+
+NEW:
+{new_batch[:7000]}
+
+Return ONLY valid JSON. No explanation. No markdown. No text outside JSON.\n\nJSON schema:
+{{
+  "changes": [
+    {{
+      "type": "added | removed | modified",
+      "category": "KYC | Risk | Capital | Reporting | Governance | Audit | Other",
+      "summary": "Specific change in <=2 lines",
+      "impact": "Brief significance note"
+    }}
+  ]
+}}
+"""
+
+
+def _build_gap_prompt(batch_index: int, pair_batches: list, batch: list, summary: str) -> str:
+    regulation_batch = "\n\n".join([f"[REG_{i + 1}]\n{item['left']}" for i, item in enumerate(batch)])
+    policy_batch = "\n\n".join([f"[POL_{i + 1}]\n{item['right']}" for i, item in enumerate(batch)])
+    return f"""
+You are a compliance auditor assessing gaps ONLY from provided context.
+Avoid repetition. Be concise but complete.
+Limit response to essential insights only. Avoid long explanations.
+
+TASK: Identify gaps where POLICY fails to meet REGULATION.
+
+CRITICAL:
+1. Use ONLY info from provided text
+2. Focus on HIGH-IMPACT gaps only
+3. Return empty compliance_gaps array if none found
+4. Do NOT assume unstated requirements
+
+REFERENCE SUMMARY:
+{summary or "N/A"}
+
+BATCH {batch_index}/{len(pair_batches)}
+
+REGULATION:
+{regulation_batch[:7000]}
+
+POLICY:
+{policy_batch[:7000]}
+
+Return ONLY valid JSON. No explanation. No markdown. No text outside JSON.\n\nJSON schema:
+{{
+  "compliance_gaps": [
+    {{
+      "issue": "Gap description <=2 lines",
+      "risk": "High | Medium | Low",
+      "regulation_requirement": "What regulation requires",
+      "policy_current_state": "What policy says/doesn't say"
+    }}
+  ]
+}}
+"""
+
+
+def _prepare_pairs(left_text: str, right_text: str, left_label: str, right_label: str) -> list[dict]:
+    left_chunks = split_into_chunks(left_text, chunk_size=2500)
+    right_chunks = split_into_chunks(right_text, chunk_size=2500)
+
+    max_len = max(len(left_chunks), len(right_chunks))
+    left_chunks.extend([""] * (max_len - len(left_chunks)))
+    right_chunks.extend([""] * (max_len - len(right_chunks)))
+
+    pairs = []
+    for left_chunk, right_chunk in zip(left_chunks, right_chunks):
+        if not (left_chunk or "").strip() and not (right_chunk or "").strip():
+            continue
+        pair_item = {"left": _truncate_text_for_tokens(left_chunk), "right": _truncate_text_for_tokens(right_chunk)}
+        pair_item["score"] = _score_item(pair_item)
+        pairs.append(pair_item)
+
+    if not pairs:
+        return []
+
+    pairs = _rank_and_limit_items(pairs, limit=TOP_ITEM_LIMIT)
+    return pairs
+
+
+def _sequential_summary(label: str, combined_text: str, call_budget: int) -> str:
+    return _optional_summary(label, combined_text, call_budget)
+
+
+def detect_changes(old_text: str, new_text: str) -> dict:
+    """Detect material changes using token-aware batched analysis."""
+    try:
+        if not old_text or not new_text:
             return _default_changes_response()
 
-        parsed = _parse_json_response(response.choices[0].message.content)
-        changes = parsed.get("changes") if isinstance(parsed, dict) else None
-        if not isinstance(changes, list):
+        old_text = _truncate_text_for_tokens(trim_text(old_text, 5500))
+        new_text = _truncate_text_for_tokens(trim_text(new_text, 5500))
+
+        pairs = _prepare_pairs(old_text, new_text, "OLD", "NEW")
+        if not pairs:
             return _default_changes_response()
 
-        return {"changes": changes[:5] if changes else []}
+        use_summary = len(pairs) <= 6
+        batch_input_budget = _derive_batch_input_budget(len(pairs), use_summary=use_summary)
+        max_batch_calls = max(1, MAX_CALLS - 1 - (1 if use_summary else 0))
+        pair_batches = build_batches(pairs, max_tokens_per_batch=batch_input_budget)
+        while len(pair_batches) > max_batch_calls and batch_input_budget < MAX_INPUT_TOKENS:
+            batch_input_budget = min(MAX_INPUT_TOKENS, batch_input_budget + 250)
+            pair_batches = build_batches(pairs, max_tokens_per_batch=batch_input_budget)
+
+        logger.info("detect_changes: items=%s batches=%s batch_budget=%s", len(pairs), len(pair_batches), batch_input_budget)
+
+        request_tokens_used = 0
+
+        def reserve_tokens(prompt_text: str, output_tokens: int) -> bool:
+            nonlocal request_tokens_used
+            estimated_tokens = estimate_tokens(prompt_text) + output_tokens
+            if request_tokens_used + estimated_tokens > MAX_TOTAL_TOKENS_PER_REQUEST:
+                return False
+            request_tokens_used += estimated_tokens
+            return True
+
+        summary = ""
+        if use_summary:
+            combined_for_summary = "\n\n".join([f"OLD:\n{item['left']}\n\nNEW:\n{item['right']}" for item in pairs])
+            summary_prompt = f"""
+Summarize key regulatory comparison points from this document set.
+Avoid repetition. Be concise but complete.
+Limit response to essential insights only. Avoid long explanations.
+
+Return ONLY valid JSON. No explanation. No markdown. No text outside JSON.\n\nJSON schema:
+{{
+  "summary": "Compact summary preserving key obligations, thresholds, timelines, penalties, and scope"
+}}
+
+DOCUMENT:
+{_truncate_text_for_tokens(combined_for_summary)}
+"""
+            summary_prompt = _ensure_prompt_token_safe(summary_prompt)
+            if reserve_tokens(summary_prompt, SUMMARY_OUTPUT_TOKENS):
+                summary_result = _safe_call(
+                    prompt=summary_prompt,
+                    max_tokens=SUMMARY_OUTPUT_TOKENS,
+                    retries=2,
+                    initial_backoff=4,
+                    expect_schema=False,
+                )
+                if isinstance(summary_result, dict) and "error" not in summary_result:
+                    summary_text = summary_result.get("summary") if isinstance(summary_result.get("summary"), str) else None
+                    if summary_text and summary_text.strip():
+                        summary = summary_text.strip()
+
+        batch_entries = []
+        for batch_index, batch in enumerate(pair_batches, start=1):
+            prompt = _build_change_prompt(batch_index, pair_batches, batch, summary)
+            prompt = _ensure_prompt_token_safe(prompt)
+            if not reserve_tokens(prompt, BATCH_OUTPUT_TOKENS):
+                logger.warning("detect_changes token budget exhausted before batch %s", batch_index)
+                break
+            batch_entries.append(
+                {
+                    "prompt": prompt,
+                    "max_tokens": BATCH_OUTPUT_TOKENS,
+                    "retries": 3,
+                    "initial_backoff": 5,
+                    "batch_size": len(batch),
+                    "estimated_tokens": estimate_tokens(prompt),
+                }
+            )
+
+        partial_results = asyncio.run(process_batches_parallel(batch_entries, label="changes")) if batch_entries else []
+        partial_results = [result for result in partial_results if isinstance(result, dict) and "error" not in result]
+
+        if not partial_results:
+            return _default_changes_response()
+
+        merge_prompt = f"""
+Combine the following analyses into one final JSON response.
+Avoid repetition. Be concise but complete.
+Limit response to essential insights only. Avoid long explanations.
+Keep only material, non-duplicate regulatory changes.
+
+Return ONLY valid JSON. No explanation. No markdown. No text outside JSON.\n\nJSON schema:
+{{
+  "changes": [
+    {{
+      "type": "added | removed | modified",
+      "category": "KYC | Risk | Capital | Reporting | Governance | Audit | Other",
+      "summary": "Specific change in <=2 lines",
+      "impact": "Brief significance note"
+    }}
+  ]
+}}
+
+PARTIAL_ANALYSES:
+{json.dumps(partial_results, ensure_ascii=True)}
+"""
+        merge_prompt = _ensure_prompt_token_safe(merge_prompt)
+        if reserve_tokens(merge_prompt, MERGE_OUTPUT_TOKENS):
+            merged = _safe_call(prompt=merge_prompt, max_tokens=MERGE_OUTPUT_TOKENS, retries=2, initial_backoff=4)
+            if isinstance(merged, dict) and "error" not in merged and isinstance(merged.get("changes"), list):
+                deduped_changes = deduplicate_items(merged.get("changes", [])[:5])
+                logger.info("deduplicated_output=%s", json.dumps({"changes": deduped_changes}, ensure_ascii=True)[:1200])
+                return _schema_response(changes=deduped_changes)
+
+        fallback = merge_chunk_results(partial_results, "changes")
+        deduped_changes = deduplicate_items(fallback[:5] if fallback else [])
+        logger.info("deduplicated_output=%s", json.dumps({"changes": deduped_changes}, ensure_ascii=True)[:1200])
+        return _schema_response(changes=deduped_changes)
 
     except Exception as e:
-        print("detect_changes failed:", e)
+        logger.error("detect_changes failed: %s", e)
         return _default_changes_response()
 
 
 def detect_compliance_gaps(new_text: str, policy_text: str) -> dict:
+    """Detect compliance gaps using token-aware batched analysis."""
     try:
-        new_text = trim_text(new_text, 2200)
-        policy_text = trim_text(policy_text, 2200)
+        if not new_text or not policy_text:
+            return _default_gaps_response()
 
-        prompt = f"""
-You are a compliance auditor conducting a regulatory gap assessment.
+        new_text = _truncate_text_for_tokens(trim_text(new_text, 5500))
+        policy_text = _truncate_text_for_tokens(trim_text(policy_text, 5500))
 
-TASK: Identify gaps where INTERNAL POLICY fails to meet REGULATORY REQUIREMENTS.
+        pairs = _prepare_pairs(new_text, policy_text, "REGULATION", "POLICY")
+        if not pairs:
+            return _default_gaps_response()
 
-CRITICAL RULES:
-1. Use ONLY information from provided REGULATION and POLICY texts
-2. Do NOT invent compliance requirements not explicitly stated in regulation
-3. Focus ONLY on high-impact gaps (significant compliance exposure)
-4. Ignore minor administrative differences or formatting variations
-5. Deduplicate: if 2 gaps describe same issue, report once
-6. Each gap ≤2 lines, specific and backed by regulation+policy references
-7. Max 6 gaps; ordered by severity (High → Medium → Low)
-8. If NO significant gaps found, return empty array
+        use_summary = len(pairs) <= 6
+        batch_input_budget = _derive_batch_input_budget(len(pairs), use_summary=use_summary)
+        max_batch_calls = max(1, MAX_CALLS - 1 - (1 if use_summary else 0))
+        pair_batches = build_batches(pairs, max_tokens_per_batch=batch_input_budget)
+        while len(pair_batches) > max_batch_calls and batch_input_budget < MAX_INPUT_TOKENS:
+            batch_input_budget = min(MAX_INPUT_TOKENS, batch_input_budget + 250)
+            pair_batches = build_batches(pairs, max_tokens_per_batch=batch_input_budget)
 
-GAP CRITERIA (must meet ALL):
-- Regulation explicitly requires X
-- Policy is silent on X, or contradicts X
-- Non-compliance creates material risk
+        logger.info("detect_compliance_gaps: items=%s batches=%s batch_budget=%s", len(pairs), len(pair_batches), batch_input_budget)
 
-IGNORE:
-- Gaps requiring information not in provided context
-- Ambiguities that could be interpreted either way
-- Assumptions about unstated policy details
+        request_tokens_used = 0
 
-Return ONLY valid JSON with NO additional text:
+        def reserve_tokens(prompt_text: str, output_tokens: int) -> bool:
+            nonlocal request_tokens_used
+            estimated_tokens = estimate_tokens(prompt_text) + output_tokens
+            if request_tokens_used + estimated_tokens > MAX_TOTAL_TOKENS_PER_REQUEST:
+                return False
+            request_tokens_used += estimated_tokens
+            return True
+
+        summary = ""
+        if use_summary:
+            combined_for_summary = "\n\n".join([f"REGULATION:\n{item['left']}\n\nPOLICY:\n{item['right']}" for item in pairs])
+            summary_prompt = f"""
+Summarize key regulatory points from this regulation-policy comparison.
+Avoid repetition. Be concise but complete.
+Limit response to essential insights only. Avoid long explanations.
+
+Return ONLY valid JSON. No explanation. No markdown. No text outside JSON.\n\nJSON schema:
 {{
-  "gaps": [
+  "summary": "Compact summary preserving key obligations, thresholds, timelines, penalties, and scope"
+}}
+
+DOCUMENT:
+{_truncate_text_for_tokens(combined_for_summary)}
+"""
+            summary_prompt = _ensure_prompt_token_safe(summary_prompt)
+            if reserve_tokens(summary_prompt, SUMMARY_OUTPUT_TOKENS):
+                summary_result = _safe_call(
+                    prompt=summary_prompt,
+                    max_tokens=SUMMARY_OUTPUT_TOKENS,
+                    retries=2,
+                    initial_backoff=4,
+                    expect_schema=False,
+                )
+                if isinstance(summary_result, dict) and "error" not in summary_result:
+                    summary_text = summary_result.get("summary") if isinstance(summary_result.get("summary"), str) else None
+                    if summary_text and summary_text.strip():
+                        summary = summary_text.strip()
+
+        batch_entries = []
+        for batch_index, batch in enumerate(pair_batches, start=1):
+            prompt = _build_gap_prompt(batch_index, pair_batches, batch, summary)
+            prompt = _ensure_prompt_token_safe(prompt)
+            if not reserve_tokens(prompt, BATCH_OUTPUT_TOKENS):
+                logger.warning("detect_compliance_gaps token budget exhausted before batch %s", batch_index)
+                break
+            batch_entries.append(
+                {
+                    "prompt": prompt,
+                    "max_tokens": BATCH_OUTPUT_TOKENS,
+                    "retries": 3,
+                    "initial_backoff": 5,
+                    "batch_size": len(batch),
+                    "estimated_tokens": estimate_tokens(prompt),
+                }
+            )
+
+        partial_results = asyncio.run(process_batches_parallel(batch_entries, label="gaps")) if batch_entries else []
+        partial_results = [result for result in partial_results if isinstance(result, dict) and "error" not in result]
+
+        if not partial_results:
+            return _default_gaps_response()
+
+        merge_prompt = f"""
+Combine the following analyses into one final JSON response.
+Avoid repetition. Be concise but complete.
+Limit response to essential insights only. Avoid long explanations.
+Keep only material, non-duplicate compliance gaps.
+
+Return ONLY valid JSON. No explanation. No markdown. No text outside JSON.\n\nJSON schema:
+{{
+  "compliance_gaps": [
     {{
-      "issue": "Specific gap description in ≤2 lines. E.g., 'No documented procedure for periodic KYC refresh (Reg requires every 2 years; policy is silent)'",
+      "issue": "Gap description <=2 lines",
       "risk": "High | Medium | Low",
       "regulation_requirement": "What regulation requires",
-      "policy_current_state": "What policy currently says or doesnt say"
+      "policy_current_state": "What policy says/doesn't say"
     }}
   ]
 }}
 
-If analysis cannot be done due to insufficient context, return empty gaps array.
-
-REGULATION TEXT:
-{new_text}
-
-INTERNAL POLICY TEXT:
-{policy_text}
+PARTIAL_ANALYSES:
+{json.dumps(partial_results, ensure_ascii=True)}
 """
+        merge_prompt = _ensure_prompt_token_safe(merge_prompt)
+        if reserve_tokens(merge_prompt, MERGE_OUTPUT_TOKENS):
+            merged = _safe_call(prompt=merge_prompt, max_tokens=MERGE_OUTPUT_TOKENS, retries=2, initial_backoff=4)
+            if isinstance(merged, dict) and "error" not in merged and isinstance(merged.get("compliance_gaps"), list):
+                gaps = merged.get("compliance_gaps", [])
+                gaps = sorted(gaps, key=lambda g: _priority_value((g or {}).get("risk", "Low")), reverse=True)
+                deduped = deduplicate_items(gaps[:6])
+                logger.info("deduplicated_output=%s", json.dumps({"compliance_gaps": deduped}, ensure_ascii=True)[:1200])
+                return _schema_response(compliance_gaps=deduped)
 
-        response = safe_llm_call(lambda: client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[
-                {"role": "system", "content": "You are a compliance auditing AI. Return ONLY valid JSON with zero extra text. No explanations, no markdown, no preamble. JSON ONLY."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.0,
-            max_tokens=2500,
-        ))
-
-        if response is None:
-            return _default_gaps_response()
-
-        parsed = _parse_json_response(response.choices[0].message.content)
-        gaps = parsed.get("gaps") if isinstance(parsed, dict) else None
-        if not isinstance(gaps, list):
-            return _default_gaps_response()
-
-        # Deduplicate gaps with similar issues
-        unique_gaps = []
-        seen_issues = set()
-        for gap in gaps[:8]:
-            issue_key = (gap.get("issue") or "").lower().strip()[:50] if isinstance(gap, dict) else ""
-            if issue_key and issue_key not in seen_issues:
-                unique_gaps.append(gap)
-                seen_issues.add(issue_key)
-        
-        return {"gaps": unique_gaps[:6] if unique_gaps else []}
+        fallback = merge_chunk_results(partial_results, "compliance_gaps")
+        fallback = sorted(fallback, key=lambda g: _priority_value((g or {}).get("risk", "Low")), reverse=True)
+        deduped = deduplicate_items(fallback[:6] if fallback else [])
+        logger.info("deduplicated_output=%s", json.dumps({"compliance_gaps": deduped}, ensure_ascii=True)[:1200])
+        return _schema_response(compliance_gaps=deduped)
 
     except Exception as e:
-        print("detect_compliance_gaps failed:", e)
+        logger.error("detect_compliance_gaps failed: %s", e)
         return _default_gaps_response()
 
 
-def analyze_impact(impact_input) -> dict:
+def analyze_impact(impact_input: dict) -> dict:
+    """Analyze impacts based on detected changes and compliance gaps."""
     try:
-        if isinstance(impact_input, dict):
-            gap_texts = [trim_text(text, 200) for text in (impact_input.get("gaps") or []) if text]
-            systems = [trim_text(system, 120) for system in (impact_input.get("systems") or []) if system]
-        else:
-            gap_texts = []
-            systems = []
+        if not impact_input or not isinstance(impact_input, dict):
+            return _schema_response()
 
-        gap_texts = gap_texts[:4]
-        systems = systems[:3]
+        changes = impact_input.get("changes", [])
+        gaps = impact_input.get("compliance_gaps", [])
 
-        if not gap_texts:
-            return default_impact(systems=systems)
+        if not changes and not gaps:
+            return _schema_response()
+
+        combined_text = ""
+        if changes:
+            combined_text += "CHANGES DETECTED:\n" + json.dumps(changes[:3], indent=2) + "\n\n"
+        if gaps:
+            combined_text += "COMPLIANCE GAPS FOUND:\n" + json.dumps(gaps[:3], indent=2)
 
         prompt = f"""
-You are a Compliance & Risk Officer at a financial institution.
+Analyze the business and compliance impact of these detected changes and gaps.
+Provide 2-3 key impacts with severity assessment.
 
-TASK: Assess business and regulatory impact of provided compliance gaps.
+CONTEXT:
+{_truncate_text_for_tokens(combined_text)}
 
-CRITICAL RULES:
-1. Base analysis ONLY on provided gaps (do NOT add external knowledge)
-2. Assess impact across: regulatory risk, operational impact, financial/reputation exposure
-3. Focus on MATERIAL impacts only (ignore minor/obvious ones)
-4. Be precise: "What could actually happen?" not "Might possibly..."
-5. Each impact assessment ≤2 lines, concrete and actionable
-6. Maximum 4 impacts; order by severity
-7. Risk_level: High (regulatory action imminent), Medium (material exposure), Low (minor exposure)
-8. If insufficient data for impact assessment, return safe defaults
-
-IMPACT FRAMEWORK:
-- REGULATORY IMPACT: Penalties, enforcement, license suspension risk
-- OPERATIONAL IMPACT: Process disruption, system changes required
-- FINANCIAL/REPUTATIONAL: Fines, loss of customers, brand damage
-
-Return ONLY valid JSON with NO additional text or markdown:
+Return ONLY valid JSON. No explanation. No markdown. No text outside JSON.\n\nJSON schema:
 {{
-  "impact": {{
-    "departments": ["Compliance", "Risk", "Operations", "Finance"],
-    "systems": {json.dumps(systems) if systems else '["Core"]'},
-    "risk_level": "High | Medium | Low",
-    "priority": "High | Medium | Low",
-    "summary": "Concrete impact assessment in ≤3 lines. E.g., 'Missing KYC refresh: RBI penalties 0.5-2M, customer onboarding halt, reputational damage in retail segment'"
-  }}
-}}
-
-COMPLIANCE GAPS TO ANALYZE:
-{json.dumps({"gaps": gap_texts, "systems": systems}, ensure_ascii=True)}
-"""
-
-        response = safe_llm_call(lambda: client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[
-                {"role": "system", "content": "You are a risk analysis AI. Return ONLY valid JSON with zero extra text, quotes, markdown, or explanation. Output JSON structure exactly as specified, nothing else."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.0,
-            max_tokens=1800,
-        ))
-
-        if response is None:
-            return default_impact(systems=systems)
-
-        parsed = _parse_json_response(response.choices[0].message.content)
-        if not isinstance(parsed, dict):
-            return default_impact(systems=systems)
-
-        return _normalize_impact_payload(parsed, systems=systems)
-
-    except Exception as e:
-        print("analyze_impact failed:", e)
-        return default_impact(systems=[])
-
-
-def generate_actions(actions_input) -> dict:
-    try:
-        if isinstance(actions_input, dict):
-            gap_texts = [trim_text(text, 200) for text in (actions_input.get("gaps") or []) if text]
-        elif isinstance(actions_input, list):
-            gap_texts = [trim_text(text, 200) for text in actions_input if text]
-        else:
-            gap_texts = []
-
-        gap_texts = gap_texts[:4]
-        if not gap_texts:
-            return default_actions()
-
-        prompt = f"""
-You are a Compliance Program Manager designing remediation roadmap.
-
-TASK: Generate practical, implementable actions to close compliance gaps.
-
-CRITICAL RULES:
-1. Base actions ONLY on provided gaps (no external additions)
-2. Each action must directly address a specific gap
-3. Actions must be IMPLEMENTABLE (not wishful thinking)
-4. Be specific about: WHO does it, WHAT is done, WHEN it's due
-5. Estimate realistic timelines (Immediate=<1 week, 1-2 weeks, 1 month)
-6. Priority: High gaps → High priority actions
-7. Each action ≤2 lines; concrete language
-8. Maximum 4 actions
-9. Deduplicate: if 2 actions are similar, report most impactful one
-10. If insufficient data, return empty actions array
-
-ACTION QUALITY:
-✓ "Implement automated KYC refresh every 2 years with audit logging; assign to Ops; 2 weeks"
-✗ "Improve compliance processes"
-
-✓ "Document transaction reporting SOP per RBI guidelines; 1 week"
-✗ "Better reporting"
-
-Return ONLY valid JSON with NO additional text or markdown:
-{{
-  "actions": [
+  "impacts": [
     {{
-      "title": "Action title in ≤2 lines. E.g., 'Implement KYC Refresh Workflow (2-year cycle)'",
-      "description": "How to implement; who owns; acceptance criteria",
-      "priority": "High | Medium | Low",
-      "status": "Pending",
-      "deadline": "Immediate | 1-2 weeks | 1 month | TBD"
+            "title": "Impact title",
+      "description": "Impact description",
+            "severity": "High | Medium | Low",
+            "impacted_departments": ["Compliance", "Risk", "Operations"]
     }}
   ]
 }}
-
-COMPLIANCE GAPS REQUIRING REMEDIATION:
-{json.dumps(gap_texts, ensure_ascii=True)}
 """
+        prompt = _ensure_prompt_token_safe(prompt)
+        result = _safe_call(prompt=prompt, max_tokens=BATCH_OUTPUT_TOKENS, retries=2, initial_backoff=4)
 
-        response = safe_llm_call(lambda: client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[
-                {"role": "system", "content": "You are a remediation planning AI. Return ONLY valid JSON with zero extra text, explanation, or markdown. JSON output exactly as specified, nothing more."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.0,
-            max_tokens=1200,
-        ))
+        if isinstance(result, dict) and "error" not in result and isinstance(result.get("impacts"), list):
+            deduped_impacts = deduplicate_items(_normalize_impacts_list(result.get("impacts", [])[:3]))
+            logger.info("deduplicated_output=%s", json.dumps({"impacts": deduped_impacts}, ensure_ascii=True)[:1200])
+            return _schema_response(impacts=deduped_impacts)
 
-        if response is None:
-            return default_actions()
-
-        parsed = _parse_json_response(response.choices[0].message.content)
-        actions = parsed.get("actions") if isinstance(parsed, dict) else None
-        if not isinstance(actions, list):
-            return default_actions()
-
-        # Deduplicate similar actions
-        unique_actions = []
-        seen_titles = set()
-        for action in actions:
-            if isinstance(action, dict):
-                title_key = (action.get("title") or "").lower().strip()[:50]
-                if title_key and title_key not in seen_titles:
-                    normalized = _normalize_action(action)
-                    unique_actions.append(normalized)
-                    seen_titles.add(title_key)
-        
-        return {"actions": unique_actions[:4] if unique_actions else default_actions()["actions"]}
+        return _schema_response()
 
     except Exception as e:
-        print("generate_actions failed:", e)
-        return default_actions()
+        logger.error("analyze_impact failed: %s", e)
+        return _schema_response()
+
+
+def generate_actions(actions_input: dict) -> dict:
+    """Generate actionable remediation steps from compliance gaps and impacts."""
+    try:
+        if not actions_input or not isinstance(actions_input, dict):
+            return _schema_response()
+
+        changes = actions_input.get("changes", [])
+        gaps = actions_input.get("compliance_gaps", [])
+        impacts = actions_input.get("impacts", [])
+
+        if not gaps and not impacts:
+            fallback_actions = default_actions().get("actions", [])
+            return _schema_response(actions=fallback_actions)
+
+        combined_text = ""
+        if changes:
+            combined_text += "CHANGES:\n" + json.dumps(changes[:2], indent=2) + "\n\n"
+        if gaps:
+            combined_text += "COMPLIANCE GAPS:\n" + json.dumps(gaps[:4], indent=2) + "\n\n"
+        if impacts:
+            combined_text += "IMPACTS:\n" + json.dumps(impacts[:4], indent=2)
+
+        prompt = f"""
+Generate 2-6 concrete and implementable compliance actions.
+Each action must map to one or more compliance gaps and the corresponding impacts.
+Each action should include owner, priority, and timeline.
+
+CONTEXT:
+{_truncate_text_for_tokens(combined_text)}
+
+Return ONLY valid JSON. No explanation. No markdown. No text outside JSON.\n\nJSON schema:
+{{
+  "actions": [
+    {{
+      "action": "Specific action description",
+      "priority": "High | Medium | Low",
+      "owner": "Team/Department responsible"
+    }}
+  ]
+}}
+"""
+        prompt = _ensure_prompt_token_safe(prompt)
+        result = _safe_call(prompt=prompt, max_tokens=BATCH_OUTPUT_TOKENS, retries=2, initial_backoff=4)
+
+        if isinstance(result, dict) and "error" not in result and isinstance(result.get("actions"), list):
+            deduped_actions = deduplicate_items(result.get("actions", [])[:6])
+            if not deduped_actions:
+                deduped_actions = default_actions().get("actions", [])
+            logger.info("deduplicated_output=%s", json.dumps({"actions": deduped_actions}, ensure_ascii=True)[:1200])
+            return _schema_response(actions=deduped_actions)
+
+        return _schema_response(actions=default_actions().get("actions", []))
+
+    except Exception as e:
+        logger.error("generate_actions failed: %s", e)
+        return _schema_response(actions=default_actions().get("actions", []))
+
+
+

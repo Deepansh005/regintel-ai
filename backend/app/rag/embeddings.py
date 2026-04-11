@@ -2,8 +2,11 @@ import hashlib
 import math
 import re
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
+import logging
 
 from langchain_community.embeddings import HuggingFaceEmbeddings
+
+logger = logging.getLogger(__name__)
 
 
 _EMBEDDING_MODEL = None

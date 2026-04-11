@@ -15,10 +15,11 @@ def process_document(text: str, collection_name: str, source: str = None):
     if not chunks or len(chunks) == 0:
         raise ValueError("Document produced no chunks after processing")
 
-    store_chunks(chunks, collection_name, source or collection_name)
+    chunk_ids = store_chunks(chunks, collection_name, source or collection_name)
 
     return {
         "status": "success",
         "collection": collection_name,
-        "num_chunks": len(chunks)
+        "num_chunks": len(chunks),
+        "chunk_ids": chunk_ids,
     }

@@ -10,3 +10,8 @@ langchain-community
 sentence-transformers
 fpdf2
 python-docx
+pdfplumber
+pytesseract
+pdf2image
+Pillow
+httpx

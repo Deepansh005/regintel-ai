@@ -1,12 +1,10 @@
 const BASE_URL = "http://127.0.0.1:8000";
 
-export const uploadDocuments = async (oldFile, newFile, policyFile) => {
+export const uploadDocuments = async (oldFiles = [], newFiles = [], policyFiles = []) => {
   const formData = new FormData();
-  formData.append("old_file", oldFile);
-  formData.append("new_file", newFile);
-  if (policyFile) {
-    formData.append("policy_file", policyFile);
-  }
+  for (const file of oldFiles) formData.append("old_file", file);
+  for (const file of newFiles) formData.append("new_file", file);
+  for (const file of policyFiles) formData.append("policy_file", file);
 
   const response = await fetch(`${BASE_URL}/upload-documents`, {
     method: "POST",
@@ -50,6 +48,22 @@ export const deleteOldTasks = async (days = 7) => {
 
   if (!response.ok) {
     throw new Error(`Failed to delete old tasks: ${response.status}`);
+  }
+
+  return response.json();
+};
+
+export const fetchChunkDetails = async (chunkIds) => {
+  const response = await fetch(`${BASE_URL}/chunks/details`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ chunk_ids: chunkIds }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Failed to fetch chunk details: ${response.status}`);
   }
 
   return response.json();

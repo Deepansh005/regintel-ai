@@ -1,14 +1,18 @@
 import os
-from fastapi import APIRouter, HTTPException
+from pathlib import Path
+from fastapi import APIRouter, Body, HTTPException
 from fastapi.responses import FileResponse
 from fpdf import FPDF
 from docx import Document
 from db.database import get_task
+from app.services.pdf_service import extract_pdf_pages
+from app.services.clause_extractor import extract_clauses_from_pages
 from app.rag.vector_store import (
     list_collections,
     delete_collection,
     delete_all_collections,
     reset_chroma_db,
+    get_chunk_details,
 )
 
 router = APIRouter()
@@ -69,6 +73,41 @@ def chroma_delete_collection(collection_name: str):
 def chroma_reset():
     reset_chroma_db()
     return {"message": "ChromaDB folder deleted and fresh database initialized"}
+
+
+@router.post("/chunks/details")
+def chunk_details(payload: dict = Body(...)):
+    chunk_ids = payload.get("chunk_ids") if isinstance(payload, dict) else None
+
+    if not isinstance(chunk_ids, list) or not chunk_ids:
+        raise HTTPException(status_code=400, detail="chunk_ids must be a non-empty list")
+
+    return {
+        "chunks": get_chunk_details(chunk_ids)
+    }
+
+
+@router.post("/debug/clause-extraction")
+def debug_clause_extraction(payload: dict = Body(...)):
+    file_path = payload.get("file_path") if isinstance(payload, dict) else None
+    if not file_path:
+        raise HTTPException(status_code=400, detail="file_path is required")
+
+    normalized_path = str(Path(file_path))
+    if not os.path.exists(normalized_path):
+        raise HTTPException(status_code=404, detail=f"File not found: {normalized_path}")
+
+    pages = extract_pdf_pages(normalized_path)
+    clauses = extract_clauses_from_pages(pages)
+
+    first_clause = clauses[0] if clauses else {}
+    print(f"Clause debug endpoint: total_clauses={len(clauses)} first_clause={first_clause.get('content', '')[:500] if isinstance(first_clause, dict) else ''}")
+
+    return {
+        "total_clauses": len(clauses),
+        "first_clause": first_clause,
+        "clauses": clauses[:5],
+    }
 
 def generate_pdf(data, path):
     pdf = FPDF()

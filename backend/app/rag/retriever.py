@@ -1,6 +1,8 @@
 from langchain_community.vectorstores import Chroma
 from app.rag.embeddings import get_embedding_model
+import logging
 
+logger = logging.getLogger(__name__)
 
 def get_vector_db(collection_name):
     embedding_model = get_embedding_model()
@@ -10,7 +12,6 @@ def get_vector_db(collection_name):
         embedding_function=embedding_model,
         collection_name=collection_name
     )
-
 
 # ✅ BASIC RETRIEVAL (optional)
 def retrieve_from_collection(query: str, collection_name: str, k: int = 5):
@@ -24,9 +25,8 @@ def retrieve_from_collection(query: str, collection_name: str, k: int = 5):
         
         return [r.page_content for r in results if r.page_content and r.page_content.strip()]
     except Exception as e:
-        print(f"Retrieval error from {collection_name}: {e}")
+        logger.error(f"Retrieval error from {collection_name}: {e}")
         return []
-
 
 # ✅ SOURCE-GROUNDED RETRIEVAL (MAIN FUNCTION)
 def retrieve_with_metadata(query: str, collection_name: str, k: int = 5):
@@ -46,12 +46,20 @@ def retrieve_with_metadata(query: str, collection_name: str, k: int = 5):
             if not chunk_text or not chunk_text.strip():
                 continue
 
+            metadata = r.metadata or {}
             formatted_chunks.append(
-                f"[SOURCE {i+1} | {collection_name}]\n{chunk_text}"
+                {
+                    "chunk_id": metadata.get("chunk_id"),
+                    "text": chunk_text,
+                    "page_number": metadata.get("page_number"),
+                    "source_file_name": metadata.get("source_file_name") or metadata.get("source") or collection_name,
+                    "collection_name": metadata.get("collection_name") or collection_name,
+                    "rank": i + 1,
+                }
             )
 
         return formatted_chunks
     
     except Exception as e:
-        print(f"Retrieval error from {collection_name}: {e}")
+        logger.error(f"Retrieval error from {collection_name}: {e}")
         return []

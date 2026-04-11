@@ -8,13 +8,14 @@ import { Shield, Upload, FileText, CheckCircle2, AlertCircle, Loader2, LogOut, A
 
 export default function UploadPage() {
     const router = useRouter();
-    const [oldFile, setOldFile] = useState(null);
-    const [newFile, setNewFile] = useState(null);
-    const [policyFile, setPolicyFile] = useState(null);
+    const [oldFiles, setOldFiles] = useState([]);
+    const [newFiles, setNewFiles] = useState([]);
+    const [policyFiles, setPolicyFiles] = useState([]);
     const [loading, setLoading] = useState(false);
     const [user, setUser] = useState(null);
     const [progress, setProgress] = useState(0);
     const [errors, setErrors] = useState({});
+    const [, setResult] = useState({});
     const mode = typeof window !== 'undefined' ? new URLSearchParams(window.location.search).get("mode") || "old" : "old";
 
     // =============================
@@ -50,20 +51,30 @@ export default function UploadPage() {
         return null;
     };
 
-    const handleFileSelect = (file, setFile, fieldName) => {
-        const error = validateFile(file, fieldName);
-        
-        if (error) {
-            setErrors(prev => ({ ...prev, [fieldName]: error }));
-            setFile(null);
-        } else {
-            setErrors(prev => {
-                const newErrors = { ...prev };
-                delete newErrors[fieldName];
-                return newErrors;
-            });
-            setFile(file);
+    const handleFileSelect = (files, setFiles, fieldName) => {
+        const selectedFiles = Array.isArray(files) ? files : [];
+
+        if (selectedFiles.length === 0) {
+            setFiles([]);
+            return;
         }
+
+        const validationError = selectedFiles
+            .map((file) => validateFile(file, fieldName))
+            .find((error) => !!error);
+
+        if (validationError) {
+            setErrors(prev => ({ ...prev, [fieldName]: validationError }));
+            setFiles([]);
+            return;
+        }
+
+        setErrors(prev => {
+            const nextErrors = { ...prev };
+            delete nextErrors[fieldName];
+            return nextErrors;
+        });
+        setFiles(selectedFiles);
     };
 
     useEffect(() => {
@@ -93,15 +104,15 @@ export default function UploadPage() {
         const newErrors = {};
 
         if (mode === "old") {
-            if (!oldFile) newErrors.oldFile = "Old Policy is required";
-            if (!policyFile) newErrors.policyFile = "Internal Policy is required";
+            if (oldFiles.length === 0) newErrors.oldFile = "At least one Old Policy PDF is required";
+            if (policyFiles.length === 0) newErrors.policyFile = "At least one Internal Policy PDF is required";
         } else if (mode === "new") {
-            if (!newFile) newErrors.newFile = "New Regulation is required";
-            if (!policyFile) newErrors.policyFile = "Internal Policy is required";
+            if (newFiles.length === 0) newErrors.newFile = "At least one New Regulation PDF is required";
+            if (policyFiles.length === 0) newErrors.policyFile = "At least one Internal Policy PDF is required";
         } else if (mode === "all") {
-            if (!oldFile) newErrors.oldFile = "Old Regulation is required";
-            if (!newFile) newErrors.newFile = "New Regulation is required";
-            if (!policyFile) newErrors.policyFile = "Internal Policy is required";
+            if (oldFiles.length === 0) newErrors.oldFile = "At least one Old Regulation PDF is required";
+            if (newFiles.length === 0) newErrors.newFile = "At least one New Regulation PDF is required";
+            if (policyFiles.length === 0) newErrors.policyFile = "At least one Internal Policy PDF is required";
         }
 
         if (Object.keys(newErrors).length > 0) {
@@ -111,25 +122,20 @@ export default function UploadPage() {
 
         // ✅ VALIDATE FILES
         let hasErrors = false;
-        if (oldFile) {
-            const error = validateFile(oldFile, "Old Regulation");
-            if (error) {
-                newErrors.oldFile = error;
-                hasErrors = true;
-            }
-        }
-        if (newFile) {
-            const error = validateFile(newFile, "New Regulation");
-            if (error) {
-                newErrors.newFile = error;
-                hasErrors = true;
-            }
-        }
-        if (policyFile) {
-            const error = validateFile(policyFile, "Internal Policy");
-            if (error) {
-                newErrors.policyFile = error;
-                hasErrors = true;
+        const fileGroups = [
+            { files: oldFiles, fieldName: "Old Regulation", errorKey: "oldFile" },
+            { files: newFiles, fieldName: "New Regulation", errorKey: "newFile" },
+            { files: policyFiles, fieldName: "Internal Policy", errorKey: "policyFile" },
+        ];
+
+        for (const group of fileGroups) {
+            for (const file of group.files) {
+                const error = validateFile(file, group.fieldName);
+                if (error) {
+                    newErrors[group.errorKey] = error;
+                    hasErrors = true;
+                    break;
+                }
             }
         }
 
@@ -144,9 +150,9 @@ export default function UploadPage() {
         try {
             const formData = new FormData();
             formData.append("mode", mode);
-            if (oldFile) formData.append("old_file", oldFile);
-            if (newFile) formData.append("new_file", newFile);
-            if (policyFile) formData.append("policy_file", policyFile);
+            for (const file of oldFiles) formData.append("old_file", file);
+            for (const file of newFiles) formData.append("new_file", file);
+            for (const file of policyFiles) formData.append("policy_file", file);
 
             const res = await fetch("http://127.0.0.1:8000/upload-documents", {
                 method: "POST",
@@ -178,6 +184,15 @@ export default function UploadPage() {
                 }
                 
                 const data = await res.json();
+                console.log("FULL API RESPONSE:", data);
+
+                if (data?.result && typeof data.result === "object") {
+                    setResult((prev) => {
+                        const merged = { ...prev, ...data.result };
+                        localStorage.setItem("analysisData", JSON.stringify(merged));
+                        return merged;
+                    });
+                }
 
                 setProgress((prev) => {
                     if (data.status === "processing") {
@@ -287,7 +302,7 @@ export default function UploadPage() {
         );
     }
 
-    const FileUploadCard = ({ file, setFile, title, icon: Icon, delay, gradientFrom, gradientTo, error, onSelect }) => (
+    const FileUploadCard = ({ files, title, icon: Icon, delay, gradientFrom, gradientTo, error, onSelect }) => (
         <div className="flex-1 flex flex-col relative z-10 group" style={{ animation: `floatItems 6s ease-in-out ${delay}s infinite` }}>
             <label className={`text-[11px] font-extrabold uppercase tracking-widest pl-2 mb-3 drop-shadow-sm transition-colors ${error ? 'text-red-500' : 'text-slate-400'}`}>{title}</label>
             <div className={`relative overflow-hidden rounded-[2rem] p-8 flex flex-col items-center justify-center transition-all duration-500 min-h-[260px] 
@@ -298,29 +313,36 @@ export default function UploadPage() {
 
                 <input
                     type="file"
+                    multiple
                     accept="application/pdf"
                     className="absolute inset-0 opacity-0 cursor-pointer z-50"
-                    onChange={(e) => onSelect(e.target.files[0])}
+                    onChange={(e) => onSelect(Array.from(e.target.files || []))}
                     disabled={!!error}
                 />
 
                 <div className={`w-20 h-20 rounded-2xl flex items-center justify-center mb-6 transition-all duration-500 relative z-10 
-                    ${error ? 'bg-red-100 border-2 border-red-300' : file ? `bg-gradient-to-br ${gradientFrom} ${gradientTo} scale-110 shadow-xl shadow-violet-500/40` : 'bg-slate-50 border border-slate-100 group-hover:bg-white group-hover:scale-110 group-hover:shadow-[0_0_30px_rgba(124,58,237,0.15)] shadow-xl'}`}>
+                    ${error ? 'bg-red-100 border-2 border-red-300' : files.length > 0 ? `bg-gradient-to-br ${gradientFrom} ${gradientTo} scale-110 shadow-xl shadow-violet-500/40` : 'bg-slate-50 border border-slate-100 group-hover:bg-white group-hover:scale-110 group-hover:shadow-[0_0_30px_rgba(124,58,237,0.15)] shadow-xl'}`}>
                     {error ? (
                         <AlertCircle className="w-10 h-10 text-red-500" />
-                    ) : file ? (
+                    ) : files.length > 0 ? (
                         <CheckCircle2 className="w-10 h-10 text-white" />
                     ) : (
-                        <Icon className={`w-10 h-10 transition-colors ${file ? 'text-white' : 'text-slate-400 group-hover:text-violet-500'}`} />
+                        <Icon className={`w-10 h-10 transition-colors ${files.length > 0 ? 'text-white' : 'text-slate-400 group-hover:text-violet-500'}`} />
                     )}
                 </div>
 
-                <p className={`font-extrabold text-center px-4 relative z-10 tracking-tight text-lg transition-colors ${error ? 'text-red-700' : file ? 'text-slate-900 bg-clip-text text-transparent bg-gradient-to-br ' + gradientFrom + ' ' + gradientTo : 'text-slate-600 group-hover:text-slate-900'}`}>
-                    {error ? "⚠ Upload Error" : file ? file.name : `Select ${title}`}
+                <p className={`font-extrabold text-center px-4 relative z-10 tracking-tight text-lg transition-colors ${error ? 'text-red-700' : files.length > 0 ? 'text-slate-900 bg-clip-text text-transparent bg-gradient-to-br ' + gradientFrom + ' ' + gradientTo : 'text-slate-600 group-hover:text-slate-900'}`}>
+                    {error ? "⚠ Upload Error" : files.length > 0 ? `${files.length} file(s) selected` : `Select ${title}`}
                 </p>
+
+                {files.length > 0 && !error && (
+                    <p className="text-xs font-semibold text-slate-600 mt-2 text-center break-all px-3">
+                        {files[0].name}{files.length > 1 ? ` + ${files.length - 1} more` : ""}
+                    </p>
+                )}
                 
                 {error && <p className="text-xs font-bold text-center text-red-600 mt-3 px-3">{error}</p>}
-                {!file && !error && <p className="text-[11px] font-bold text-slate-400 mt-3 uppercase tracking-widest relative z-10 group-hover:text-violet-400 transition-colors">PDF UP TO {MAX_FILE_SIZE_MB}MB</p>}
+                {files.length === 0 && !error && <p className="text-[11px] font-bold text-slate-400 mt-3 uppercase tracking-widest relative z-10 group-hover:text-violet-400 transition-colors">PDF UP TO {MAX_FILE_SIZE_MB}MB</p>}
             </div>
         </div>
     );
@@ -412,40 +434,37 @@ export default function UploadPage() {
                 <div className={`w-full grid ${mode === 'all' ? 'md:grid-cols-3 max-w-5xl' : 'md:grid-cols-2 max-w-4xl'} gap-8 mb-16 mx-auto px-4`}>
                     {(mode === 'old' || mode === 'all') && (
                         <FileUploadCard
-                            file={oldFile} 
-                            setFile={setOldFile} 
+                            files={oldFiles}
                             title="Old Regulation" 
                             delay={0} 
                             icon={FileText}
                             gradientFrom="from-violet-500" 
                             gradientTo="to-indigo-500"
                             error={errors.oldFile}
-                            onSelect={(file) => handleFileSelect(file, setOldFile, "oldFile")}
+                            onSelect={(files) => handleFileSelect(files, setOldFiles, "oldFile")}
                         />
                     )}
                     {(mode === 'new' || mode === 'all') && (
                         <FileUploadCard
-                            file={newFile} 
-                            setFile={setNewFile} 
+                            files={newFiles}
                             title="New Regulation" 
                             delay={0.2} 
                             icon={FileCheck}
                             gradientFrom="from-blue-500" 
                             gradientTo="to-cyan-500"
                             error={errors.newFile}
-                            onSelect={(file) => handleFileSelect(file, setNewFile, "newFile")}
+                            onSelect={(files) => handleFileSelect(files, setNewFiles, "newFile")}
                         />
                     )}
                     <FileUploadCard
-                        file={policyFile} 
-                        setFile={setPolicyFile} 
+                        files={policyFiles}
                         title="Internal Policy" 
                         delay={0.4} 
                         icon={Building2}
                         gradientFrom="from-emerald-400" 
                         gradientTo="to-teal-500"
                         error={errors.policyFile}
-                        onSelect={(file) => handleFileSelect(file, setPolicyFile, "policyFile")}
+                        onSelect={(files) => handleFileSelect(files, setPolicyFiles, "policyFile")}
                     />
                 </div>
 
@@ -468,7 +487,14 @@ export default function UploadPage() {
                 <div className="flex flex-col items-center w-full max-w-[320px] mt-2">
                     <button
                         onClick={handleSubmit}
-                        disabled={loading || (mode === 'old' ? (!oldFile || !policyFile) : mode === 'new' ? (!newFile || !policyFile) : (!oldFile || !newFile || !policyFile))}
+                        disabled={
+                            loading ||
+                            (mode === "old"
+                                ? oldFiles.length === 0 || policyFiles.length === 0
+                                : mode === "new"
+                                  ? newFiles.length === 0 || policyFiles.length === 0
+                                  : oldFiles.length === 0 || newFiles.length === 0 || policyFiles.length === 0)
+                        }
                         className="w-full bg-slate-900 text-white py-4.5 rounded-2xl font-bold transition-all 
                         active:scale-[0.98] disabled:opacity-50 disabled:active:scale-100 flex items-center justify-center gap-3 group 
                         shadow-[0_15px_30px_-5px_rgba(0,0,0,0.3)] hover:shadow-[0_20px_40px_-5px_rgba(0,0,0,0.4)] hover:-translate-y-1 relative overflow-hidden"

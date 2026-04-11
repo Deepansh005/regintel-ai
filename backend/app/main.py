@@ -22,7 +22,12 @@ app.include_router(upload.router)
 app.include_router(report.router)
 
 
-
 @app.get("/")
 def root():
     return {"message": "RegIntel AI Backend Running 🚀"}
+
+
+@app.get("/health")
+def health_check():
+    """Simple health check endpoint."""
+    return {"status": "healthy", "backend": "running"}

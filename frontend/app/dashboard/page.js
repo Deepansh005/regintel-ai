@@ -3,15 +3,16 @@
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
-import { fetchTasks, clearTaskHistory, deleteOldTasks } from "../../services/api";
+import { fetchTasks, clearTaskHistory, deleteOldTasks, fetchChunkDetails } from "../../services/api";
 import { 
     Search, Bell, User, Upload, ArrowRight, Shield, AlertTriangle, 
-    CheckCircle2, Clock, AlertCircle, RefreshCw, XCircle, FileText
+    CheckCircle2, Clock, AlertCircle, RefreshCw, XCircle, FileText, Eye
 } from "lucide-react";
 import { 
     ResponsiveContainer, PieChart, Pie, Cell, LineChart, Line, XAxis, YAxis, 
     CartesianGrid, Tooltip, BarChart, Bar, Legend
 } from "recharts";
+import SourceViewerModal from "../../components/SourceViewerModal";
 
 const COLORS = ['#7C3AED', '#A78BFA', '#C4B5FD', '#EDE9FE'];
 const RISK_COLORS = { 'Low': '#10B981', 'Medium': '#F59E0B', 'High': '#EF4444' };
@@ -157,56 +158,18 @@ function normalizeGaps(payload) {
     if (Array.isArray(root)) {
         return root;
     }
-    if (Array.isArray(root.gaps)) {
-        return root.gaps;
-    }
     return [];
 }
 
-function normalizeImpact(payload) {
-    let root = unwrapTaskResult(payload)?.impact ?? unwrapTaskResult(payload) ?? {};
-    if (root.raw && typeof root.raw === 'string') {
-        try { root = JSON.parse(root.raw); } catch (e) {}
-    }
-    return root.impact && typeof root.impact === 'object' ? root.impact : root;
-}
-
-function normalizeImpactResult(payload) {
-    const impact = normalizeImpact(payload);
-
-    if (impact && typeof impact === 'object' && impact.impact && typeof impact.impact === 'object') {
-        return impact.impact;
-    }
-
-    return impact || {};
+function normalizeImpacts(payload) {
+    const root = unwrapTaskResult(payload)?.impacts ?? unwrapTaskResult(payload) ?? [];
+    if (typeof root === 'string') return [];
+    return Array.isArray(root) ? root : [];
 }
 
 function normalizeActions(payload) {
     const normalized = unwrapTaskResult(payload);
-    const candidatePaths = {
-        actions: normalized?.actions,
-        resultActions: normalized?.result?.actions,
-        analysisActions: normalized?.analysis?.actions,
-        generatedActions: normalized?.generated_actions,
-        remediationActions: normalized?.remediation_actions,
-    };
-
-    console.log("ACTIONS PATH CHECK:", {
-        actions1: candidatePaths.actions,
-        actions2: candidatePaths.resultActions,
-        actions3: candidatePaths.analysisActions,
-        actions4: candidatePaths.generatedActions,
-        actions5: candidatePaths.remediationActions,
-    });
-
-    const actions =
-        findFirstArrayCandidate(candidatePaths.actions)
-        || findFirstArrayCandidate(candidatePaths.resultActions)
-        || findFirstArrayCandidate(candidatePaths.analysisActions)
-        || findFirstArrayCandidate(candidatePaths.generatedActions)
-        || findFirstArrayCandidate(candidatePaths.remediationActions)
-        || findFirstArrayCandidate(normalized)
-        || [];
+    const actions = findFirstArrayCandidate(normalized?.actions) || [];
 
     if (!Array.isArray(actions)) {
         console.warn("Actions is not array", actions);
@@ -220,7 +183,6 @@ function normalizeComplianceTrend(payload) {
     const normalized = unwrapTaskResult(payload);
     const trendRoot = normalized?.compliance_trend
         ?? normalized?.impact_analysis?.compliance_trend
-        ?? normalized?.impact?.compliance_trend
         ?? [];
 
     const rawTrend = Array.isArray(trendRoot)
@@ -239,16 +201,53 @@ function normalizeComplianceTrend(payload) {
         .filter((item) => Number.isFinite(item.score));
 }
 
-function normalizeImpactedDepartments(payload, normalizedImpact) {
-    const normalized = unwrapTaskResult(payload);
-    const rootDepartments = normalized?.impacted_departments
-        ?? normalized?.impact_analysis?.departments
-        ?? normalizedImpact?.departments
-        ?? [];
-
-    return toArray(rootDepartments)
+function normalizeImpactedDepartments(payload, impacts) {
+    const impactDepartments = toArray(impacts)
+        .flatMap((impact) => toArray(impact?.impacted_departments))
         .map((entry) => (typeof entry === 'string' ? entry : entry?.name))
         .filter(Boolean);
+
+    return [...new Set(impactDepartments.map((entry) => String(entry).trim()).filter(Boolean))];
+}
+
+function normalizeDepartmentRisk(payload, impacts) {
+    const normalized = unwrapTaskResult(payload);
+    const direct = toArray(normalized?.department_risk)
+        .map((item) => ({
+            department: String(item?.department || '').trim(),
+            risk_percent: Number(item?.risk_percent || 0),
+        }))
+        .filter((item) => item.department);
+
+    if (direct.length > 0) {
+        return direct
+            .map((item) => ({
+                department: item.department,
+                risk_percent: Math.max(0, Math.min(100, Math.round(item.risk_percent))),
+            }))
+            .sort((a, b) => b.risk_percent - a.risk_percent);
+    }
+
+    const weights = { high: 3, medium: 2, low: 1 };
+    const aggregate = new Map();
+
+    toArray(impacts).forEach((impact) => {
+        const severity = String(impact?.severity || 'Medium').toLowerCase();
+        const weight = weights[severity] || 2;
+        toArray(impact?.impacted_departments).forEach((department) => {
+            const label = String(department || '').trim();
+            if (!label) return;
+            aggregate.set(label, (aggregate.get(label) || 0) + weight);
+        });
+    });
+
+    const max = Math.max(...Array.from(aggregate.values()), 1);
+    return Array.from(aggregate.entries())
+        .map(([department, score]) => ({
+            department,
+            risk_percent: Math.max(0, Math.min(100, Math.round((score / max) * 100))),
+        }))
+        .sort((a, b) => b.risk_percent - a.risk_percent);
 }
 
 function formatStatus(status) {
@@ -279,6 +278,26 @@ function formatAxisLabel(label, max = 18) {
     return `${text.slice(0, max - 1)}…`;
 }
 
+const HIGHLIGHT_STOP_WORDS = new Set([
+    'the', 'and', 'for', 'with', 'that', 'this', 'from', 'into', 'have', 'has', 'are', 'was', 'were', 'will', 'shall',
+    'must', 'should', 'may', 'can', 'could', 'would', 'does', 'done', 'your', 'their', 'them', 'its', 'about', 'into',
+    'upon', 'under', 'over', 'than', 'then', 'when', 'where', 'what', 'which', 'who', 'whom', 'been', 'being', 'also',
+]);
+
+function extractHighlightTerms(...values) {
+    const terms = [];
+
+    values.flat().forEach((value) => {
+        String(value || '')
+            .split(/[^A-Za-z0-9]+/)
+            .map((term) => term.trim().toLowerCase())
+            .filter((term) => term.length > 3 && !HIGHLIGHT_STOP_WORDS.has(term))
+            .forEach((term) => terms.push(term));
+    });
+
+    return [...new Set(terms)].slice(0, 8);
+}
+
 export default function Dashboard() {
     const [data, setData] = useState(null);
     const [loading, setLoading] = useState(true);
@@ -286,10 +305,62 @@ export default function Dashboard() {
     const [banner, setBanner] = useState(null);
     const [isClearingHistory, setIsClearingHistory] = useState(false);
     const [isDeletingOld, setIsDeletingOld] = useState(false);
+    const [sourceViewer, setSourceViewer] = useState({
+        open: false,
+        title: "",
+        chunks: [],
+        loading: false,
+        highlightTerms: [],
+    });
     const [history, setHistory] = useState([]);
     const [currentTaskId, setCurrentTaskId] = useState(null);
     const [user, setUser] = useState(null);
     const router = useRouter();
+
+    const closeSourceViewer = () => {
+        setSourceViewer({
+            open: false,
+            title: "",
+            chunks: [],
+            loading: false,
+            highlightTerms: [],
+        });
+    };
+
+    const openSourceViewer = async ({ title, sourceChunks, highlightValues = [] }) => {
+        const chunkIds = [...new Set((Array.isArray(sourceChunks) ? sourceChunks : []).filter(Boolean))];
+
+        if (chunkIds.length === 0) {
+            setBanner({ type: "error", message: "No source chunks are available for this item." });
+            return;
+        }
+
+        const highlightTerms = extractHighlightTerms(highlightValues, title);
+        setSourceViewer({
+            open: true,
+            title: title || "Source Details",
+            chunks: [],
+            loading: true,
+            highlightTerms,
+        });
+
+        try {
+            const response = await fetchChunkDetails(chunkIds);
+            setSourceViewer((current) => ({
+                ...current,
+                chunks: Array.isArray(response?.chunks) ? response.chunks : [],
+                loading: false,
+            }));
+        } catch (err) {
+            console.error("Failed to fetch chunk details:", err);
+            setSourceViewer((current) => ({
+                ...current,
+                chunks: [],
+                loading: false,
+            }));
+            setBanner({ type: "error", message: "Unable to load source details." });
+        }
+    };
 
     const loadDashboardData = async (activeRef = { current: true }) => {
         const response = await fetchTasks();
@@ -401,18 +472,16 @@ export default function Dashboard() {
     // DYNAMIC DATA MAPPING (BACKEND-DRIVEN)
     const normalizedData = unwrapTaskResult(data);
     const changesArray = normalizeChanges(normalizedData);
-    const backendChangesList = toArray(normalizedData?.changes?.changes).map((item) => ({
-        ...item,
-        type: (item?.type || '').toString().toLowerCase()
-    }));
-    const changesList = backendChangesList.length > 0 ? backendChangesList : changesArray;
+    const changesList = changesArray;
     const visibleChanges = changesList.slice(0, 5);
     const gapsArray = normalizeGaps(normalizedData);
-    const impactData = normalizeImpactResult(normalizedData) || {};
-    const impactSystems = toArray(impactData.systems);
-    const impactDepartments = normalizeImpactedDepartments(normalizedData, impactData);
+    const impactsArray = normalizeImpacts(normalizedData);
+    console.log("IMPACTS:", normalizedData?.impacts);
+    const impactSystems = [...new Set(toArray(impactsArray).flatMap((impact) => toArray(impact?.systems)).filter(Boolean))];
+    const impactSourceChunks = [...new Set(toArray(impactsArray).flatMap((impact) => toArray(impact?.source_chunks)).filter(Boolean))];
+    const impactDepartments = normalizeImpactedDepartments(normalizedData, impactsArray);
+    const departmentRisk = normalizeDepartmentRisk(normalizedData, impactsArray);
     const actionsData = normalizeActions(normalizedData);
-    console.log("ACTIONS PROPS:", actionsData);
     const complianceTrendData = normalizeComplianceTrend(normalizedData);
 
     const criticalGapsCount = gapsArray.filter((g) => getRiskValue(g) === 'high').length;
@@ -446,71 +515,19 @@ export default function Dashboard() {
 
     const trendData = complianceTrendData.length > 0 ? complianceTrendData : historyScores;
 
-    const systems = toArray(normalizedData?.impact?.impact?.systems).length > 0
-        ? toArray(normalizedData?.impact?.impact?.systems)
-        : impactSystems.length > 0
-            ? impactSystems
-            : ['Core System'];
-    const gaps = toArray(normalizedData?.compliance_gaps?.gaps).length > 0
-        ? toArray(normalizedData?.compliance_gaps?.gaps)
-        : gapsArray;
+    const severityCounts = toArray(impactsArray).reduce((acc, imp) => {
+        const severity = (imp?.severity || '').toString().trim().toLowerCase();
+        if (severity === 'high') acc.High += 1;
+        else if (severity === 'medium') acc.Medium += 1;
+        else if (severity === 'low') acc.Low += 1;
+        return acc;
+    }, { High: 0, Medium: 0, Low: 0 });
 
-    const getDeterministicJitter = (name, index) => {
-        const seed = `${name}-${index}`;
-        let hash = 0;
-        for (let i = 0; i < seed.length; i += 1) {
-            hash = ((hash << 5) - hash) + seed.charCodeAt(i);
-            hash |= 0;
-        }
-        return ((Math.abs(hash) % 1000) / 1000 - 0.5) * 10;
-    };
-
-    const getSystemScore = (systemName) => {
-        let score = 0;
-        const sys = systemName.toLowerCase();
-
-        gaps.forEach((gap) => {
-            const text = (gap?.issue || gap?.gap_identified || gap?.gap || '').toString().toLowerCase();
-
-            if (sys.includes('kyc') && text.includes('kyc')) score += 3;
-            else if (sys.includes('transaction') && text.includes('transaction')) score += 3;
-            else if (sys.includes('report') && text.includes('report')) score += 2;
-            else score += 0.2;
-        });
-
-        return score;
-    };
-
-    const impactTargets = systems.length > 0 ? systems : impactDepartments;
-    const systemScores = impactTargets.slice(0, 4).map((item, i) => {
-        const systemName = typeof item === 'string'
-            ? item
-            : (item?.name || `Target ${i + 1}`);
-
-        if (gaps.length === 0) {
-            return { name: systemName, score: 0 };
-        }
-
-        return { name: systemName, score: getSystemScore(systemName) };
-    });
-
-    const maxScore = Math.max(...systemScores.map((s) => s.score), 1);
-    const impactChartData = systemScores.length > 0 ? systemScores.map((s, i) => {
-        const jitter = getDeterministicJitter(s.name, i);
-
-        if (gaps.length === 0) {
-            return { name: s.name, value: Math.round(Math.max(25, Math.min(60, 30 + jitter))) };
-        }
-
-        const normalized = s.score / maxScore;
-        let value = 30 + (normalized * 20);
-        value += jitter;
-
-        return {
-            name: s.name,
-            value: Math.round(Math.max(25, Math.min(value, 60)))
-        };
-    }) : [{ name: 'Core System', value: 35 }];
+    const impactChartData = [
+        { name: 'High', value: severityCounts.High },
+        { name: 'Medium', value: severityCounts.Medium },
+        { name: 'Low', value: severityCounts.Low },
+    ];
 
     const hasTrendData = trendData.length > 0;
     const hasImpactData = impactChartData.length > 0;
@@ -728,15 +745,30 @@ export default function Dashboard() {
                                                 {item.section || item.category || 'General Update'}
                                             </span>
 
-                                            <span className={`text-xs px-2 py-1 rounded-full capitalize ${
-                                                item.type === 'added'
-                                                    ? 'bg-green-100 text-green-700'
-                                                    : item.type === 'removed'
-                                                        ? 'bg-red-100 text-red-700'
-                                                        : 'bg-yellow-100 text-yellow-700'
-                                            }`}>
-                                                {item.type || 'modified'}
-                                            </span>
+                                            <div className="flex items-center gap-2">
+                                                <span className={`text-xs px-2 py-1 rounded-full capitalize ${
+                                                    item.type === 'added'
+                                                        ? 'bg-green-100 text-green-700'
+                                                        : item.type === 'removed'
+                                                            ? 'bg-red-100 text-red-700'
+                                                            : 'bg-yellow-100 text-yellow-700'
+                                                }`}>
+                                                    {item.type || 'modified'}
+                                                </span>
+                                                <button
+                                                    type="button"
+                                                    onClick={() => openSourceViewer({
+                                                        title: item.section || item.category || 'Regulatory Change Source',
+                                                        sourceChunks: item.source_chunks,
+                                                        highlightValues: [item.summary, item.impact, item.section],
+                                                    })}
+                                                    disabled={!Array.isArray(item.source_chunks) || item.source_chunks.length === 0}
+                                                    className="inline-flex items-center gap-1 rounded-full border border-slate-200 px-2.5 py-1 text-[11px] font-bold uppercase tracking-wider text-slate-600 transition-colors hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
+                                                >
+                                                    <Eye className="h-3.5 w-3.5" />
+                                                    View Source
+                                                </button>
+                                            </div>
                                         </div>
 
                                         <p className="text-sm text-gray-600 mt-1">
@@ -752,8 +784,23 @@ export default function Dashboard() {
 
                     {/* 6. Impact Analysis Horizontal Bar */}
                     <div className="bg-white rounded-2xl p-6 border border-slate-200 shadow-sm lg:col-span-1 flex flex-col hover:shadow-md transition-shadow">
-                        <h3 className="font-bold text-slate-900 mb-1">Systems Impact</h3>
-                        <p className="text-sm text-slate-500 mb-6">Severity across infrastructure</p>
+                        <div className="flex items-center justify-between gap-3 mb-1">
+                            <h3 className="font-bold text-slate-900">Impact Severity</h3>
+                            <button
+                                type="button"
+                                onClick={() => openSourceViewer({
+                                    title: 'Impact Source Details',
+                                    sourceChunks: impactSourceChunks,
+                                    highlightValues: [impactSystems.join(' ')],
+                                })}
+                                disabled={!impactSourceChunks.length}
+                                className="inline-flex items-center gap-1 rounded-full border border-slate-200 px-2.5 py-1 text-[11px] font-bold uppercase tracking-wider text-slate-600 transition-colors hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
+                            >
+                                <Eye className="h-3.5 w-3.5" />
+                                View Source
+                            </button>
+                        </div>
+                        <p className="text-sm text-slate-500 mb-6">Severity distribution of detected impacts</p>
                         {hasImpactData ? (
                             <div className="flex-grow min-h-[200px]">
                                 <ResponsiveContainer width="100%" height="100%">
@@ -765,13 +812,12 @@ export default function Dashboard() {
                                             type="category"
                                             width={130}
                                             interval={0}
-                                            tickFormatter={(label) => formatAxisLabel(label, 18)}
                                             axisLine={false}
                                             tickLine={false}
                                             tick={{ fontSize: 13, fill: '#0F172A', fontWeight: 500 }}
                                         />
                                         <Tooltip cursor={{ fill: '#F8FAFC' }} contentStyle={{ borderRadius: '12px', border: '1px solid #E2E8F0', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)' }} />
-                                        <Bar dataKey="value" fill="#A78BFA" radius={[0, 4, 4, 0]} label={{ position: 'right', fill: '#64748B', fontSize: 12, formatter: (val) => `${val}%` }} />
+                                        <Bar dataKey="value" fill="#A78BFA" radius={[0, 4, 4, 0]} label={{ position: 'right', fill: '#64748B', fontSize: 12 }} />
                                     </BarChart>
                                 </ResponsiveContainer>
                             </div>
@@ -797,11 +843,26 @@ export default function Dashboard() {
                                         <div className="flex-1">
                                             <p className="text-sm font-bold text-slate-900 leading-tight mb-1">{gap.issue || gap.gap_identified || gap.gap || "Policy alignment gap identified"}</p>
                                             <p className="text-xs text-slate-600 mb-3 line-clamp-1">{gap.policy_reference ? `Ref: ${gap.policy_reference} (${gap.regulation_reference})` : gap.recommendation || "Review and align internal controls with updated circular."}</p>
-                                            <div className="flex items-center gap-2">
+                                            <div className="flex items-center justify-between gap-3">
                                                 <div className="h-1.5 w-full bg-slate-200/50 rounded-full overflow-hidden border border-black/5">
                                                     <div className={`h-full ${color}`} style={{ width: isHigh ? '90%' : '50%' }} />
                                                 </div>
-                                                <span className={`text-[10px] font-bold uppercase tracking-widest ${isHigh ? 'text-rose-600' : 'text-amber-600'}`}>{isHigh ? 'High' : 'Med'}</span>
+                                                <div className="flex items-center gap-2 shrink-0">
+                                                    <span className={`text-[10px] font-bold uppercase tracking-widest ${isHigh ? 'text-rose-600' : 'text-amber-600'}`}>{isHigh ? 'High' : 'Med'}</span>
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => openSourceViewer({
+                                                            title: 'Compliance Gap Source Details',
+                                                            sourceChunks: gap.source_chunks,
+                                                            highlightValues: [gap.issue, gap.regulation_requirement, gap.policy_current_state],
+                                                        })}
+                                                        disabled={!Array.isArray(gap.source_chunks) || gap.source_chunks.length === 0}
+                                                        className="inline-flex items-center gap-1 rounded-full border border-slate-200 px-2.5 py-1 text-[11px] font-bold uppercase tracking-wider text-slate-600 transition-colors hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
+                                                    >
+                                                        <Eye className="h-3.5 w-3.5" />
+                                                        View Source
+                                                    </button>
+                                                </div>
                                             </div>
                                         </div>
                                     </div>
@@ -819,13 +880,34 @@ export default function Dashboard() {
                 <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-6 mb-8 hover:shadow-md transition-shadow">
                     <h3 className="font-bold text-slate-900 mb-1">Impacted Departments</h3>
                     <p className="text-sm text-slate-500 mb-4">Teams affected by current regulatory updates</p>
-                    {impactDepartments.length > 0 ? (
-                        <div className="flex flex-wrap gap-2">
-                            {impactDepartments.map((department, idx) => (
-                                <span key={`${department}-${idx}`} className="inline-flex items-center px-3 py-1.5 rounded-full border border-indigo-200 bg-indigo-50 text-indigo-700 text-xs font-bold uppercase tracking-wider">
-                                    {department}
-                                </span>
-                            ))}
+                    {departmentRisk.length > 0 ? (
+                        <div className="space-y-3">
+                            {departmentRisk.map((item, idx) => {
+                                const percent = Math.max(0, Math.min(100, Number(item?.risk_percent || 0)));
+                                const colorClass = percent > 70
+                                    ? 'bg-rose-500'
+                                    : percent >= 40
+                                        ? 'bg-amber-400'
+                                        : 'bg-emerald-500';
+
+                                const textColor = percent > 70
+                                    ? 'text-rose-700'
+                                    : percent >= 40
+                                        ? 'text-amber-700'
+                                        : 'text-emerald-700';
+
+                                return (
+                                    <div key={`${item.department}-${idx}`} className="rounded-xl border border-slate-200 px-3 py-2.5 bg-slate-50/60">
+                                        <div className="flex items-center justify-between mb-2">
+                                            <span className="text-sm font-semibold text-slate-900">{item.department}</span>
+                                            <span className={`text-xs font-bold ${textColor}`}>{percent}%</span>
+                                        </div>
+                                        <div className="h-2 w-full bg-slate-200 rounded-full overflow-hidden">
+                                            <div className={`h-full ${colorClass}`} style={{ width: `${percent}%` }} />
+                                        </div>
+                                    </div>
+                                );
+                            })}
                         </div>
                     ) : (
                         <div className="border border-dashed border-slate-200 rounded-xl px-4 py-6 text-sm font-medium text-slate-500 text-center">
@@ -852,6 +934,7 @@ export default function Dashboard() {
                                     <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase tracking-widest min-w-[300px]">Description</th>
                                     <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase tracking-widest w-40">Status</th>
                                     <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase tracking-widest text-right">Deadline</th>
+                                    <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase tracking-widest text-right">Source</th>
                                 </tr>
                             </thead>
                             <tbody className="divide-y divide-slate-100">
@@ -865,6 +948,7 @@ export default function Dashboard() {
                                     const title = action?.title || action?.step || action?.action || action?.action_required || 'Untitled action';
                                     const description = action?.description || action?.summary || 'No description provided';
                                     const deadline = action?.deadline || action?.timeline || action?.due_date || 'TBD';
+                                    const actionSourceChunks = Array.isArray(action?.source_chunks) ? action.source_chunks : [];
                                     
                                     return (
                                         <tr key={action.id || action.step || action.title || `${currentTaskId || 'action'}-${i}`} className="hover:bg-slate-50 transition-colors">
@@ -882,11 +966,26 @@ export default function Dashboard() {
                                             <td className="px-6 py-4 text-right">
                                                 <span className="text-sm font-semibold text-slate-700">{deadline}</span>
                                             </td>
+                                            <td className="px-6 py-4 text-right">
+                                                <button
+                                                    type="button"
+                                                    onClick={() => openSourceViewer({
+                                                        title: title,
+                                                        sourceChunks: actionSourceChunks,
+                                                        highlightValues: [title, description],
+                                                    })}
+                                                    disabled={actionSourceChunks.length === 0}
+                                                    className="inline-flex items-center gap-1 rounded-full border border-slate-200 px-2.5 py-1 text-[11px] font-bold uppercase tracking-wider text-slate-600 transition-colors hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
+                                                >
+                                                    <Eye className="h-3.5 w-3.5" />
+                                                    View Source
+                                                </button>
+                                            </td>
                                         </tr>
                                     );
                                 }) : (
                                     <tr>
-                                        <td colSpan={4} className="px-6 py-12 text-center">
+                                        <td colSpan={5} className="px-6 py-12 text-center">
                                             <CheckCircle2 className="w-8 h-8 text-slate-300 mx-auto mb-3" />
                                             <p className="text-slate-500 font-medium text-sm">No actions generated</p>
                                         </td>
@@ -953,6 +1052,15 @@ export default function Dashboard() {
                 </div>
 
             </div>
+
+            <SourceViewerModal
+                isOpen={sourceViewer.open}
+                title={sourceViewer.title}
+                chunks={sourceViewer.chunks}
+                loading={sourceViewer.loading}
+                highlightTerms={sourceViewer.highlightTerms}
+                onClose={closeSourceViewer}
+            />
         </div>
     );
 }

@@ -2,6 +2,7 @@ import logging
 import os
 import threading
 import time
+import json
 from dataclasses import dataclass
 from typing import Optional
 
@@ -13,6 +14,9 @@ logger = logging.getLogger(__name__)
 
 GROQ_MODEL = "llama-3.1-8b-instant"
 KEY_COOLDOWN_SECONDS = int(os.getenv("GROQ_KEY_COOLDOWN_SECONDS", "30"))
+MAX_INPUT_CHARS = int(os.getenv("GROQ_MAX_INPUT_CHARS", "2500"))
+MAX_OUTPUT_TOKENS = 800
+STRICT_JSON_PROMPT = "Return ONLY valid JSON. No explanation. No text outside JSON."
 
 
 def _mask_key(api_key: str) -> str:
@@ -34,7 +38,13 @@ class KeyState:
 
 
 _key_lock = threading.Lock()
-_key_states: list[KeyState] = [KeyState(api_key=key, index=index) for index, key in enumerate(GROQ_API_KEYS)]
+GROQ_KEYS = [
+    os.getenv("GROQ_API_KEY_1"),
+    os.getenv("GROQ_API_KEY_2"),
+    os.getenv("GROQ_API_KEY_3"),
+]
+_resolved_keys = [key for key in GROQ_KEYS if key] or [key for key in GROQ_API_KEYS if key]
+_key_states: list[KeyState] = [KeyState(api_key=key, index=index) for index, key in enumerate(_resolved_keys)]
 _round_robin_index = 0
 
 logger.info(
@@ -88,6 +98,35 @@ def get_next_api_key(prefer_least_used: bool = True, preferred_key_index: Option
             state.active_calls,
         )
         return state.api_key, state.index
+
+
+def _truncate_message_content(content: str) -> str:
+    value = str(content or "")
+    if len(value) <= MAX_INPUT_CHARS:
+        return value
+    return value[:MAX_INPUT_CHARS]
+
+
+def _prepare_messages_for_llm(messages: list[dict], enforce_json: bool = True) -> list[dict]:
+    prepared = []
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "user")
+        content = _truncate_message_content(str(message.get("content") or ""))
+        prepared.append({"role": role, "content": content})
+
+    if enforce_json:
+        has_system = any(str(item.get("role") or "") == "system" for item in prepared)
+        if has_system:
+            for item in prepared:
+                if str(item.get("role") or "") == "system":
+                    item["content"] = f"{STRICT_JSON_PROMPT}\n\n{item.get('content') or ''}".strip()
+                    break
+        else:
+            prepared.insert(0, {"role": "system", "content": STRICT_JSON_PROMPT})
+
+    return prepared
 
 
 def _release_api_key(api_key: str, success: bool = True, cooldown_seconds: int | None = None) -> None:
@@ -157,14 +196,31 @@ def call_groq_with_retry(
     """Retry across available keys before giving up."""
     last_error: Exception | None = None
     timeout_retry_used = False
+    retries = min(3, max(1, retries), max(1, len(_key_states)))
+    max_tokens = min(max_tokens, MAX_OUTPUT_TOKENS)
+    prepared_messages = _prepare_messages_for_llm(messages, enforce_json=True)
+    attempted_key_indices: set[int] = set()
 
     for attempt in range(1, retries + 1):
         api_key = None
         try:
-            api_key, key_index = get_next_api_key(
-                prefer_least_used=True,
-                preferred_key_index=preferred_key_index,
-            )
+            # Rotate key on each attempt; do not reuse key inside the same request if possible.
+            guard_loops = 0
+            while True:
+                api_key, key_index = get_next_api_key(
+                    prefer_least_used=False,
+                    preferred_key_index=preferred_key_index,
+                )
+                if key_index not in attempted_key_indices or len(attempted_key_indices) >= len(_key_states):
+                    break
+                _release_api_key(api_key, success=True)
+                guard_loops += 1
+                if guard_loops >= len(_key_states):
+                    break
+
+            attempted_key_indices.add(key_index)
+            print(f"[LLM] Using key index: {key_index}")
+            print(f"[LLM] Retry attempt: {attempt}")
             logger.info(
                 "Groq request attempt=%s/%s key_index=%s preferred_key_index=%s model=%s",
                 attempt,
@@ -174,19 +230,28 @@ def call_groq_with_retry(
                 model,
             )
             result = call_groq(
-                messages,
+                prepared_messages,
                 model=model,
                 api_key=api_key,
                 max_tokens=max_tokens,
                 temperature=temperature,
             ) if response_format is None else _call_groq_with_format(
-                messages=messages,
+                messages=prepared_messages,
                 model=model,
                 api_key=api_key,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 response_format=response_format,
             )
+
+            # Safe JSON parse check. If invalid, retry with next key.
+            try:
+                json.loads(result)
+            except Exception as parse_exc:
+                _release_api_key(api_key, success=False, cooldown_seconds=5)
+                last_error = RuntimeError(f"Invalid JSON response: {parse_exc}")
+                continue
+
             _release_api_key(api_key, success=True)
             return result
         except Exception as exc:
@@ -210,9 +275,8 @@ def call_groq_with_retry(
                 continue
 
     if last_error:
-        raise RuntimeError(f"Groq failed after {retries} retries: {last_error}") from last_error
-
-    raise RuntimeError("Groq failed unexpectedly without an error")
+        logger.error("Groq failed after retries=%s error=%s", retries, last_error)
+    return json.dumps({"changes": [], "error": "LLM failed"})
 
 
 def llm_chat_completion(
@@ -246,7 +310,7 @@ def llm_chat_completion(
         )
     except Exception as exc:
         logger.error("Groq call for task '%s' failed: %s", task_type, exc)
-        raise RuntimeError(f"Groq failed for task '{task_type}': {exc}") from exc
+        return json.dumps({"changes": [], "error": "LLM failed"})
 
 
 def key_health_snapshot() -> list[dict]:

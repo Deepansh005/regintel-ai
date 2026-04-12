@@ -17,6 +17,8 @@ from app.services.ai_service import (
     detect_compliance_gaps,
     reduce_changes_and_actions,
 )
+from app.services.impact_engine import generate_impacts
+from app.services.action_engine import generate_actions
 from app.services.context_optimizer import optimize_context_chunks
 from app.services.clause_extractor import extract_clauses_from_text, extract_clauses_from_pages, filter_relevant_clauses
 
@@ -211,6 +213,7 @@ def _empty_pipeline_schema() -> dict:
         "impacts": [],
         "actions": [],
         "department_risk": [],
+        "results": [],
     }
 
 
@@ -263,6 +266,7 @@ async def _run_analysis_pipeline(mode: str, old_context: str, new_context: str, 
     gaps_payload = {"changes": [], "compliance_gaps": [], "impacts": [], "actions": []}
     impacts_payload = {"changes": [], "compliance_gaps": [], "impacts": [], "actions": []}
     actions_payload = {"changes": [], "compliance_gaps": [], "impacts": [], "actions": []}
+    results_payload = []
 
     if mode == "all" and old_context and new_context:
         changes_payload = await asyncio.to_thread(detect_changes, old_context, new_context)
@@ -284,21 +288,75 @@ async def _run_analysis_pipeline(mode: str, old_context: str, new_context: str, 
     reduced_actions = reduce_result.get("actions", []) if isinstance(reduce_result, dict) else []
     print(f"Final changes count: {len(reduced_changes)}")
 
+    # Ensure per-change enrichment engines are actually executed.
+    impacts_by_change = await asyncio.to_thread(generate_impacts, reduced_changes)
+    actions_by_change = await asyncio.to_thread(generate_actions, reduced_changes)
+
+    print("Impact count:", len(impacts_by_change))
+    print("Action count:", len(actions_by_change))
+
+    final_output = []
+    for i, change in enumerate(reduced_changes):
+        final_output.append(
+            {
+                "change": change,
+                "impacts": impacts_by_change[i].get("impacts", []) if i < len(impacts_by_change) and isinstance(impacts_by_change[i], dict) else [],
+                "actions": actions_by_change[i].get("actions", []) if i < len(actions_by_change) and isinstance(actions_by_change[i], dict) else [],
+            }
+        )
+
+    flat_impacts = []
+    for item in impacts_by_change:
+        if not isinstance(item, dict):
+            continue
+        for impact in item.get("impacts") or []:
+            if not isinstance(impact, dict):
+                continue
+            department = str(impact.get("department") or "").strip()
+            impact_level = str(impact.get("impact_level") or "Medium").strip().title() or "Medium"
+            reason = str(impact.get("reason") or "").strip()
+            if not department:
+                continue
+            flat_impacts.append(
+                {
+                    "title": f"Impact on {department}",
+                    "description": reason,
+                    "severity": impact_level,
+                    "impacted_departments": [department],
+                }
+            )
+
+    flat_actions = []
+    for item in actions_by_change:
+        if not isinstance(item, dict):
+            continue
+        for action in item.get("actions") or []:
+            if isinstance(action, dict):
+                flat_actions.append(action)
+
+    combined_actions = [*flat_actions, *reduced_actions]
+
     changes_payload = {
         "changes": reduced_changes,
         "compliance_gaps": [],
         "impacts": [],
         "actions": [],
     }
-    impacts_payload = {"changes": [], "compliance_gaps": [], "impacts": [], "actions": []}
+    impacts_payload = {
+        "changes": [],
+        "compliance_gaps": [],
+        "impacts": flat_impacts,
+        "actions": [],
+    }
     actions_payload = {
         "changes": [],
         "compliance_gaps": [],
         "impacts": [],
-        "actions": reduced_actions,
+        "actions": combined_actions,
     }
+    results_payload = final_output
 
-    return changes_payload, gaps_payload, impacts_payload, actions_payload
+    return changes_payload, gaps_payload, impacts_payload, actions_payload, results_payload
 
 
 def _pick_source_chunks(item_text: str, candidate_chunks: list[dict], max_sources: int = 2):
@@ -674,7 +732,7 @@ def process_task(task_id: str, file_paths: dict, file_hashes: dict | None = None
             analysis_source_pool = (new_sources if 'new_sources' in locals() else []) + (policy_sources if 'policy_sources' in locals() else [])
 
         try:
-            changes_payload, compliance_gaps_payload, impacts_payload, actions_payload = asyncio.run(
+            changes_payload, compliance_gaps_payload, impacts_payload, actions_payload, results_payload = asyncio.run(
                 _run_analysis_pipeline(
                     mode=mode,
                     old_context=old_context,
@@ -687,6 +745,7 @@ def process_task(task_id: str, file_paths: dict, file_hashes: dict | None = None
             compliance_gaps_payload = _empty_pipeline_schema()
             impacts_payload = _empty_pipeline_schema()
             actions_payload = _empty_pipeline_schema()
+            results_payload = []
 
         changes_items = _extract_changes(changes_payload)[:5]
         gaps_items = _extract_gaps(compliance_gaps_payload)
@@ -738,6 +797,7 @@ def process_task(task_id: str, file_paths: dict, file_hashes: dict | None = None
             "compliance_gaps": gaps_items,
             "impacts": impacts_items,
             "actions": actions_items,
+            "results": results_payload if isinstance(results_payload, list) else [],
             "department_risk": _build_department_risk(impacts_items),
             "file_clause_map": {
                 file_name: [

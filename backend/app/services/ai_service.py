@@ -37,7 +37,21 @@ STRICT_SCHEMA_INSTRUCTION = (
     "Always respond with this top-level JSON schema exactly: "
     '{"changes": [], "compliance_gaps": [], "impacts": [], "actions": []}'
 )
-VAGUE_CHANGE_TERMS = ("improve", "enhance", "develop")
+VAGUE_CHANGE_TERMS = ("improve", "enhance", "develop", "updated", "improved", "policy updated")
+CONDITION_SIGNAL_TERMS = (
+    "shall",
+    "must",
+    "required",
+    "if ",
+    "unless",
+    "provided that",
+    "at least",
+    "not less than",
+    "no more than",
+    "threshold",
+    "limit",
+    "within",
+)
 
 
 class UnifiedResponseSchema(BaseModel):
@@ -1478,25 +1492,80 @@ def _parse_clause_comparison_payload(raw_content: str) -> list[dict] | None:
 
 def filter_changes(changes):
     filtered = []
+    removed_count = 0
     for c in changes or []:
         text = str(c).lower()
 
         # remove no-change outputs
         if "no change" in text:
+            removed_count += 1
             continue
 
         # remove type none
         if isinstance(c, dict) and str(c.get("type") or "").strip().lower() == "none":
+            removed_count += 1
             continue
 
         # must have meaningful old/new difference
         if isinstance(c, dict):
             if c.get("old") == c.get("new"):
+                removed_count += 1
+                continue
+
+            merged_text = " ".join(
+                [
+                    str(c.get("field") or ""),
+                    str(c.get("old") or ""),
+                    str(c.get("new") or ""),
+                ]
+            ).lower()
+            if any(term in merged_text for term in VAGUE_CHANGE_TERMS):
+                removed_count += 1
                 continue
 
         filtered.append(c)
 
+    print("Filtered vague changes:", removed_count)
     return filtered
+
+
+def _has_numeric_or_condition_signal(field: str, old_value: str, new_value: str) -> bool:
+    old_text = str(old_value or "")
+    new_text = str(new_value or "")
+    field_text = str(field or "")
+    merged = f"{field_text} {old_text} {new_text}".lower()
+
+    if any(char.isdigit() for char in new_text):
+        return True
+    if any(char.isdigit() for char in old_text):
+        return True
+
+    return any(term in merged for term in CONDITION_SIGNAL_TERMS)
+
+
+def is_valid(change: dict) -> bool:
+    if not isinstance(change, dict):
+        return False
+
+    change_type = str(change.get("type") or "").strip().lower()
+    if change_type not in {"added", "removed", "modified"}:
+        return False
+
+    field = str(change.get("field") or "").strip()
+    old_value = str(change.get("old") or "").strip()
+    new_value = str(change.get("new") or "").strip()
+
+    merged_text = f"{field} {old_value} {new_value}".lower()
+    if "no change" in merged_text:
+        return False
+    if any(term in merged_text for term in VAGUE_CHANGE_TERMS):
+        return False
+
+    return (
+        old_value != new_value
+        and len(new_value) > 15
+        and _has_numeric_or_condition_signal(field, old_value, new_value)
+    )
 
 
 def final_clean(changes):
@@ -1506,25 +1575,31 @@ def final_clean(changes):
         if not isinstance(c, dict):
             continue
 
+        if not is_valid(c):
+            continue
+
         field = str(c.get("field") or "").strip()
-
-        # remove weak entries
-        if len(field) < 5:
-            continue
-
-        if c.get("old") == c.get("new"):
-            continue
+        old_value = str(c.get("old") or "").strip()
+        new_value = str(c.get("new") or "").strip()
 
         signature = (
             _normalize_change_text(field),
-            _normalize_change_text(c.get("old") or ""),
-            _normalize_change_text(c.get("new") or ""),
+            _normalize_change_text(old_value),
+            _normalize_change_text(new_value),
         )
         if signature in seen:
             continue
         seen.add(signature)
 
-        clean.append(c)
+        clean.append(
+            {
+                "type": str(c.get("type") or "modified").strip().lower(),
+                "field": trim_text(field, 140),
+                "old": trim_text(old_value, 220),
+                "new": trim_text(new_value, 220),
+                "change": trim_text(str(c.get("change") or f"{field}: {old_value} -> {new_value}").strip(), 280),
+            }
+        )
 
     return clean
 
@@ -1559,32 +1634,30 @@ def map_changes_per_clause(clause, stats: dict | None = None) -> list[dict]:
         return []
 
     user_prompt = (
-        "You are a strict legal comparison engine.\n\n"
-        "Compare OLD and NEW clause.\n\n"
-        "RULES:\n"
-        "- ONLY extract explicit differences\n"
-        "- DO NOT summarize\n"
-        "- DO NOT interpret\n"
-        "- DO NOT generalize\n"
-        "- DO NOT infer meaning\n"
-        "- ONLY compare text\n\n"
-        "Focus ONLY on:\n"
-        "- numbers (%, limits, values)\n"
-        "- dates\n"
-        "- conditions\n"
-        "- obligations (shall, must)\n"
-        "- added or removed sentences\n\n"
-        "If there is no difference, return [] and nothing else.\n"
-        "DO NOT return \"no change\".\n"
-        "DO NOT include explanations for no change.\n\n"
-        "OUTPUT STRICT JSON:\n\n"
+        "Compare OLD vs NEW clauses strictly.\n"
+        "Extract ONLY:\n"
+        "- numeric changes\n"
+        "- threshold changes\n"
+        "- condition changes\n"
+        "- obligations added/removed\n\n"
+        "DO NOT summarize.\n"
+        "DO NOT generalize.\n"
+        "DO NOT interpret.\n"
+        "DO NOT infer meaning.\n\n"
+        "BAD example:\n"
+        "- policy updated\n\n"
+        "GOOD example:\n"
+        "- Dividend payout limit changed from 50% to 75%\n\n"
+        "If no explicit change exists, return exactly: {\"changes\": []}\n"
+        "Never output \"no change\" text.\n\n"
+        "STRICT OUTPUT FORMAT:\n"
         "{\n"
         '  "changes": [\n'
         "    {\n"
-        '      "type": "modified/added/removed",\n'
-        '      "field": "what exactly changed",\n'
-        '      "old": "exact old text",\n'
-        '      "new": "exact new text"\n'
+        '      "type": "added/removed/modified",\n'
+        '      "field": "...",\n'
+        '      "old": "...",\n'
+        '      "new": "..."\n'
         "    }\n"
         "  ]\n"
         "}\n\n"
@@ -1833,7 +1906,15 @@ def merge_and_dedupe_clause_changes(clause_level_outputs: list[list[dict]]) -> l
                 change_type = "modified"
             if not change:
                 continue
-            merged_items.append({"change": change, "type": change_type})
+            merged_items.append(
+                {
+                    "change": change,
+                    "type": change_type,
+                    "field": str(item.get("field") or "").strip(),
+                    "old": str(item.get("old") or "").strip(),
+                    "new": str(item.get("new") or "").strip(),
+                }
+            )
 
     before_count = len(merged_items)
 
@@ -1861,10 +1942,15 @@ def merge_and_dedupe_clause_changes(clause_level_outputs: list[list[dict]]) -> l
             continue
 
         seen_exact.add(exact_key)
-        unique_changes.append({
-            "change": re.sub(r"\s+", " ", str(item.get("change") or "").strip()),
-            "type": normalized_type,
-        })
+        unique_changes.append(
+            {
+                "change": re.sub(r"\s+", " ", str(item.get("change") or "").strip()),
+                "type": normalized_type,
+                "field": str(item.get("field") or "").strip(),
+                "old": str(item.get("old") or "").strip(),
+                "new": str(item.get("new") or "").strip(),
+            }
+        )
 
     logger.info("MAP merge/dedup: before_count=%s after_dedup=%s", before_count, len(unique_changes))
     return unique_changes
@@ -1877,63 +1963,51 @@ def _normalize_change_summary_text(value: str) -> str:
     return text
 
 
-def _clean_detected_changes(changes: list[dict], max_items: int = 12) -> list[dict]:
-    """Clean detected changes by normalizing text and removing exact/similar duplicates."""
+def _clean_detected_changes(changes: list[dict], max_items: int = 10) -> list[dict]:
+    """Return only strict high-quality changes in {type, field, old, new} shape."""
     normalized_items = []
     for item in changes or []:
         if not isinstance(item, dict):
             continue
 
-        change_type = str(item.get("type") or "modified").strip().lower()
-        if change_type not in {"added", "modified", "removed"}:
-            change_type = "modified"
-
-        summary = _normalize_change_summary_text(item.get("summary") or item.get("change") or "")
-        if not summary:
-            continue
-        if not _is_high_quality_change_description(summary):
+        candidate = {
+            "type": str(item.get("type") or "modified").strip().lower(),
+            "field": _normalize_change_summary_text(str(item.get("field") or "").strip()),
+            "old": _normalize_change_summary_text(str(item.get("old") or "").strip()),
+            "new": _normalize_change_summary_text(str(item.get("new") or "").strip()),
+        }
+        if not is_valid(candidate):
             continue
 
         normalized_items.append(
             {
-                "type": change_type,
-                "category": str(item.get("category") or "Other").strip() or "Other",
-                "summary": trim_text(summary, 240),
-                "impact": _normalize_change_summary_text(item.get("impact") or "Detected in clause-level MAP analysis"),
+                "type": candidate["type"],
+                "field": trim_text(candidate["field"], 140),
+                "old": trim_text(candidate["old"], 220),
+                "new": trim_text(candidate["new"], 220),
             }
         )
 
     before_count = len(normalized_items)
-
     deduped_exact = []
     seen_exact = set()
     for item in normalized_items:
-        exact_key = f"{item['type']}|{_normalize_change_text(item['summary'])}"
+        exact_key = (
+            str(item.get("type") or ""),
+            _normalize_change_text(item.get("field") or ""),
+            _normalize_change_text(item.get("old") or ""),
+            _normalize_change_text(item.get("new") or ""),
+        )
         if exact_key in seen_exact:
             continue
         seen_exact.add(exact_key)
         deduped_exact.append(item)
 
-    deduped_similar = []
-    for item in deduped_exact:
-        normalized_current = _normalize_change_text(item.get("summary") or "")
-        is_duplicate_like = False
-        for existing in deduped_similar:
-            if str(existing.get("type") or "") != str(item.get("type") or ""):
-                continue
-            normalized_existing = _normalize_change_text(existing.get("summary") or "")
-            if _is_similar_change(normalized_current, normalized_existing, threshold=0.86):
-                is_duplicate_like = True
-                break
-        if not is_duplicate_like:
-            deduped_similar.append(item)
-
-    capped = deduped_similar[: max(10, min(15, max_items))]
+    capped = deduped_exact[: min(10, max_items)]
     logger.info(
-        "Change cleaning summary | before=%s after_exact=%s after_similar=%s final=%s",
+        "Change cleaning summary | before=%s after_exact=%s final=%s",
         before_count,
         len(deduped_exact),
-        len(deduped_similar),
         len(capped),
     )
     return capped
@@ -2190,31 +2264,28 @@ def detect_changes(old_text: str, new_text: str) -> dict:
         mapped_changes = [
             {
                 "type": item.get("type") or "modified",
-                "category": "Other",
                 "field": trim_text(str(item.get("field") or ""), 140),
                 "old": trim_text(str(item.get("old") or ""), 220),
                 "new": trim_text(str(item.get("new") or ""), 220),
-                "summary": trim_text(item.get("change") or "", 220),
-                "impact": "Detected in clause-level MAP analysis",
             }
             for item in unique_clean_changes
         ]
 
         deduped_changes = deduplicate_items(mapped_changes)
-        cleaned_changes = _clean_detected_changes(deduped_changes, max_items=12)
+        cleaned_changes = _clean_detected_changes(deduped_changes, max_items=10)
 
         print("FINAL OUTPUT")
         print("Changes:")
         for item in cleaned_changes:
             if not isinstance(item, dict):
                 continue
-            field = str(item.get("field") or item.get("summary") or "Change").strip()
+            field = str(item.get("field") or "Change").strip()
             old_value = str(item.get("old") or "").strip()
             new_value = str(item.get("new") or "").strip()
             if old_value or new_value:
                 print(f"- {field}: {old_value} -> {new_value}")
             else:
-                print(f"- {field}: {str(item.get('summary') or '').strip()}")
+                print(f"- {field}")
 
         return _schema_response(changes=cleaned_changes)
 

@@ -14,6 +14,18 @@ logger = logging.getLogger(__name__)
 AI_ROUTER_ENABLED = os.getenv("AI_ROUTER_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _safe_fallback_response(endpoint: str) -> dict:
+    if endpoint == "/worker/detect-changes":
+        return {"changes": [], "error": "LLM failed"}
+    if endpoint == "/worker/detect-compliance-gaps":
+        return {"compliance_gaps": [], "error": "LLM failed"}
+    if endpoint == "/worker/generate-impacts":
+        return {"impacts": [], "error": "LLM failed"}
+    if endpoint == "/worker/generate-actions":
+        return {"actions": [], "error": "LLM failed"}
+    return {"error": "LLM failed"}
+
+
 def _run_async(coro):
     try:
         asyncio.get_running_loop()
@@ -27,14 +39,22 @@ def _run_async(coro):
 def _route_or_fallback(endpoint: str, payload: dict, fallback_fn, *fallback_args):
     if not AI_ROUTER_ENABLED:
         logger.warning("AI router disabled, using local fallback for endpoint=%s", endpoint)
-        return fallback_fn(*fallback_args)
+        try:
+            return fallback_fn(*fallback_args)
+        except Exception as exc:
+            logger.error("Local fallback failed endpoint=%s error=%s", endpoint, exc)
+            return _safe_fallback_response(endpoint)
 
     try:
         logger.info("Routing AI request endpoint=%s", endpoint)
         return _run_async(route_request(endpoint=endpoint, payload=payload))
     except Exception as exc:
         logger.error("Router request failed for %s. Falling back local. error=%s", endpoint, exc)
-        return fallback_fn(*fallback_args)
+        try:
+            return fallback_fn(*fallback_args)
+        except Exception as fallback_exc:
+            logger.error("Router fallback failed endpoint=%s error=%s", endpoint, fallback_exc)
+            return _safe_fallback_response(endpoint)
 
 
 def detect_changes(old_text: str, new_text: str) -> dict:

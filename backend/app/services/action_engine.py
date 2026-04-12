@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 from typing import Any
 
 from app.services.llm_router import call_groq_with_retry
@@ -7,7 +8,7 @@ from app.services.llm_router import call_groq_with_retry
 logger = logging.getLogger(__name__)
 
 _ALLOWED_PRIORITIES = {"Low", "Medium", "High"}
-_VAGUE_TERMS = {"improve", "enhance"}
+_VAGUE_TERMS = {"improve", "enhance", "review", "optimize", "strengthen", "address"}
 
 
 def _extract_change_text(change: Any) -> str:
@@ -65,10 +66,18 @@ def _parse_actions_payload(raw_content: str) -> list[dict]:
         return []
 
     parsed = None
+    candidate = str(raw_content or "").strip()
     try:
-        parsed = json.loads(raw_content)
+        parsed = json.loads(candidate)
     except Exception:
-        parsed = None
+        fenced = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", candidate, re.IGNORECASE)
+        if fenced:
+            try:
+                parsed = json.loads(fenced.group(1).strip())
+            except Exception:
+                parsed = None
+        else:
+            parsed = None
 
     if not isinstance(parsed, dict):
         return []
@@ -140,43 +149,88 @@ def generate_actions(changes: list[Any]) -> list[dict]:
         print("Actions generated for 0 changes")
         return []
 
-    output = []
+    def _deterministic_actions(change_item: dict) -> list[dict]:
+        field = str(change_item.get("field") or "Regulatory requirement").strip()
+        change_type = str(change_item.get("type") or "").strip().lower()
+        lowered = field.lower()
 
+        actions: list[dict] = []
+        if any(token in lowered for token in ["cet1", "dividend", "payout", "pat", "threshold", "%", "limit"]):
+            actions.append(
+                {
+                    "action": f"Implement rule-engine validation for {field} using RBI thresholds.",
+                    "owner": "Finance",
+                    "priority": "High",
+                }
+            )
+            actions.append(
+                {
+                    "action": f"Update compliance controls and test cases for {field}.",
+                    "owner": "Compliance",
+                    "priority": "High",
+                }
+            )
+        elif any(token in lowered for token in ["str", "report", "timeline", "day", "deadline"]):
+            actions.append(
+                {
+                    "action": f"Configure automated reporting workflow deadlines for {field}.",
+                    "owner": "Compliance",
+                    "priority": "High",
+                }
+            )
+            actions.append(
+                {
+                    "action": f"Deploy operational SLA checks to enforce {field} submission timelines.",
+                    "owner": "Operations",
+                    "priority": "Medium",
+                }
+            )
+        elif any(token in lowered for token in ["eligib", "condition", "restriction", "prohibit"]):
+            actions.append(
+                {
+                    "action": f"Implement eligibility and restriction controls aligned with {field}.",
+                    "owner": "Risk",
+                    "priority": "High",
+                }
+            )
+            actions.append(
+                {
+                    "action": f"Revise policy clauses to align legal wording for {field}.",
+                    "owner": "Compliance",
+                    "priority": "Medium",
+                }
+            )
+        else:
+            actions.append(
+                {
+                    "action": f"Update policy implementation controls for {field}.",
+                    "owner": "Compliance",
+                    "priority": "Medium",
+                }
+            )
+
+        if change_type == "extra_policy_rule":
+            actions.insert(
+                0,
+                {
+                    "action": f"Remove or justify policy-only rule for {field} with RBI mapping evidence.",
+                    "owner": "Compliance",
+                    "priority": "Medium",
+                },
+            )
+
+        return _validate_actions(actions)
+
+    output = []
     for item in changes:
+        if not isinstance(item, dict):
+            continue
         change_text = _extract_change_text(item)
         if not change_text:
             continue
 
-        prompt = _build_prompt(change_text)
-
-        try:
-            content = call_groq_with_retry(
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are a strict JSON action generation assistant. Return only valid JSON.",
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-                max_tokens=320,
-                temperature=0.0,
-                retries=1,
-                initial_backoff=1.0,
-                response_format={"type": "json_object"},
-            )
-        except Exception as exc:
-            logger.warning("generate_actions LLM call failed for change: %s", exc)
-            content = ""
-
-        parsed_actions = _parse_actions_payload(content)
-        valid_actions = _validate_actions(parsed_actions)
-
-        output.append(
-            {
-                "change": change_text,
-                "actions": valid_actions,
-            }
-        )
+        valid_actions = _deterministic_actions(item)
+        output.append({"change": change_text, "actions": valid_actions})
 
     print(f"Actions generated for {len(output)} changes")
     return output

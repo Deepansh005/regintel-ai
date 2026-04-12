@@ -1,9 +1,10 @@
 import math
 from typing import List
 import logging
+import re
 
 from app.rag.embeddings import get_embedding_model
-from app.services.clause_extractor import extract_clauses_from_text, filter_relevant_clauses
+from app.services.semantic_block_extractor import extract_semantic_blocks
 from app.services.llm_router import llm_chat_completion
 
 logger = logging.getLogger(__name__)
@@ -15,19 +16,27 @@ def _filter_context_for_llm(text: str) -> str:
         return ""
 
     try:
-        all_clauses = extract_clauses_from_text(source_text)
-        if not all_clauses:
+        blocks = extract_semantic_blocks(source_text)
+        if not blocks:
+            paragraphs = [part.strip() for part in re.split(r"\n\s*\n+", source_text) if part and part.strip()]
+            blocks = [
+                {
+                    "block_id": f"fallback-{index}",
+                    "heading": "Paragraph Block",
+                    "content": paragraph,
+                }
+                for index, paragraph in enumerate(paragraphs, start=1)
+            ]
+
+        if not blocks:
             return source_text
 
-        filtered_clauses = filter_relevant_clauses(all_clauses)
-        if not filtered_clauses:
-            return source_text
-
-        logger.info("Using filtered clauses for LLM processing")
-        rebuilt = "\n\n".join((clause.get("content") or "").strip() for clause in filtered_clauses).strip()
+        logger.info("Using semantic blocks for LLM processing")
+        print("Using semantic blocks:", len(blocks))
+        rebuilt = "\n\n".join((block.get("content") or "").strip() for block in blocks).strip()
         return rebuilt or source_text
     except Exception as exc:
-        logger.warning("Context clause filtering failed, using original clauses: %s", exc)
+        logger.warning("Context semantic block filtering failed, using original text: %s", exc)
         return source_text
 
 

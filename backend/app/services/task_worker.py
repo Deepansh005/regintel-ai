@@ -15,12 +15,11 @@ from app.services.ai_service import (
     deduplicate_items,
     detect_changes,
     detect_compliance_gaps,
-    reduce_changes_and_actions,
 )
 from app.services.impact_engine import generate_impacts
 from app.services.action_engine import generate_actions
 from app.services.context_optimizer import optimize_context_chunks
-from app.services.clause_extractor import extract_clauses_from_text, extract_clauses_from_pages, filter_relevant_clauses
+from app.services.semantic_block_extractor import extract_semantic_blocks, extract_semantic_blocks_from_pages
 
 from app.rag.retriever import retrieve_with_metadata
 from app.rag.vector_store import store_chunks
@@ -84,59 +83,38 @@ def _build_chunk_records(page_records: list[dict], file_path: str) -> list[dict]
     source_file_name = os.path.basename(file_path)
     chunk_records = []
 
-    try:
-        logger.info("📄 Processing PDF: %s", source_file_name)
-        clauses = extract_clauses_from_pages(page_records or [])
-        total_clauses = len(clauses)
-        filtered_clauses = filter_relevant_clauses(clauses)
-        filtered_count = len(filtered_clauses)
-        reduction_pct = ((total_clauses - filtered_count) / total_clauses * 100.0) if total_clauses else 0.0
-        clauses = filtered_clauses
-        logger.info(
-            "PDF clause filter: file=%s total_clauses=%s filtered_clauses=%s reduction_pct=%.2f",
-            source_file_name,
-            total_clauses,
-            filtered_count,
-            reduction_pct,
-        )
-    except Exception as exc:
-        logger.error("Clause extraction failed, falling back to chunking: %s", exc)
-        clauses = []
+    all_text = "\n\n".join(str((page or {}).get("text") or "").strip() for page in (page_records or []) if str((page or {}).get("text") or "").strip())
+    blocks = extract_semantic_blocks_from_pages(page_records, file_name=source_file_name) if page_records else []
 
-    if clauses:
-        page_items = clauses
-    else:
-        page_items = []
-        for page_record in page_records or []:
-            page_number = page_record.get("page_number")
-            page_text = page_record.get("text") or ""
-            page_items.extend(
-                {
-                    "clause_id": f"legacy-{page_number}-{index}",
-                    "title": f"Legacy Chunk {index}",
-                    "content": chunk_text,
-                    "page_number": page_number,
-                    "source_file_name": source_file_name,
-                }
-                for index, chunk_text in enumerate(chunk_markdown_text(page_text), start=1)
-            )
+    if not blocks and all_text:
+        # Failsafe: fallback to simple paragraph blocks when semantic extraction yields zero.
+        paragraphs = [part.strip() for part in re.split(r"\n\s*\n+", all_text) if part and part.strip()]
+        blocks = [
+            {
+                "block_id": f"fallback-{index}",
+                "heading": "Paragraph Block",
+                "content": paragraph,
+            }
+            for index, paragraph in enumerate(paragraphs, start=1)
+        ]
 
-    for clause_index, clause in enumerate(page_items, start=1):
-        normalized_text = (clause.get("content") or "").strip()
+    print("Using semantic blocks:", len(blocks))
+
+    for block_index, block in enumerate(blocks, start=1):
+        normalized_text = str(block.get("content") or "").strip()
         if not normalized_text:
             continue
 
-        clause_page_number = clause.get("page_number")
-        chunk_page_number = clause_page_number if clause_page_number is not None else "unknown"
+        chunk_page_number = block.get("page") if block.get("page") is not None else "unknown"
 
         chunk_records.append(
             {
-                "chunk_id": f"{source_file_name}-p{chunk_page_number}-c{clause_index}-{uuid.uuid4().hex[:8]}",
+                "chunk_id": f"{source_file_name}-p{chunk_page_number}-b{block_index}-{uuid.uuid4().hex[:8]}",
                 "text": normalized_text,
-                "page_number": clause_page_number,
+                "page_number": chunk_page_number if chunk_page_number != "unknown" else None,
                 "source_file_name": source_file_name,
-                "clause_id": clause.get("clause_id"),
-                "title": clause.get("title"),
+                "block_id": block.get("block_id") or f"block-{block_index}",
+                "title": block.get("heading") or "Semantic Block",
             }
         )
 
@@ -257,7 +235,15 @@ def _build_department_risk(impacts: list[dict]) -> list[dict]:
     return result
 
 
-async def _run_analysis_pipeline(mode: str, old_context: str, new_context: str, policy_context: str):
+async def _run_analysis_pipeline(
+    mode: str,
+    old_context: str,
+    new_context: str,
+    policy_context: str,
+    old_blocks: list[dict],
+    new_blocks: list[dict],
+    policy_blocks: list[dict],
+):
     """
     Dependency-safe flow: changes -> compliance_gaps -> impacts -> actions
     Stage internals remain batched/parallel in ai_service.
@@ -268,8 +254,8 @@ async def _run_analysis_pipeline(mode: str, old_context: str, new_context: str, 
     actions_payload = {"changes": [], "compliance_gaps": [], "impacts": [], "actions": []}
     results_payload = []
 
-    if mode == "all" and old_context and new_context:
-        changes_payload = await asyncio.to_thread(detect_changes, old_context, new_context)
+    if mode == "all" and old_blocks and new_blocks:
+        changes_payload = await asyncio.to_thread(detect_changes, old_blocks, new_blocks, policy_blocks)
 
     if mode == "all" and new_context and policy_context:
         gaps_payload = await asyncio.to_thread(detect_compliance_gaps, new_context, policy_context)
@@ -278,15 +264,35 @@ async def _run_analysis_pipeline(mode: str, old_context: str, new_context: str, 
     elif mode == "new" and new_context and policy_context:
         gaps_payload = await asyncio.to_thread(detect_compliance_gaps, new_context, policy_context)
 
-    print("Starting REDUCE Phase...")
-    reduce_result = await asyncio.to_thread(
-        reduce_changes_and_actions,
-        (changes_payload or {}).get("changes", []),
-    )
-
-    reduced_changes = reduce_result.get("changes", []) if isinstance(reduce_result, dict) else []
-    reduced_actions = reduce_result.get("actions", []) if isinstance(reduce_result, dict) else []
+    detected_changes = (changes_payload or {}).get("changes", []) if isinstance(changes_payload, dict) else []
+    reduced_changes = [item for item in detected_changes if isinstance(item, dict)]
+    reduced_actions = []
     print(f"Final changes count: {len(reduced_changes)}")
+
+    if reduced_changes:
+        gaps_payload = await asyncio.to_thread(detect_compliance_gaps, "", "", reduced_changes)
+
+    if not reduced_changes:
+        print("No changes found")
+        changes_payload = {
+            "changes": [],
+            "compliance_gaps": [],
+            "impacts": [],
+            "actions": [],
+        }
+        impacts_payload = {
+            "changes": [],
+            "compliance_gaps": [],
+            "impacts": [],
+            "actions": [],
+        }
+        actions_payload = {
+            "changes": [],
+            "compliance_gaps": [],
+            "impacts": [],
+            "actions": [],
+        }
+        return changes_payload, gaps_payload, impacts_payload, actions_payload, []
 
     # Ensure per-change enrichment engines are actually executed.
     impacts_by_change = await asyncio.to_thread(generate_impacts, reduced_changes)
@@ -417,18 +423,20 @@ def chunk_markdown_text(markdown_text: str, max_chunk_size: int = 800):
         return []
 
     try:
-        clauses = extract_clauses_from_text(markdown_text)
-        if clauses:
-            clauses = filter_relevant_clauses(clauses)
+        blocks = extract_semantic_blocks(markdown_text)
+        if blocks:
+            print("Using semantic blocks:", len(blocks))
             return [
-                (clause.get("content") or "").strip()
-                for clause in clauses
-                if (clause.get("content") or "").strip()
+                (block.get("content") or "").strip()
+                for block in blocks
+                if (block.get("content") or "").strip()
             ]
     except Exception as exc:
-        logger.warning("Clause extraction failed, falling back to legacy chunking: %s", exc)
+        logger.warning("Semantic block extraction failed, falling back to paragraph split: %s", exc)
 
-    return _legacy_chunk_markdown_text(markdown_text, max_chunk_size=max_chunk_size)
+    # Semantic-only fallback: paragraph grouping, no clause-system fallback.
+    paragraphs = [part.strip() for part in re.split(r"\n\s*\n+", markdown_text or "") if part and part.strip()]
+    return paragraphs
 
 
 def split_large_section(text: str, max_chunk_size: int):
@@ -639,11 +647,20 @@ def process_task(task_id: str, file_paths: dict, file_hashes: dict | None = None
             policy_source_chunks = []
             old_source_chunks = []
             new_source_chunks = []
-            per_pdf_clause_map = {}
+            per_pdf_block_map = {}
 
             policy_files = _as_file_list(file_paths.get("policy"))
             old_files = _as_file_list(file_paths.get("old"))
             new_files = _as_file_list(file_paths.get("new"))
+
+            old_file = os.path.basename(old_files[0]) if old_files else "N/A"
+            new_file = os.path.basename(new_files[0]) if new_files else "N/A"
+            policy_file = os.path.basename(policy_files[0]) if policy_files else "N/A"
+            print("==============================")
+            print("🔍 Comparing:")
+            print(f"OLD: {old_file}")
+            print(f"NEW: {new_file}")
+            print(f"POLICY: {policy_file}")
 
             if policy_files:
                 for policy_file in policy_files:
@@ -657,7 +674,7 @@ def process_task(task_id: str, file_paths: dict, file_hashes: dict | None = None
                             "PDF may be blank or image-only. Enable OCR for scanned PDFs."
                         )
                     policy_source_chunks.extend(file_chunks)
-                    per_pdf_clause_map[os.path.basename(policy_file)] = file_chunks
+                    per_pdf_block_map[os.path.basename(policy_file)] = file_chunks
                     logger.info(f"📦 Policy PDF: Created {len(file_chunks)} chunks")
                     store_chunks(file_chunks, "internal_policy", policy_file)
 
@@ -678,11 +695,11 @@ def process_task(task_id: str, file_paths: dict, file_hashes: dict | None = None
                             "PDF may be blank or image-only. Enable OCR for scanned PDFs."
                         )
                     old_source_chunks.extend(file_chunks)
-                    per_pdf_clause_map[os.path.basename(old_file)] = file_chunks
+                    per_pdf_block_map[os.path.basename(old_file)] = file_chunks
                     logger.info(f"📦 Old regulation PDF: Created {len(file_chunks)} chunks")
                     store_chunks(file_chunks, "old_regulation", old_file)
 
-                old_sources = retrieve_with_metadata("key regulatory clauses", "old_regulation", k=5)
+                old_sources = retrieve_with_metadata("key regulatory semantic blocks", "old_regulation", k=5)
                 if not old_sources:
                     raise ValueError("Old regulation PDF chunks could not be indexed or retrieved")
                 old_sources, old_context = optimize_context_chunks(old_sources, max_chunks=5, compress=True)
@@ -699,7 +716,7 @@ def process_task(task_id: str, file_paths: dict, file_hashes: dict | None = None
                             "PDF may be blank or image-only. Enable OCR for scanned PDFs."
                         )
                     new_source_chunks.extend(file_chunks)
-                    per_pdf_clause_map[os.path.basename(new_file)] = file_chunks
+                    per_pdf_block_map[os.path.basename(new_file)] = file_chunks
                     logger.info(f"📦 New regulation PDF: Created {len(file_chunks)} chunks")
                     store_chunks(file_chunks, "new_regulation", new_file)
 
@@ -707,6 +724,11 @@ def process_task(task_id: str, file_paths: dict, file_hashes: dict | None = None
                 if not new_sources:
                     raise ValueError("New regulation PDF chunks could not be indexed or retrieved")
                 new_sources, new_context = optimize_context_chunks(new_sources, max_chunks=5, compress=True)
+
+            print(f"📄 {old_file} -> Blocks: {len([item for item in old_source_chunks if isinstance(item, dict)])}")
+            print(f"📄 {new_file} -> Blocks: {len([item for item in new_source_chunks if isinstance(item, dict)])}")
+            print(f"📄 {policy_file} -> Blocks: {len([item for item in policy_source_chunks if isinstance(item, dict)])}")
+            print("==============================")
         
         except Exception as e:
             return _handle_extraction_error(task_id, e)
@@ -738,6 +760,33 @@ def process_task(task_id: str, file_paths: dict, file_hashes: dict | None = None
                     old_context=old_context,
                     new_context=new_context,
                     policy_context=policy_context,
+                    old_blocks=[
+                        {
+                            "block_id": str(item.get("block_id") or item.get("chunk_id") or ""),
+                            "heading": str(item.get("title") or "").strip(),
+                            "content": str(item.get("text") or "").strip(),
+                        }
+                        for item in old_source_chunks
+                        if isinstance(item, dict) and str(item.get("text") or "").strip()
+                    ],
+                    new_blocks=[
+                        {
+                            "block_id": str(item.get("block_id") or item.get("chunk_id") or ""),
+                            "heading": str(item.get("title") or "").strip(),
+                            "content": str(item.get("text") or "").strip(),
+                        }
+                        for item in new_source_chunks
+                        if isinstance(item, dict) and str(item.get("text") or "").strip()
+                    ],
+                    policy_blocks=[
+                        {
+                            "block_id": str(item.get("block_id") or item.get("chunk_id") or ""),
+                            "heading": str(item.get("title") or "").strip(),
+                            "content": str(item.get("text") or "").strip(),
+                        }
+                        for item in policy_source_chunks
+                        if isinstance(item, dict) and str(item.get("text") or "").strip()
+                    ],
                 )
             )
         except Exception:
@@ -799,31 +848,26 @@ def process_task(task_id: str, file_paths: dict, file_hashes: dict | None = None
             "actions": actions_items,
             "results": results_payload if isinstance(results_payload, list) else [],
             "department_risk": _build_department_risk(impacts_items),
-            "file_clause_map": {
+            "file_block_map": {
                 file_name: [
                     {
-                        "clause_id": item.get("clause_id"),
+                        "block_id": item.get("block_id") or item.get("clause_id"),
                         "title": item.get("title"),
                         "page_number": item.get("page_number"),
                         "text": item.get("text"),
                     }
                     for item in items
                 ]
-                for file_name, items in per_pdf_clause_map.items()
+                for file_name, items in per_pdf_block_map.items()
             },
         }
+        response["file_clause_map"] = response.get("file_block_map", {})
 
-        print("==============================")
-        print("FINAL OUTPUT")
-        print("==============================")
-        print("Changes:")
-        for change in changes_items or []:
-            if isinstance(change, dict):
-                print(f"- {str(change.get('summary') or '').strip()}")
-        print("Actions:")
-        for action in actions_items or []:
-            if isinstance(action, dict):
-                print(f"- {str(action.get('action') or '').strip()}")
+        print("\n✅ FINAL:")
+        print(f"Changes: {len(changes_items)}")
+        print(f"Impact: {len(impacts_items)}")
+        print(f"Actions: {len(actions_items)}")
+        print("==========")
 
         # ✅ SAVE SUCCESS
         update_task(task_id, status="completed", result=response)

@@ -17,6 +17,24 @@ from app.services.llm_router import call_groq_with_retry
 
 logger = logging.getLogger(__name__)
 
+MAX_BATCH_PAIRS = 5
+MAX_BATCH_CALLS = 5
+
+RULE_SPLIT_REGEX = re.compile(r"(?<=[.!?])\s+|\n+")
+VALUE_PERCENT_REGEX = re.compile(r"\b\d+(?:\.\d+)?\s*%\b", re.IGNORECASE)
+VALUE_TIMELINE_REGEX = re.compile(r"\b\d+\s*(?:day|days|month|months|year|years)\b", re.IGNORECASE)
+VALUE_NUMBER_REGEX = re.compile(r"\b\d+(?:\.\d+)?\b")
+
+RULE_FIELD_PATTERNS = [
+    ("Dividend payout cap", [r"dividend", r"payout|distribution", r"cap|limit|not exceed|up to|maximum"]),
+    ("CET1 ratio eligibility", [r"cet1|common equity tier\s*1", r"eligib|minimum|threshold|bucket"]),
+    ("STR reporting timeline", [r"str|suspicious transaction report", r"report|timeline|submit|file", r"day|days|month|months"]),
+    ("Reporting requirement", [r"report|reporting|return filing|disclosure", r"shall|must|required|within"]),
+    ("Eligibility condition", [r"eligib|qualif|criteria|condition", r"shall|must|required|subject to"]),
+    ("Restriction or prohibition", [r"prohibit|not allowed|shall not|must not|restricted|restriction"]),
+    ("Formula requirement", [r"pat|profit after tax|cet1|capital adequacy|formula|ratio"]),
+]
+
 
 def _estimate_tokens(text: str) -> int:
     """Rough token estimation."""
@@ -133,6 +151,277 @@ def _contains_vague_terms(text: str) -> bool:
     
     text_lower = text.lower()
     return any(term in text_lower for term in vague_terms)
+
+
+def _split_sentences(text: str) -> List[str]:
+    return [part.strip() for part in RULE_SPLIT_REGEX.split(str(text or "")) if part and part.strip()]
+
+
+def _normalize_value(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip().lower())
+
+
+def _extract_value(sentence: str) -> str:
+    sentence_text = str(sentence or "")
+    percent = VALUE_PERCENT_REGEX.search(sentence_text)
+    if percent:
+        return percent.group(0).strip()
+
+    timeline = VALUE_TIMELINE_REGEX.search(sentence_text)
+    if timeline:
+        return timeline.group(0).strip()
+
+    number = VALUE_NUMBER_REGEX.search(sentence_text)
+    if number:
+        return number.group(0).strip()
+
+    if re.search(r"\bshall not\b|\bmust not\b|\bprohibited\b|\brestricted\b", sentence_text, re.IGNORECASE):
+        return "prohibited"
+
+    return sentence_text[:80].strip()
+
+
+def _match_field(sentence: str) -> str | None:
+    lowered = str(sentence or "").lower()
+    for field_name, pattern_group in RULE_FIELD_PATTERNS:
+        if all(re.search(pattern, lowered, re.IGNORECASE) for pattern in pattern_group):
+            return field_name
+    return None
+
+
+def _extract_structured_rules(text: str, source_label: str) -> List[Dict]:
+    rules = []
+    seen = set()
+
+    for sentence in _split_sentences(text):
+        field = _match_field(sentence)
+        if not field:
+            continue
+
+        value = _extract_value(sentence)
+        key = (field.lower(), _normalize_value(value))
+        if key in seen:
+            continue
+        seen.add(key)
+
+        rules.append(
+            {
+                "field": field,
+                "value": value,
+                "evidence": sentence[:220].strip(),
+                "source": source_label,
+            }
+        )
+
+    return rules
+
+
+def _compare_rules(policy_rules: List[Dict], rbi_rules: List[Dict]) -> List[Dict]:
+    changes = []
+    used_policy = set()
+
+    for rbi_rule in rbi_rules:
+        field = str(rbi_rule.get("field") or "").strip()
+        rbi_value = str(rbi_rule.get("value") or "").strip()
+        evidence = str(rbi_rule.get("evidence") or "").strip()
+
+        policy_index = next(
+            (
+                index
+                for index, policy_rule in enumerate(policy_rules)
+                if index not in used_policy
+                and str(policy_rule.get("field") or "").strip().lower() == field.lower()
+            ),
+            None,
+        )
+
+        if policy_index is None:
+            changes.append(
+                {
+                    "type": "missing_requirement",
+                    "field": field,
+                    "old": None,
+                    "new": rbi_value,
+                    "evidence": evidence,
+                    "source": "RBI",
+                }
+            )
+            continue
+
+        used_policy.add(policy_index)
+        policy_value = str(policy_rules[policy_index].get("value") or "").strip()
+        if _normalize_value(policy_value) != _normalize_value(rbi_value):
+            changes.append(
+                {
+                    "type": "modified_requirement",
+                    "field": field,
+                    "old": policy_value,
+                    "new": rbi_value,
+                    "evidence": evidence,
+                    "source": "RBI",
+                }
+            )
+
+    for index, policy_rule in enumerate(policy_rules):
+        if index in used_policy:
+            continue
+        changes.append(
+            {
+                "type": "extra_policy_rule",
+                "field": str(policy_rule.get("field") or "").strip(),
+                "old": str(policy_rule.get("value") or "").strip(),
+                "new": None,
+                "evidence": str(policy_rule.get("evidence") or "").strip(),
+                "source": "POLICY",
+            }
+        )
+
+    deduped = []
+    seen_changes = set()
+    for item in changes:
+        key = (
+            str(item.get("type") or "").lower(),
+            str(item.get("field") or "").lower(),
+            _normalize_value(str(item.get("old") or "")),
+            _normalize_value(str(item.get("new") or "")),
+        )
+        if key in seen_changes:
+            continue
+        seen_changes.add(key)
+        deduped.append(item)
+
+    return deduped
+
+
+def _chunk_list(items: List[Dict], size: int) -> List[List[Dict]]:
+    if size <= 0:
+        return [items]
+    return [items[index:index + size] for index in range(0, len(items), size)]
+
+
+def _build_batch_input(matched_pairs: List[Dict]) -> List[Dict]:
+    batch_input = []
+    for index, match in enumerate(matched_pairs, start=1):
+        old_block = match.get("old_block") if isinstance(match.get("old_block"), dict) else {}
+        new_block = match.get("new_block") if isinstance(match.get("new_block"), dict) else {}
+
+        explicit_old = str(match.get("old") or "").strip()
+        explicit_new = str(match.get("new") or "").strip()
+
+        pair_id = str(match.get("pair_id") or "").strip() or str(
+            new_block.get("block_id")
+            or old_block.get("block_id")
+            or f"pair-{index}"
+        )
+        batch_input.append(
+            {
+                "pair_id": pair_id,
+                "old_heading": str(match.get("old_heading") or old_block.get("heading") or "").strip(),
+                "new_heading": str(match.get("new_heading") or new_block.get("heading") or "").strip(),
+                "old": _truncate_text(explicit_old or str(old_block.get("content") or "").strip(), 250),
+                "new": _truncate_text(explicit_new or str(new_block.get("content") or "").strip(), 250),
+            }
+        )
+    return batch_input
+
+
+def _parse_batch_diff_response(content: str) -> List[Dict]:
+    if not content or not isinstance(content, str):
+        return []
+
+    parsed = None
+    try:
+        parsed = json.loads(content)
+    except Exception:
+        parsed = _parse_diff_response(content)
+
+    if not isinstance(parsed, dict):
+        return []
+
+    results = parsed.get("results")
+    if not isinstance(results, list):
+        return []
+
+    normalized = []
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+        pair_id = str(result.get("pair_id") or "").strip()
+        changes = result.get("changes") if isinstance(result.get("changes"), list) else []
+
+        for change in changes:
+            if not _is_valid_change(change):
+                continue
+
+            statement = str(change.get("statement") or "").strip()
+            if _contains_vague_terms(statement):
+                continue
+
+            normalized.append(
+                {
+                    "type": str(change.get("type") or "modified").strip().lower(),
+                    "statement": statement,
+                    "old_text": str(change.get("old_text") or "").strip(),
+                    "new_text": str(change.get("new_text") or "").strip(),
+                    "block_id": pair_id,
+                }
+            )
+
+    return normalized
+
+
+def compare_blocks_batch(matched_pairs: List[Dict], debug: bool = False) -> List[Dict]:
+    if not matched_pairs:
+        return []
+
+    batch_input = _build_batch_input(matched_pairs)
+    if not batch_input:
+        return []
+
+    parsed_changes: List[Dict] = []
+    total_rbi_rules = 0
+    total_policy_rules = 0
+    rbi_rule_fields: List[str] = []
+    policy_rule_fields: List[str] = []
+
+    for pair in batch_input:
+        policy_text = str(pair.get("old") or "").strip()
+        rbi_text = str(pair.get("new") or "").strip()
+        pair_id = str(pair.get("pair_id") or "").strip()
+
+        policy_rules = _extract_structured_rules(policy_text, source_label="POLICY")
+        rbi_rules = _extract_structured_rules(rbi_text, source_label="RBI")
+        total_policy_rules += len(policy_rules)
+        total_rbi_rules += len(rbi_rules)
+        rbi_rule_fields.extend([str(rule.get("field") or "") for rule in rbi_rules])
+        policy_rule_fields.extend([str(rule.get("field") or "") for rule in policy_rules])
+
+        pair_changes = _compare_rules(policy_rules, rbi_rules)
+        for change in pair_changes:
+            parsed_changes.append(
+                {
+                    "type": str(change.get("type") or "modified_requirement"),
+                    "statement": str(change.get("field") or "Regulatory rule change"),
+                    "old_text": "" if change.get("old") is None else str(change.get("old")),
+                    "new_text": "" if change.get("new") is None else str(change.get("new")),
+                    "field": str(change.get("field") or "").strip(),
+                    "old": change.get("old"),
+                    "new": change.get("new"),
+                    "evidence": str(change.get("evidence") or "").strip(),
+                    "source": str(change.get("source") or "RBI").strip().upper(),
+                    "block_id": pair_id,
+                }
+            )
+
+    print(f"RBI rules extracted: {total_rbi_rules}")
+    print(f"Policy rules extracted: {total_policy_rules}")
+    print(f"RBI rule sample: {', '.join([field for field in rbi_rule_fields if field][:4])}")
+    print(f"Policy rule sample: {', '.join([field for field in policy_rule_fields if field][:4])}")
+    print(f"Matching results: {len(parsed_changes)} structured changes")
+
+    if debug:
+        logger.info("Batch comparison parsed_changes=%s pairs=%s", len(parsed_changes), len(batch_input))
+    return parsed_changes
 
 
 def compare_blocks(old_block: Dict, new_block: Dict, debug: bool = False) -> List[Dict]:
@@ -308,6 +597,8 @@ def compare_all_matched_blocks(matches: List[Dict], debug: bool = False) -> Tupl
         "api_calls": 0,
     }
     
+    matched_pairs = []
+
     for match in matches:
         match_type = match.get("match_type", "")
         stats["total_comparisons"] += 1
@@ -340,13 +631,30 @@ def compare_all_matched_blocks(matches: List[Dict], debug: bool = False) -> Tupl
         
         elif match_type == "matched":
             stats["matched_pairs"] += 1
-            stats["api_calls"] += 1
-            
-            old_block = match.get("old_block")
-            new_block = match.get("new_block")
-            
-            changes = compare_blocks(old_block, new_block, debug=debug)
-            all_changes.extend(changes)
+            matched_pairs.append(match)
+
+    # Batch strategy:
+    # - If <=10 matched pairs => single call
+    # - If >10 matched pairs => split into batches of 5
+    if matched_pairs:
+        if len(matched_pairs) > (MAX_BATCH_PAIRS * MAX_BATCH_CALLS):
+            matched_pairs = sorted(
+                matched_pairs,
+                key=lambda item: float(item.get("match_score") or 0.0),
+                reverse=True,
+            )[: (MAX_BATCH_PAIRS * MAX_BATCH_CALLS)]
+            logger.info(
+                "Matched pairs truncated to control LLM calls | kept=%s max_calls=%s",
+                len(matched_pairs),
+                MAX_BATCH_CALLS,
+            )
+
+        batches = [matched_pairs] if len(matched_pairs) <= 10 else _chunk_list(matched_pairs, MAX_BATCH_PAIRS)
+        batches = batches[:MAX_BATCH_CALLS]
+        stats["api_calls"] += len(batches)
+        for batch in batches:
+            batch_changes = compare_blocks_batch(batch, debug=debug)
+            all_changes.extend(batch_changes)
     
     stats["total_changes_detected"] = len(all_changes)
     

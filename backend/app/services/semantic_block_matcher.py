@@ -103,8 +103,8 @@ def _content_similarity(old_content: str, new_content: str) -> float:
 def match_blocks(
     old_blocks: List[Dict],
     new_blocks: List[Dict],
-    heading_match_threshold: float = 0.6,
-    content_match_threshold: float = 0.5,
+    heading_match_threshold: float = 0.55,
+    content_match_threshold: float = 0.42,
 ) -> List[Dict]:
     """
     Match NEW blocks to OLD blocks.
@@ -269,10 +269,37 @@ def match_blocks(
         removed_count
     )
     
-    print(f"\n🔗 Block Matching Results:")
-    print(f"   Matched: {matched_count}")
-    print(f"   Added: {added_count}")
-    print(f"   Removed: {removed_count}")
-    print()
-    
     return matches
+
+
+def to_matched_blocks_payload(matches: List[Dict]) -> List[Dict]:
+    """Convert match records into explicit old/new payload list for batched diff calls."""
+    payload = []
+    for index, match in enumerate(matches or [], start=1):
+        if not isinstance(match, dict):
+            continue
+
+        old_block = match.get("old_block") if isinstance(match.get("old_block"), dict) else {}
+        new_block = match.get("new_block") if isinstance(match.get("new_block"), dict) else {}
+
+        pair_id = str(
+            new_block.get("block_id")
+            or old_block.get("block_id")
+            or f"pair-{index}"
+        )
+
+        payload.append(
+            {
+                "pair_id": pair_id,
+                "old": str(old_block.get("content") or "").strip(),
+                "new": str(new_block.get("content") or "").strip(),
+                "old_heading": str(old_block.get("heading") or "").strip(),
+                "new_heading": str(new_block.get("heading") or "").strip(),
+                "match_type": str(match.get("match_type") or "").strip().lower() or "matched",
+                "match_score": float(match.get("match_score") or 0.0),
+                "old_block": old_block,
+                "new_block": new_block,
+            }
+        )
+
+    return payload

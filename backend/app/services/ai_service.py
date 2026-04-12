@@ -10,11 +10,10 @@ from typing import Any
 
 from pydantic import BaseModel, Field, ValidationError
 
-from app.services.clause_extractor import extract_clauses_from_text, filter_relevant_clauses
 from app.services.llm_router import call_groq_with_retry
 from app.services.semantic_block_extractor import extract_semantic_blocks
-from app.services.semantic_block_matcher import match_blocks
-from app.services.strict_diff_engine import compare_all_matched_blocks
+from app.services.semantic_block_matcher import match_blocks, to_matched_blocks_payload
+from app.services.strict_diff_engine import compare_all_matched_blocks, compare_blocks_batch
 from app.services.change_processor import hard_validate_changes, deduplicate_changes, limit_output_changes, render_final_output
 
 logger = logging.getLogger(__name__)
@@ -33,6 +32,7 @@ STRICT_JSON_INSTRUCTION = (
     "Return ONLY valid JSON. No explanation. No markdown. No text outside JSON. "
     "Do not include summary strings or prose outside JSON."
 )
+STRICT_JSON_ARRAY_INSTRUCTION = "Return ONLY valid JSON array. No explanation. No markdown. No text outside JSON."
 STRICT_SCHEMA_INSTRUCTION = (
     "Always respond with this top-level JSON schema exactly: "
     '{"changes": [], "compliance_gaps": [], "impacts": [], "actions": []}'
@@ -217,40 +217,76 @@ def _strip_trailing_commas(raw: str) -> str:
     return re.sub(r",\s*([}\]])", r"\1", raw)
 
 
+def _clean_llm_response_text(raw_response: str) -> str:
+    response = str(raw_response or "").strip()
+
+    # remove markdown fences if present, even when surrounded by plain text
+    if "```" in response:
+        fenced_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", response, re.IGNORECASE)
+        if fenced_match:
+            response = fenced_match.group(1).strip()
+
+    if response.lower().startswith("json"):
+        response = response[4:].strip()
+
+    return _strip_trailing_commas(response)
+
+
+def _extract_first_valid_json(raw_response: str):
+    """Extract only the first valid JSON object/array from a noisy response."""
+    response = _clean_llm_response_text(raw_response)
+    if not response:
+        return None
+
+    # Attempt direct parse first.
+    try:
+        return _parse_json_without_duplicate_keys(response)
+    except Exception:
+        pass
+
+    # If multiple JSON-like blocks exist, scan and pick first valid JSON object or array.
+    starters = [index for index, ch in enumerate(response) if ch in "[{"]
+    for start in starters:
+        opener = response[start]
+        closer = "}" if opener == "{" else "]"
+        depth = 0
+        in_string = False
+        escaped = False
+
+        for end in range(start, len(response)):
+            ch = response[end]
+
+            if escaped:
+                escaped = False
+                continue
+            if ch == "\\":
+                escaped = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+
+            if ch == opener:
+                depth += 1
+            elif ch == closer:
+                depth -= 1
+                if depth == 0:
+                    candidate = _strip_trailing_commas(response[start:end + 1].strip())
+                    try:
+                        return _parse_json_without_duplicate_keys(candidate)
+                    except Exception:
+                        break
+
+    return None
+
+
 def clean_llm_json(raw_response: str) -> dict | None:
     if not raw_response or not isinstance(raw_response, str):
         return None
 
-    original = raw_response.strip()
-    candidate = _strip_trailing_commas(original)
-
-    parsed = None
-
-    # Attempt 1: direct parse.
-    try:
-        parsed = _parse_json_without_duplicate_keys(candidate)
-    except Exception:
-        parsed = None
-
-    # Attempt 2: fenced JSON block extraction.
-    if parsed is None:
-        fenced_match = re.search(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", candidate, re.IGNORECASE)
-        if fenced_match:
-            extracted = _strip_trailing_commas(fenced_match.group(1).strip())
-            try:
-                parsed = _parse_json_without_duplicate_keys(extracted)
-            except Exception:
-                parsed = None
-
-    # Attempt 3: first object-like region extraction.
-    if parsed is None:
-        json_match = re.search(r"\{[\s\S]*\}", candidate)
-        if json_match:
-            extracted = _strip_trailing_commas(json_match.group(0).strip())
-            try:
-                parsed = _parse_json_without_duplicate_keys(extracted)
-            except Exception:
-                parsed = None
+    parsed = _extract_first_valid_json(raw_response)
 
     if parsed is None:
         return UnifiedResponseSchema().model_dump()
@@ -339,14 +375,26 @@ def _truncate_item_for_tokens(item):
     return item
 
 
+def _simple_paragraph_blocks(text: str, prefix: str) -> list[dict]:
+    paragraphs = [part.strip() for part in re.split(r"\n\s*\n+", str(text or "")) if part and part.strip()]
+    return [
+        {
+            "block_id": f"{prefix}-{index}",
+            "heading": "Paragraph Block",
+            "content": _truncate_text_for_tokens(paragraph, max_tokens=350),
+        }
+        for index, paragraph in enumerate(paragraphs, start=1)
+    ]
+
+
 def _dedupe_clause_list(clauses: list[dict]) -> list[dict]:
     seen = set()
     deduped = []
     for clause in clauses or []:
         if not isinstance(clause, dict):
             continue
-        clause_id = str(clause.get("clause_id") or "").strip().lower()
-        title = str(clause.get("title") or "").strip().lower()
+        clause_id = str(clause.get("clause_id") or clause.get("block_id") or "").strip().lower()
+        title = str(clause.get("title") or clause.get("heading") or "").strip().lower()
         content = str(clause.get("content") or "").strip().lower()
         key = f"{clause_id}|{title}|{content}"
         if key in seen:
@@ -357,29 +405,28 @@ def _dedupe_clause_list(clauses: list[dict]) -> list[dict]:
 
 
 def _filter_text_for_llm(text: str, label: str) -> str:
-    """Apply clause filtering right before LLM prompt construction.
-
-    Backward compatibility: if extraction/filtering fails or yields no usable output,
-    return original text unchanged.
-    """
+    """Apply semantic block filtering right before LLM prompt construction."""
     source_text = str(text or "").strip()
     if not source_text:
         return source_text
 
     try:
-        all_clauses = extract_clauses_from_text(source_text)
+        all_clauses = extract_semantic_blocks(source_text)
+        if not all_clauses:
+            all_clauses = _simple_paragraph_blocks(source_text, prefix=f"{label}-fallback")
         if not all_clauses:
             return source_text
 
         all_clauses = _dedupe_clause_list(all_clauses)
-        filtered_clauses = filter_relevant_clauses(all_clauses)
-        filtered_clauses = _dedupe_clause_list(filtered_clauses)
-
-        if not filtered_clauses:
-            return source_text
+        scored = sorted(
+            all_clauses,
+            key=lambda block: _score_relevance(str(block.get("content") or "")),
+            reverse=True,
+        )
+        filtered_clauses = _dedupe_clause_list(scored[:TOP_ITEM_LIMIT])
 
         logger.info(
-            "Using filtered clauses for LLM processing | stage=%s before=%s after=%s",
+            "Using semantic blocks for LLM processing | stage=%s before=%s after=%s",
             label,
             len(all_clauses),
             len(filtered_clauses),
@@ -388,7 +435,7 @@ def _filter_text_for_llm(text: str, label: str) -> str:
         rebuilt = "\n\n".join(str(clause.get("content") or "").strip() for clause in filtered_clauses).strip()
         return rebuilt or source_text
     except Exception as exc:
-        logger.warning("Clause filtering failed at stage=%s, using original clauses: %s", label, exc)
+        logger.warning("Semantic block filtering failed at stage=%s, using original text: %s", label, exc)
         return source_text
 
 
@@ -415,6 +462,8 @@ def _score_relevance(text: str) -> int:
             score += 3
     if re.search(r"\b\d+%\b", value) or re.search(r"\b\d+(?:\.\d+)?\b", value):
         score += 4
+
+
     if value.isupper() and len(value) < 120:
         score += 2
     score += min(len(value) // 500, 4)
@@ -432,6 +481,7 @@ def _rank_and_limit_items(items: list, limit: int = TOP_ITEM_LIMIT) -> list:
         reverse=True,
     )
     return ranked[:limit]
+
 
 
 def create_token_safe_batches(items, max_input_tokens: int = MAX_INPUT_TOKENS):
@@ -643,14 +693,36 @@ def _parse_json_response(content):
     if not content or not isinstance(content, str):
         return None
 
-    match = re.search(r"\{.*\}", content, re.DOTALL)
-    if not match:
-        return None
+    response = str(content).strip()
+    original_response = response
+
+    # remove markdown/backticks before parsing
+    if "`" in response:
+        if "```" in response:
+            fenced_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", response, re.IGNORECASE)
+            if fenced_match:
+                response = fenced_match.group(1).strip()
+        else:
+            parts = response.split("`")
+            if len(parts) > 1:
+                response = parts[1].strip()
+
+    # extract JSON array only when available
+    start = response.find("[")
+    end = response.rfind("]")
+    if start != -1 and end != -1 and end >= start:
+        response = response[start:end + 1]
+
+    response = _strip_trailing_commas(response)
 
     try:
-        return _parse_json_without_duplicate_keys(match.group(0))
+        return _parse_json_without_duplicate_keys(response)
     except Exception:
-        return None
+        fallback = _extract_first_valid_json(_clean_llm_response_text(original_response))
+        if fallback is not None:
+            return fallback
+        print("❌ JSON FAILED:", response[:200])
+        return []
 
 
 def _call_groq_safe(
@@ -669,7 +741,7 @@ def _call_groq_safe(
         messages = [
             {
                 "role": "system",
-                "content": f"{system_prompt}\n{STRICT_JSON_INSTRUCTION}{strict_schema_message}{retry_message}",
+                "content": f"{system_prompt}\n{STRICT_JSON_INSTRUCTION}\n{STRICT_JSON_ARRAY_INSTRUCTION}{strict_schema_message}{retry_message}",
             },
             {"role": "user", "content": prompt},
         ]
@@ -785,6 +857,7 @@ Return ONLY valid JSON. No explanation. No markdown. No text outside JSON.\n\nJS
 {{
   "summary": "Compact summary preserving key obligations, thresholds, timelines, penalties, and scope"
 }}
+
 
 DOCUMENT:
 {_truncate_text_for_tokens(value, max_tokens=MAX_INPUT_TOKENS)}
@@ -1063,19 +1136,25 @@ def _extract_filtered_clauses_for_map(text: str, label: str, clause_prefix: str)
         return []
 
     try:
-        all_clauses = extract_clauses_from_text(source_text)
+        all_clauses = extract_semantic_blocks(source_text)
+        if not all_clauses:
+            all_clauses = _simple_paragraph_blocks(source_text, prefix=f"{clause_prefix}-fallback")
         if not all_clauses:
             return []
 
         all_clauses = _dedupe_clause_list(all_clauses)
-        filtered_clauses = filter_relevant_clauses(all_clauses)
-        filtered_clauses = _dedupe_clause_list(filtered_clauses)
+        ranked_blocks = sorted(
+            all_clauses,
+            key=lambda block: _score_relevance(str(block.get("content") or "")),
+            reverse=True,
+        )
+        filtered_clauses = _dedupe_clause_list(ranked_blocks[:TOP_ITEM_LIMIT])
 
         if not filtered_clauses:
             filtered_clauses = all_clauses
 
         logger.info(
-            "Using filtered clauses for LLM processing | stage=%s before=%s after=%s",
+            "Using semantic blocks for LLM processing | stage=%s before=%s after=%s",
             label,
             len(all_clauses),
             len(filtered_clauses),
@@ -1086,26 +1165,34 @@ def _extract_filtered_clauses_for_map(text: str, label: str, clause_prefix: str)
             content = str(clause.get("content") or "").strip()
             if not content:
                 continue
-            clause_id = str(clause.get("clause_id") or f"{clause_prefix}-{index}").strip()
+            clause_id = str(clause.get("block_id") or clause.get("clause_id") or f"{clause_prefix}-{index}").strip()
             normalized.append(
                 {
                     "clause_id": clause_id,
-                    "title": str(clause.get("title") or "").strip(),
+                    "title": str(clause.get("heading") or clause.get("title") or "").strip(),
                     "content": _truncate_text_for_tokens(content, max_tokens=350),
                 }
             )
         return normalized
     except Exception as exc:
-        logger.warning("Clause extraction/filtering failed for stage=%s, using fallback: %s", label, exc)
-        fallback = _truncate_text_for_tokens(source_text, max_tokens=350)
-        return [{"clause_id": f"{clause_prefix}-1", "title": "", "content": fallback}] if fallback else []
+        logger.warning("Semantic block extraction/filtering failed for stage=%s, using paragraph fallback: %s", label, exc)
+        fallback_blocks = _simple_paragraph_blocks(source_text, prefix=f"{clause_prefix}-fallback")
+        return [
+            {
+                "clause_id": str(block.get("block_id") or f"{clause_prefix}-{index}"),
+                "title": str(block.get("heading") or ""),
+                "content": str(block.get("content") or ""),
+            }
+            for index, block in enumerate(fallback_blocks, start=1)
+            if str(block.get("content") or "").strip()
+        ]
 
 
 def _log_clause_structure(label: str, clauses: list[dict]) -> None:
     clause_list = [item for item in (clauses or []) if isinstance(item, dict)]
     total = len(clause_list)
     if total == 0:
-        logger.info("Clause structure analysis | document=%s total=0", label)
+        logger.info("Semantic block analysis | document=%s total=0", label)
         return
 
     title_count = sum(1 for item in clause_list if str(item.get("title") or "").strip())
@@ -1119,7 +1206,7 @@ def _log_clause_structure(label: str, clauses: list[dict]) -> None:
     ][:3]
 
     logger.info(
-        "Clause structure analysis | document=%s total=%s titled=%s avg_chars=%s max_chars=%s sample_titles=%s",
+        "Semantic block analysis | document=%s total=%s titled=%s avg_chars=%s max_chars=%s sample_titles=%s",
         label,
         total,
         title_count,
@@ -1491,6 +1578,7 @@ def _parse_clause_comparison_payload(raw_content: str) -> list[dict] | None:
 
 
 def filter_changes(changes):
+    print("Before filter:", len(changes or []))
     filtered = []
     removed_count = 0
     for c in changes or []:
@@ -1506,26 +1594,23 @@ def filter_changes(changes):
             removed_count += 1
             continue
 
-        # must have meaningful old/new difference
+        # relaxed rule: only reject very short entries (<5 words)
         if isinstance(c, dict):
-            if c.get("old") == c.get("new"):
-                removed_count += 1
-                continue
-
             merged_text = " ".join(
                 [
                     str(c.get("field") or ""),
                     str(c.get("old") or ""),
                     str(c.get("new") or ""),
                 ]
-            ).lower()
-            if any(term in merged_text for term in VAGUE_CHANGE_TERMS):
+            ).strip()
+            if len(merged_text.split()) < 5:
                 removed_count += 1
                 continue
 
         filtered.append(c)
 
     print("Filtered vague changes:", removed_count)
+    print("After filter:", len(filtered))
     return filtered
 
 
@@ -1548,7 +1633,7 @@ def is_valid(change: dict) -> bool:
         return False
 
     change_type = str(change.get("type") or "").strip().lower()
-    if change_type not in {"added", "removed", "modified"}:
+    if change_type not in {"added", "removed", "modified", "threshold_change", "missing_requirement", "modified_requirement", "extra_policy_rule"}:
         return False
 
     field = str(change.get("field") or "").strip()
@@ -1561,11 +1646,20 @@ def is_valid(change: dict) -> bool:
     if any(term in merged_text for term in VAGUE_CHANGE_TERMS):
         return False
 
-    return (
-        old_value != new_value
-        and len(new_value) > 15
-        and _has_numeric_or_condition_signal(field, old_value, new_value)
-    )
+    if len(merged_text.split()) < 5:
+        return False
+
+    if change_type == "modified":
+        return old_value != new_value
+
+    if change_type == "threshold_change":
+        return old_value != new_value and (any(char.isdigit() for char in old_value) or any(char.isdigit() for char in new_value))
+
+    if change_type in {"missing_requirement", "modified_requirement", "extra_policy_rule"}:
+        field = str(change.get("field") or "").strip()
+        return len(field.split()) >= 2
+
+    return True
 
 
 def final_clean(changes):
@@ -1695,7 +1789,8 @@ def map_changes_per_clause(clause, stats: dict | None = None) -> list[dict]:
         parsed = _parse_clause_comparison_payload(content)
         if parsed is not None:
             raw_changes = parsed
-            filtered_changes = filter_changes(raw_changes)
+            # TEMP DEBUG MODE: disable filtering completely.
+            filtered_changes = raw_changes
             final_changes = final_clean(filtered_changes)
 
             print(f"Raw changes: {len(raw_changes)}")
@@ -1975,6 +2070,7 @@ def _clean_detected_changes(changes: list[dict], max_items: int = 10) -> list[di
             "field": _normalize_change_summary_text(str(item.get("field") or "").strip()),
             "old": _normalize_change_summary_text(str(item.get("old") or "").strip()),
             "new": _normalize_change_summary_text(str(item.get("new") or "").strip()),
+            "source": str(item.get("source") or "NEW").strip().upper(),
         }
         if not is_valid(candidate):
             continue
@@ -1985,6 +2081,7 @@ def _clean_detected_changes(changes: list[dict], max_items: int = 10) -> list[di
                 "field": trim_text(candidate["field"], 140),
                 "old": trim_text(candidate["old"], 220),
                 "new": trim_text(candidate["new"], 220),
+                "source": candidate["source"] if candidate["source"] in {"NEW", "OLD", "POLICY"} else "NEW",
             }
         )
 
@@ -2019,12 +2116,17 @@ def _normalize_reduce_changes(items: list[dict]) -> list[dict]:
         if not isinstance(item, dict):
             continue
 
-        summary = str(item.get("summary") or item.get("change") or "").strip()
+        summary = str(item.get("summary") or item.get("change") or item.get("field") or "").strip()
+        if not summary:
+            old_text = str(item.get("old") or item.get("old_text") or "").strip()
+            new_text = str(item.get("new") or item.get("new_text") or "").strip()
+            if old_text or new_text:
+                summary = trim_text(f"{old_text} -> {new_text}".strip(" ->"), 220)
         if not summary:
             continue
 
         change_type = str(item.get("type") or "modified").strip().lower()
-        if change_type not in {"added", "modified", "removed"}:
+        if change_type not in {"added", "modified", "removed", "threshold_change"}:
             change_type = "modified"
 
         normalized.append(
@@ -2181,111 +2283,181 @@ INPUT_CHANGES:
     return fallback_result
 
 
-def detect_changes(old_text: str, new_text: str) -> dict:
-    """Detect material changes using MAP phase (per-clause LLM calls)."""
+def detect_changes(old_blocks: Any, new_blocks: Any, policy_blocks: Any = None) -> dict:
+    """Detect compliance changes using RBI (new) vs Policy (current state) semantics."""
     try:
-        if not old_text or not new_text:
+        def _normalize_blocks(value: Any, prefix: str) -> list[dict]:
+            if isinstance(value, list):
+                normalized = []
+                for index, item in enumerate(value, start=1):
+                    if not isinstance(item, dict):
+                        continue
+                    content = str(item.get("content") or item.get("text") or "").strip()
+                    if not content:
+                        continue
+                    normalized.append(
+                        {
+                            "block_id": str(item.get("block_id") or item.get("chunk_id") or f"{prefix}-{index}"),
+                            "heading": str(item.get("heading") or item.get("title") or "").strip(),
+                            "content": content,
+                        }
+                    )
+                return normalized
+
+            source_text = str(value or "").strip()
+            if not source_text:
+                return []
+
+            blocks = extract_semantic_blocks(source_text)
+            if not blocks:
+                blocks = _simple_paragraph_blocks(source_text, prefix=f"{prefix}-fallback")
+            return [
+                {
+                    "block_id": str(block.get("block_id") or f"{prefix}-{index}"),
+                    "heading": str(block.get("heading") or block.get("title") or "").strip(),
+                    "content": str(block.get("content") or "").strip(),
+                }
+                for index, block in enumerate(blocks, start=1)
+                if isinstance(block, dict) and str(block.get("content") or "").strip()
+            ]
+
+        rbi_items = _normalize_blocks(new_blocks, prefix="rbi")
+        policy_items = _normalize_blocks(policy_blocks, prefix="policy") if policy_blocks is not None else _normalize_blocks(old_blocks, prefix="policy")
+
+        print("Using semantic blocks:", len(rbi_items) + len(policy_items))
+
+        if not rbi_items or not policy_items:
             return _default_changes_response()
 
-        old_text = _truncate_text_for_tokens(trim_text(old_text, 5500))
-        new_text = _truncate_text_for_tokens(trim_text(new_text, 5500))
+        matches = match_blocks(policy_items, rbi_items)
+        matched_blocks = to_matched_blocks_payload(matches)
 
-        old_clauses = _extract_filtered_clauses_for_map(old_text, label="changes_old", clause_prefix="old")
-        new_clauses = _extract_filtered_clauses_for_map(new_text, label="changes_new", clause_prefix="new")
-        _log_clause_structure("old", old_clauses)
-        _log_clause_structure("new", new_clauses)
+        matched_count = len([item for item in matched_blocks if str(item.get("match_type") or "") == "matched"])
+        added_count = len([item for item in matched_blocks if str(item.get("match_type") or "") == "added"])
+        removed_count = len([item for item in matched_blocks if str(item.get("match_type") or "") == "removed"])
 
-        matched_clause_pairs = _match_old_new_clauses(old_clauses, new_clauses)
-        added_pairs = sum(1 for pair in matched_clause_pairs if str(pair.get("status") or "").lower() == "added")
-        removed_pairs = sum(1 for pair in matched_clause_pairs if str(pair.get("status") or "").lower() == "removed")
-        matched_count = len(matched_clause_pairs) - added_pairs - removed_pairs
-        logger.info(
-            "Matched pair analysis | matched=%s added=%s removed=%s total=%s",
-            matched_count,
-            added_pairs,
-            removed_pairs,
-            len(matched_clause_pairs),
-        )
+        print("\n🔍 Matching:")
+        print(f"Matched: {matched_count} | Added: {added_count} | Removed: {removed_count}")
 
-        if not matched_clause_pairs:
-            return _default_changes_response()
-
-        all_changes = []
-        clause_level_outputs = []
-        seen_clause_pairs = set()
-        map_stats = {"api_calls": 0}
-        clauses_processed = 0
-
-        for index, matched_pair in enumerate(matched_clause_pairs, start=1):
-            old_clause = matched_pair.get("old_clause") if isinstance(matched_pair.get("old_clause"), dict) else {}
-            new_clause = matched_pair.get("new_clause") if isinstance(matched_pair.get("new_clause"), dict) else {}
-
-            clause_id = str(
-                new_clause.get("clause_id")
-                or old_clause.get("clause_id")
-                or f"pair-{index}"
-            )
-
-            pair_key = f"{clause_id}|{old_clause.get('content') or ''}|{new_clause.get('content') or ''}"
-            if pair_key in seen_clause_pairs:
-                continue
-            seen_clause_pairs.add(pair_key)
-
-            old_content = str(old_clause.get("content") or "").strip()
-            new_content = str(new_clause.get("content") or "").strip()
-            if not old_content and not new_content:
-                logger.info("Clause compare | clause_id=%s skipped=empty_pair", clause_id)
-                continue
-            if old_content == new_content:
-                logger.info("Clause compare | clause_id=%s skipped=identical", clause_id)
-                continue
-
-            clause_payload = {
-                "clause_id": clause_id,
-                "old_content": old_content,
-                "new_content": new_content,
-            }
-
-            clause_changes = map_changes_per_clause(clause_payload, stats=map_stats)
-            missed_changes = find_missed_changes_per_clause(clause_payload, clause_changes, stats=map_stats)
-            clause_changes = [*(clause_changes or []), *(missed_changes or [])]
-            clauses_processed += 1
-            clause_level_outputs.append(clause_changes)
-            all_changes.extend(clause_changes)
-
-        logger.info(
-            "MAP phase: clauses_processed=%s total_api_calls=%s",
-            clauses_processed,
-            int(map_stats.get("api_calls") or 0),
-        )
-
-        unique_clean_changes = merge_and_dedupe_clause_changes(clause_level_outputs)
-
-        mapped_changes = [
+        compare_pairs = [
             {
-                "type": item.get("type") or "modified",
-                "field": trim_text(str(item.get("field") or ""), 140),
-                "old": trim_text(str(item.get("old") or ""), 220),
-                "new": trim_text(str(item.get("new") or ""), 220),
+                "pair_id": str(pair.get("pair_id") or "").strip(),
+                "old": str(pair.get("old") or "").strip(),
+                "new": str(pair.get("new") or "").strip(),
+                "old_heading": str(pair.get("old_heading") or "").strip(),
+                "new_heading": str(pair.get("new_heading") or "").strip(),
+                "match_score": float(pair.get("match_score") or 0.0),
             }
-            for item in unique_clean_changes
+            for pair in matched_blocks
+            if isinstance(pair, dict)
+            and (str(pair.get("old") or "").strip() or str(pair.get("new") or "").strip())
         ]
 
-        deduped_changes = deduplicate_items(mapped_changes)
-        cleaned_changes = _clean_detected_changes(deduped_changes, max_items=10)
+        MAX_BLOCKS_PER_CALL = 5
+        MAX_TOTAL_COMPARE_BLOCKS = 20
+        if len(compare_pairs) > MAX_TOTAL_COMPARE_BLOCKS:
+            compare_pairs = sorted(
+                compare_pairs,
+                key=lambda item: float(item.get("match_score") or 0.0),
+                reverse=True,
+            )[:MAX_TOTAL_COMPARE_BLOCKS]
 
-        print("FINAL OUTPUT")
-        print("Changes:")
-        for item in cleaned_changes:
-            if not isinstance(item, dict):
+        batches = [
+            compare_pairs[index:index + MAX_BLOCKS_PER_CALL]
+            for index in range(0, len(compare_pairs), MAX_BLOCKS_PER_CALL)
+        ]
+
+        raw_changes = []
+        print("\n🧠 LLM:")
+        for batch_index, batch in enumerate(batches, start=1):
+            print(f"Batch {batch_index} -> {len(batch)} blocks")
+            if batch:
+                sample_old = trim_text(str(batch[0].get("old") or "").replace("\n", " "), 140)
+                sample_new = trim_text(str(batch[0].get("new") or "").replace("\n", " "), 140)
+                print(f"Sample OLD: {sample_old}")
+                print(f"Sample NEW: {sample_new}")
+            batch_result = compare_blocks_batch(batch, debug=False)
+            if isinstance(batch_result, list):
+                raw_changes.extend([item for item in batch_result if isinstance(item, dict)])
+
+        # Normalize to strict output format.
+        mapped_changes = []
+        banned_terms = {"general update", "no summary provided", "may affect", "needs review"}
+        for item in raw_changes:
+            change_type = str(item.get("type") or "").strip().lower()
+            if change_type not in {"missing_requirement", "modified_requirement", "extra_policy_rule"}:
                 continue
-            field = str(item.get("field") or "Change").strip()
-            old_value = str(item.get("old") or "").strip()
-            new_value = str(item.get("new") or "").strip()
-            if old_value or new_value:
-                print(f"- {field}: {old_value} -> {new_value}")
-            else:
-                print(f"- {field}")
+
+            field = trim_text(str(item.get("field") or item.get("statement") or "").strip(), 140)
+            old_value = str(item.get("old") if item.get("old") is not None else item.get("old_text") or "").strip()
+            new_value = str(item.get("new") if item.get("new") is not None else item.get("new_text") or "").strip()
+            evidence = trim_text(str(item.get("evidence") or item.get("statement") or "").strip(), 220)
+
+            merged = f"{field} {old_value} {new_value} {evidence}".lower()
+            if any(term in merged for term in banned_terms):
+                continue
+            if len(field.split()) < 2 or len(evidence.split()) < 4:
+                continue
+
+            mapped_changes.append(
+                {
+                    "type": change_type,
+                    "field": field,
+                    "old": old_value or None,
+                    "new": new_value or None,
+                    "evidence": evidence,
+                    "source": "RBI" if change_type != "extra_policy_rule" else "POLICY",
+                }
+            )
+
+        # Deduplicate and cap to meaningful range.
+        deduped = []
+        seen = set()
+        for item in mapped_changes:
+            key = (
+                str(item.get("type") or "").strip().lower(),
+                _normalize_change_text(str(item.get("field") or "")),
+                _normalize_change_text(str(item.get("old") or "")),
+                _normalize_change_text(str(item.get("new") or "")),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(item)
+
+        if len(deduped) < 5:
+            for pair in compare_pairs:
+                old_text = str(pair.get("old") or "").strip()
+                new_text = str(pair.get("new") or "").strip()
+                field = str(pair.get("new_heading") or pair.get("old_heading") or "Regulatory requirement").strip()
+                if not new_text:
+                    continue
+                inferred_type = "modified_requirement" if old_text else "missing_requirement"
+                candidate = {
+                    "type": inferred_type,
+                    "field": trim_text(field, 140),
+                    "old": trim_text(old_text, 220) if old_text else None,
+                    "new": trim_text(new_text, 220),
+                    "evidence": trim_text(new_text, 220),
+                    "source": "RBI",
+                }
+                key = (
+                    str(candidate.get("type") or "").strip().lower(),
+                    _normalize_change_text(str(candidate.get("field") or "")),
+                    _normalize_change_text(str(candidate.get("old") or "")),
+                    _normalize_change_text(str(candidate.get("new") or "")),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                deduped.append(candidate)
+                if len(deduped) >= 5:
+                    break
+
+        cleaned_changes = deduped[:15]
+
+        print("\n✅ FINAL:")
+        print(f"Changes: {len(cleaned_changes)}")
 
         return _schema_response(changes=cleaned_changes)
 
@@ -2297,6 +2469,52 @@ def detect_changes(old_text: str, new_text: str) -> dict:
 def detect_compliance_gaps(new_text: str, policy_text: str, changes: list[dict] | None = None) -> dict:
     """Detect compliance gaps using token-aware batched analysis."""
     try:
+        if isinstance(changes, list) and changes:
+            gaps = []
+            for item in changes:
+                if not isinstance(item, dict):
+                    continue
+                field = str(item.get("field") or "Regulatory requirement").strip()
+                evidence = str(item.get("evidence") or "").strip()
+                change_type = str(item.get("type") or "").strip().lower()
+                old_value = str(item.get("old") or "").strip()
+                new_value = str(item.get("new") or "").strip()
+
+                severity = "Low"
+                lowered = f"{field} {evidence} {new_value}".lower()
+                if any(token in lowered for token in ["%", "threshold", "limit", "ce t1", "cet1", "day", "days", "report", "timeline", "penalty"]):
+                    severity = "High"
+                elif any(token in lowered for token in ["monitor", "procedure", "process", "control"]):
+                    severity = "Medium"
+
+                if change_type == "missing_requirement":
+                    gap_text = f"Missing RBI requirement: {field}"
+                    reason = f"Policy does not implement RBI rule for {field}; this can create direct non-compliance risk."
+                elif change_type == "modified_requirement":
+                    gap_text = f"Policy rule differs from RBI for {field}"
+                    reason = f"Policy value '{old_value or 'N/A'}' conflicts with RBI value '{new_value or 'N/A'}'."
+                elif change_type == "extra_policy_rule":
+                    gap_text = f"Policy has extra rule not mapped to RBI: {field}"
+                    reason = "Policy contains a requirement not aligned to RBI source text and needs rationalization."
+                else:
+                    continue
+
+                gaps.append(
+                    {
+                        "gap": trim_text(gap_text, 220),
+                        "severity": severity,
+                        "reason": trim_text(reason, 240),
+                        "issue": trim_text(gap_text, 220),
+                        "risk": severity,
+                        "regulation_requirement": trim_text(f"{field}: {new_value or evidence}", 220),
+                        "policy_current_state": trim_text(old_value or "Not implemented in policy", 220),
+                    }
+                )
+
+            deduped = deduplicate_items(gaps)[:15]
+            print(f"Compliance gaps generated: {len(deduped)}")
+            return _schema_response(compliance_gaps=deduped)
+
         if not new_text or not policy_text:
             return _default_gaps_response()
 

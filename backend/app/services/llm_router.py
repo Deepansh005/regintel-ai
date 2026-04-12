@@ -3,6 +3,7 @@ import os
 import threading
 import time
 import json
+import random
 from dataclasses import dataclass
 from typing import Optional
 
@@ -14,9 +15,10 @@ logger = logging.getLogger(__name__)
 
 GROQ_MODEL = "llama-3.1-8b-instant"
 KEY_COOLDOWN_SECONDS = int(os.getenv("GROQ_KEY_COOLDOWN_SECONDS", "30"))
+KEY_FAILURE_THRESHOLD = int(os.getenv("GROQ_KEY_FAILURE_THRESHOLD", "2"))
 MAX_INPUT_CHARS = int(os.getenv("GROQ_MAX_INPUT_CHARS", "2500"))
 MAX_OUTPUT_TOKENS = 800
-STRICT_JSON_PROMPT = "Return ONLY valid JSON. No explanation. No text outside JSON."
+STRICT_JSON_PROMPT = "Return ONLY valid JSON. No explanation. No markdown. No text outside JSON."
 
 
 def _mask_key(api_key: str) -> str:
@@ -62,11 +64,21 @@ def _is_available(state: KeyState, now: float) -> bool:
     return now >= state.cooldown_until
 
 
-def _select_state(prefer_least_used: bool = True, preferred_key_index: Optional[int] = None) -> KeyState:
+def _select_state(
+    prefer_least_used: bool = True,
+    preferred_key_index: Optional[int] = None,
+    excluded_indices: Optional[set[int]] = None,
+) -> Optional[KeyState]:
     now = _now()
-    available = [state for state in _key_states if _is_available(state, now)]
+    excluded_indices = excluded_indices or set()
+    available = [state for state in _key_states if _is_available(state, now) and state.index not in excluded_indices]
+
+    if not available and excluded_indices:
+        # If all available keys were excluded for this request, allow any available key.
+        available = [state for state in _key_states if _is_available(state, now)]
+
     if not available:
-        raise RuntimeError("No Groq API keys available. All keys are cooling down.")
+        return None
 
     if preferred_key_index is not None:
         preferred = [state for state in available if state.index == preferred_key_index]
@@ -78,26 +90,52 @@ def _select_state(prefer_least_used: bool = True, preferred_key_index: Optional[
         available.sort(key=lambda state: (state.active_calls, state.total_uses, state.last_used_at, state.index))
         return available[0]
 
-    global _round_robin_index
-    available.sort(key=lambda state: (state.active_calls, state.total_uses, state.last_used_at, state.index))
-    selected = available[_round_robin_index % len(available)]
-    _round_robin_index = (_round_robin_index + 1) % max(1, len(available))
-    return selected
+    # Randomly rotate across currently available keys to reduce synchronized cooldowns.
+    least_active = min(state.active_calls for state in available)
+    candidate_pool = [state for state in available if state.active_calls == least_active]
+    return random.choice(candidate_pool)
 
 
-def get_next_api_key(prefer_least_used: bool = True, preferred_key_index: Optional[int] = None) -> tuple[str, int]:
-    with _key_lock:
-        state = _select_state(prefer_least_used=prefer_least_used, preferred_key_index=preferred_key_index)
-        state.active_calls += 1
-        state.last_used_at = _now()
-        state.total_uses += 1
-        logger.info(
-            "Using API key index: %s masked=%s active_calls=%s",
-            state.index,
-            _mask_key(state.api_key),
-            state.active_calls,
-        )
-        return state.api_key, state.index
+def _min_cooldown_wait_seconds() -> float:
+    if not _key_states:
+        return 0.0
+    now = _now()
+    waits = [max(0.0, state.cooldown_until - now) for state in _key_states]
+    return min(waits) if waits else 0.0
+
+
+def get_next_api_key(
+    prefer_least_used: bool = True,
+    preferred_key_index: Optional[int] = None,
+    excluded_indices: Optional[set[int]] = None,
+    wait_for_key: bool = True,
+) -> tuple[str, int]:
+    while True:
+        with _key_lock:
+            state = _select_state(
+                prefer_least_used=prefer_least_used,
+                preferred_key_index=preferred_key_index,
+                excluded_indices=excluded_indices,
+            )
+
+            if state is not None:
+                state.active_calls += 1
+                state.last_used_at = _now()
+                state.total_uses += 1
+                logger.info(
+                    "Using API key index: %s masked=%s active_calls=%s",
+                    state.index,
+                    _mask_key(state.api_key),
+                    state.active_calls,
+                )
+                return state.api_key, state.index
+
+        if not wait_for_key:
+            raise RuntimeError("No Groq API key currently available")
+
+        sleep_for = min(2.0, max(0.25, _min_cooldown_wait_seconds()))
+        logger.info("All keys cooling briefly; waiting %.2fs for next available key", sleep_for)
+        time.sleep(sleep_for)
 
 
 def _truncate_message_content(content: str) -> str:
@@ -138,7 +176,8 @@ def _release_api_key(api_key: str, success: bool = True, cooldown_seconds: int |
                     state.failures = 0
                 else:
                     state.failures += 1
-                    state.cooldown_until = _now() + (cooldown_seconds or KEY_COOLDOWN_SECONDS)
+                    if state.failures >= KEY_FAILURE_THRESHOLD:
+                        state.cooldown_until = _now() + (cooldown_seconds or KEY_COOLDOWN_SECONDS)
                 return
 
 
@@ -147,7 +186,8 @@ def _mark_key_cooldown(api_key: str, reason: str, cooldown_seconds: int | None =
         for state in _key_states:
             if state.api_key == api_key:
                 state.failures += 1
-                state.cooldown_until = _now() + (cooldown_seconds or KEY_COOLDOWN_SECONDS)
+                if state.failures >= KEY_FAILURE_THRESHOLD:
+                    state.cooldown_until = _now() + (cooldown_seconds or KEY_COOLDOWN_SECONDS)
                 logger.warning(
                     "Groq key index=%s cooled down reason=%s failures=%s cooldown_until=%s",
                     state.index,
@@ -187,36 +227,39 @@ def call_groq_with_retry(
     messages: list[dict],
     max_tokens: int = 1000,
     temperature: float = 0.0,
-    retries: int = 3,
+    retries: int = 2,
     initial_backoff: float = 1.5,
     model: str = GROQ_MODEL,
     preferred_key_index: Optional[int] = None,
     response_format: Optional[dict] = None,
 ) -> str:
     """Retry across available keys before giving up."""
+    if not _key_states:
+        logger.error("No Groq API keys configured")
+        return json.dumps({"changes": [], "error": "No Groq API keys configured"})
+
     last_error: Exception | None = None
     timeout_retry_used = False
-    retries = min(3, max(1, retries), max(1, len(_key_states)))
+    retries = max(1, min(2, retries))
     max_tokens = min(max_tokens, MAX_OUTPUT_TOKENS)
     prepared_messages = _prepare_messages_for_llm(messages, enforce_json=True)
     attempted_key_indices: set[int] = set()
 
     for attempt in range(1, retries + 1):
         api_key = None
+        key_index = None
         try:
-            # Rotate key on each attempt; do not reuse key inside the same request if possible.
-            guard_loops = 0
-            while True:
-                api_key, key_index = get_next_api_key(
-                    prefer_least_used=False,
-                    preferred_key_index=preferred_key_index,
-                )
-                if key_index not in attempted_key_indices or len(attempted_key_indices) >= len(_key_states):
-                    break
-                _release_api_key(api_key, success=True)
-                guard_loops += 1
-                if guard_loops >= len(_key_states):
-                    break
+            # Rotate key on each attempt; avoid retrying the same key immediately.
+            exclude_for_attempt = set(attempted_key_indices)
+            if len(exclude_for_attempt) >= len(_key_states):
+                exclude_for_attempt = set()
+
+            api_key, key_index = get_next_api_key(
+                prefer_least_used=False,
+                preferred_key_index=preferred_key_index,
+                excluded_indices=exclude_for_attempt,
+                wait_for_key=True,
+            )
 
             attempted_key_indices.add(key_index)
             print(f"[LLM] Using key index: {key_index}")
@@ -244,14 +287,6 @@ def call_groq_with_retry(
                 response_format=response_format,
             )
 
-            # Safe JSON parse check. If invalid, retry with next key.
-            try:
-                json.loads(result)
-            except Exception as parse_exc:
-                _release_api_key(api_key, success=False, cooldown_seconds=5)
-                last_error = RuntimeError(f"Invalid JSON response: {parse_exc}")
-                continue
-
             _release_api_key(api_key, success=True)
             return result
         except Exception as exc:
@@ -263,9 +298,9 @@ def call_groq_with_retry(
                     _mark_key_cooldown(api_key, reason=str(exc))
                 elif _is_timeout_error(exc) and not timeout_retry_used:
                     timeout_retry_used = True
-                    _release_api_key(api_key, success=False, cooldown_seconds=5)
+                    _release_api_key(api_key, success=False)
                 else:
-                    _release_api_key(api_key, success=False, cooldown_seconds=5)
+                    _release_api_key(api_key, success=False)
 
             if _should_retry_with_next_key(exc) or (_is_timeout_error(exc) and timeout_retry_used):
                 continue

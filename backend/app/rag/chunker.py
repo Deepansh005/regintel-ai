@@ -1,6 +1,6 @@
 import logging
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from app.services.clause_extractor import extract_clauses_from_text, filter_relevant_clauses
+from app.services.semantic_block_extractor import extract_semantic_blocks
 
 logger = logging.getLogger(__name__)
 
@@ -11,14 +11,14 @@ def chunk_document(text: str):
     """
 
     try:
-        clauses = extract_clauses_from_text(text)
-        if clauses:
-            clauses = filter_relevant_clauses(clauses)
-            logger.info("Clause extraction started")
-            logger.info("Extracted %s clauses", len(clauses))
-            return clauses
+        blocks = extract_semantic_blocks(text)
+        if blocks:
+            logger.info("Semantic block extraction started")
+            logger.info("Extracted %s blocks", len(blocks))
+            print("Using semantic blocks:", len(blocks))
+            return blocks
     except Exception as exc:
-        logger.error("Clause extraction failed in chunk_document, using legacy splitter: %s", exc)
+        logger.error("Semantic block extraction failed in chunk_document, using legacy splitter: %s", exc)
 
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=1000,

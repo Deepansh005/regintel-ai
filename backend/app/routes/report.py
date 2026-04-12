@@ -6,7 +6,7 @@ from fpdf import FPDF
 from docx import Document
 from db.database import get_task
 from app.services.pdf_service import extract_pdf_pages
-from app.services.clause_extractor import extract_clauses_from_pages
+from app.services.semantic_block_extractor import extract_semantic_blocks
 from app.rag.vector_store import (
     list_collections,
     delete_collection,
@@ -98,7 +98,8 @@ def debug_clause_extraction(payload: dict = Body(...)):
         raise HTTPException(status_code=404, detail=f"File not found: {normalized_path}")
 
     pages = extract_pdf_pages(normalized_path)
-    clauses = extract_clauses_from_pages(pages)
+    combined_text = "\n\n".join(str((page or {}).get("text") or "").strip() for page in pages if str((page or {}).get("text") or "").strip())
+    clauses = extract_semantic_blocks(combined_text)
 
     first_clause = clauses[0] if clauses else {}
     print(f"Clause debug endpoint: total_clauses={len(clauses)} first_clause={first_clause.get('content', '')[:500] if isinstance(first_clause, dict) else ''}")

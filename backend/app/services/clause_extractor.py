@@ -11,6 +11,20 @@ CLAUSE_DEBUG = os.getenv("CLAUSE_DEBUG", "false").strip().lower() in {"1", "true
 MAX_HEADING_PREVIEW = 5
 MAX_CLAUSE_PREVIEW = 5
 
+CLAUSE_FILTER_KEYWORDS = (
+    "shall",
+    "must",
+    "required",
+    "compliance",
+    "regulation",
+    "mandatory",
+    "penalty",
+    "risk",
+    "obligation",
+    "audit",
+)
+CLAUSE_FILTER_MIN_COUNT = 5
+
 # Regex-based heading matcher for splitting by heading boundaries.
 # Supports:
 # - Numbered: 1., 1.1, 2.3.1
@@ -56,6 +70,53 @@ def _extract_heading_text(line: str) -> str:
     line = re.sub(r"^[A-Z]\.\s*", "", line)  # Remove letter prefix
     line = re.sub(r"^(?:Chapter|Section)\s*(?:[IVXivx\d]+|[A-Z])?\s*", "", line)  # Remove chapter/section
     return line.strip()
+
+
+def filter_relevant_clauses(clauses: List[Dict]) -> List[Dict]:
+    """Filter and rank clauses by compliance keyword relevance.
+
+    Rules:
+    - Keep clauses containing any configured keyword.
+    - Score by count of matched keywords and sort descending.
+    - If fewer than 5 clauses match, fallback to top 5 longest clauses.
+    """
+    input_clauses = [clause for clause in (clauses or []) if isinstance(clause, dict)]
+    total_before = len(input_clauses)
+
+    if total_before == 0:
+        logger.info("Clause filtering: before=0 after=0 reduction=0.00%%")
+        return []
+
+    scored = []
+    for index, clause in enumerate(input_clauses):
+        title = str(clause.get("title") or "")
+        content = str(clause.get("content") or "")
+        haystack = f"{title}\n{content}".lower()
+        score = sum(1 for keyword in CLAUSE_FILTER_KEYWORDS if keyword in haystack)
+        scored.append((score, len(content), index, clause))
+
+    matched = [entry for entry in scored if entry[0] > 0]
+    matched.sort(key=lambda entry: (entry[0], entry[1], -entry[2]), reverse=True)
+    filtered = [entry[3] for entry in matched]
+
+    fallback_used = False
+    if len(filtered) < CLAUSE_FILTER_MIN_COUNT:
+        fallback_used = True
+        longest = sorted(scored, key=lambda entry: (entry[1], -entry[2]), reverse=True)
+        fallback_limit = min(CLAUSE_FILTER_MIN_COUNT, total_before)
+        filtered = [entry[3] for entry in longest[:fallback_limit]]
+
+    total_after = len(filtered)
+    reduction_pct = ((total_before - total_after) / total_before) * 100 if total_before else 0.0
+    logger.info(
+        "Clause filtering: before=%s after=%s reduction=%.2f%% fallback_used=%s",
+        total_before,
+        total_after,
+        reduction_pct,
+        fallback_used,
+    )
+
+    return filtered
 
 
 def _detect_headings(text: str) -> List[Tuple[int, int, str, str]]:

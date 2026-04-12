@@ -14,12 +14,11 @@ from app.services.pdf_service import extract_pdf_pages
 from app.services.ai_service import (
     deduplicate_items,
     detect_changes,
-    analyze_impact,
-    generate_actions,
     detect_compliance_gaps,
+    reduce_changes_and_actions,
 )
 from app.services.context_optimizer import optimize_context_chunks
-from app.services.clause_extractor import extract_clauses_from_text, extract_clauses_from_pages
+from app.services.clause_extractor import extract_clauses_from_text, extract_clauses_from_pages, filter_relevant_clauses
 
 from app.rag.retriever import retrieve_with_metadata
 from app.rag.vector_store import store_chunks
@@ -86,7 +85,18 @@ def _build_chunk_records(page_records: list[dict], file_path: str) -> list[dict]
     try:
         logger.info("📄 Processing PDF: %s", source_file_name)
         clauses = extract_clauses_from_pages(page_records or [])
-        logger.info("Clause summary for %s: clauses=%s pages=%s", source_file_name, len(clauses), len(page_records or []))
+        total_clauses = len(clauses)
+        filtered_clauses = filter_relevant_clauses(clauses)
+        filtered_count = len(filtered_clauses)
+        reduction_pct = ((total_clauses - filtered_count) / total_clauses * 100.0) if total_clauses else 0.0
+        clauses = filtered_clauses
+        logger.info(
+            "PDF clause filter: file=%s total_clauses=%s filtered_clauses=%s reduction_pct=%.2f",
+            source_file_name,
+            total_clauses,
+            filtered_count,
+            reduction_pct,
+        )
     except Exception as exc:
         logger.error("Clause extraction failed, falling back to chunking: %s", exc)
         clauses = []
@@ -264,18 +274,29 @@ async def _run_analysis_pipeline(mode: str, old_context: str, new_context: str, 
     elif mode == "new" and new_context and policy_context:
         gaps_payload = await asyncio.to_thread(detect_compliance_gaps, new_context, policy_context)
 
-    impacts_input = {
-        "changes": (changes_payload or {}).get("changes", []),
-        "compliance_gaps": (gaps_payload or {}).get("compliance_gaps", []),
-    }
-    impacts_payload = await asyncio.to_thread(analyze_impact, impacts_input)
+    print("Starting REDUCE Phase...")
+    reduce_result = await asyncio.to_thread(
+        reduce_changes_and_actions,
+        (changes_payload or {}).get("changes", []),
+    )
 
-    actions_input = {
-        "changes": (changes_payload or {}).get("changes", []),
-        "compliance_gaps": (gaps_payload or {}).get("compliance_gaps", []),
-        "impacts": (impacts_payload or {}).get("impacts", []),
+    reduced_changes = reduce_result.get("changes", []) if isinstance(reduce_result, dict) else []
+    reduced_actions = reduce_result.get("actions", []) if isinstance(reduce_result, dict) else []
+    print(f"Final changes count: {len(reduced_changes)}")
+
+    changes_payload = {
+        "changes": reduced_changes,
+        "compliance_gaps": [],
+        "impacts": [],
+        "actions": [],
     }
-    actions_payload = await asyncio.to_thread(generate_actions, actions_input)
+    impacts_payload = {"changes": [], "compliance_gaps": [], "impacts": [], "actions": []}
+    actions_payload = {
+        "changes": [],
+        "compliance_gaps": [],
+        "impacts": [],
+        "actions": reduced_actions,
+    }
 
     return changes_payload, gaps_payload, impacts_payload, actions_payload
 
@@ -340,6 +361,7 @@ def chunk_markdown_text(markdown_text: str, max_chunk_size: int = 800):
     try:
         clauses = extract_clauses_from_text(markdown_text)
         if clauses:
+            clauses = filter_relevant_clauses(clauses)
             return [
                 (clause.get("content") or "").strip()
                 for clause in clauses
@@ -730,6 +752,18 @@ def process_task(task_id: str, file_paths: dict, file_hashes: dict | None = None
                 for file_name, items in per_pdf_clause_map.items()
             },
         }
+
+        print("==============================")
+        print("FINAL OUTPUT")
+        print("==============================")
+        print("Changes:")
+        for change in changes_items or []:
+            if isinstance(change, dict):
+                print(f"- {str(change.get('summary') or '').strip()}")
+        print("Actions:")
+        for action in actions_items or []:
+            if isinstance(action, dict):
+                print(f"- {str(action.get('action') or '').strip()}")
 
         # ✅ SAVE SUCCESS
         update_task(task_id, status="completed", result=response)

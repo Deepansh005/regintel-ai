@@ -3,9 +3,32 @@ from typing import List
 import logging
 
 from app.rag.embeddings import get_embedding_model
+from app.services.clause_extractor import extract_clauses_from_text, filter_relevant_clauses
 from app.services.llm_router import llm_chat_completion
 
 logger = logging.getLogger(__name__)
+
+
+def _filter_context_for_llm(text: str) -> str:
+    source_text = (text or "").strip()
+    if not source_text:
+        return ""
+
+    try:
+        all_clauses = extract_clauses_from_text(source_text)
+        if not all_clauses:
+            return source_text
+
+        filtered_clauses = filter_relevant_clauses(all_clauses)
+        if not filtered_clauses:
+            return source_text
+
+        logger.info("Using filtered clauses for LLM processing")
+        rebuilt = "\n\n".join((clause.get("content") or "").strip() for clause in filtered_clauses).strip()
+        return rebuilt or source_text
+    except Exception as exc:
+        logger.warning("Context clause filtering failed, using original clauses: %s", exc)
+        return source_text
 
 
 def _cosine_similarity(vector_a: list[float], vector_b: list[float]) -> float:
@@ -74,6 +97,8 @@ def compress_context(text: str) -> str:
     value = (text or "").strip()
     if not value:
         return ""
+
+    value = _filter_context_for_llm(value)
 
     # Avoid extra round-trip for short contexts.
     if len(value) < 1500:

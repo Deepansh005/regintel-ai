@@ -1,4 +1,5 @@
 ﻿import asyncio
+from difflib import SequenceMatcher
 import hashlib
 import json
 import logging
@@ -9,6 +10,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field, ValidationError
 
+from app.services.clause_extractor import extract_clauses_from_text, filter_relevant_clauses
 from app.services.llm_router import call_groq_with_retry
 
 logger = logging.getLogger(__name__)
@@ -316,6 +318,59 @@ def _truncate_item_for_tokens(item):
         return _truncate_text_for_tokens(item)
 
     return item
+
+
+def _dedupe_clause_list(clauses: list[dict]) -> list[dict]:
+    seen = set()
+    deduped = []
+    for clause in clauses or []:
+        if not isinstance(clause, dict):
+            continue
+        clause_id = str(clause.get("clause_id") or "").strip().lower()
+        title = str(clause.get("title") or "").strip().lower()
+        content = str(clause.get("content") or "").strip().lower()
+        key = f"{clause_id}|{title}|{content}"
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(clause)
+    return deduped
+
+
+def _filter_text_for_llm(text: str, label: str) -> str:
+    """Apply clause filtering right before LLM prompt construction.
+
+    Backward compatibility: if extraction/filtering fails or yields no usable output,
+    return original text unchanged.
+    """
+    source_text = str(text or "").strip()
+    if not source_text:
+        return source_text
+
+    try:
+        all_clauses = extract_clauses_from_text(source_text)
+        if not all_clauses:
+            return source_text
+
+        all_clauses = _dedupe_clause_list(all_clauses)
+        filtered_clauses = filter_relevant_clauses(all_clauses)
+        filtered_clauses = _dedupe_clause_list(filtered_clauses)
+
+        if not filtered_clauses:
+            return source_text
+
+        logger.info(
+            "Using filtered clauses for LLM processing | stage=%s before=%s after=%s",
+            label,
+            len(all_clauses),
+            len(filtered_clauses),
+        )
+
+        rebuilt = "\n\n".join(str(clause.get("content") or "").strip() for clause in filtered_clauses).strip()
+        return rebuilt or source_text
+    except Exception as exc:
+        logger.warning("Clause filtering failed at stage=%s, using original clauses: %s", label, exc)
+        return source_text
 
 
 def _score_relevance(text: str) -> int:
@@ -983,8 +1038,400 @@ def _sequential_summary(label: str, combined_text: str, call_budget: int) -> str
     return _optional_summary(label, combined_text, call_budget)
 
 
+def _extract_filtered_clauses_for_map(text: str, label: str, clause_prefix: str) -> list[dict]:
+    source_text = str(text or "").strip()
+    if not source_text:
+        return []
+
+    try:
+        all_clauses = extract_clauses_from_text(source_text)
+        if not all_clauses:
+            return []
+
+        all_clauses = _dedupe_clause_list(all_clauses)
+        filtered_clauses = filter_relevant_clauses(all_clauses)
+        filtered_clauses = _dedupe_clause_list(filtered_clauses)
+
+        if not filtered_clauses:
+            filtered_clauses = all_clauses
+
+        logger.info(
+            "Using filtered clauses for LLM processing | stage=%s before=%s after=%s",
+            label,
+            len(all_clauses),
+            len(filtered_clauses),
+        )
+
+        normalized = []
+        for index, clause in enumerate(filtered_clauses, start=1):
+            content = str(clause.get("content") or "").strip()
+            if not content:
+                continue
+            clause_id = str(clause.get("clause_id") or f"{clause_prefix}-{index}").strip()
+            normalized.append(
+                {
+                    "clause_id": clause_id,
+                    "title": str(clause.get("title") or "").strip(),
+                    "content": _truncate_text_for_tokens(content, max_tokens=350),
+                }
+            )
+        return normalized
+    except Exception as exc:
+        logger.warning("Clause extraction/filtering failed for stage=%s, using fallback: %s", label, exc)
+        fallback = _truncate_text_for_tokens(source_text, max_tokens=350)
+        return [{"clause_id": f"{clause_prefix}-1", "title": "", "content": fallback}] if fallback else []
+
+
+def _parse_mapped_changes(raw_content: str) -> list[dict] | None:
+    if not raw_content or not isinstance(raw_content, str):
+        return None
+
+    candidate = _strip_trailing_commas(raw_content.strip())
+    parsed = None
+
+    try:
+        parsed = _parse_json_without_duplicate_keys(candidate)
+    except Exception:
+        parsed = None
+
+    if parsed is None:
+        fenced_match = re.search(r"```(?:json)?\s*(\{[\s\S]*?\}|\[[\s\S]*?\])\s*```", candidate, re.IGNORECASE)
+        if fenced_match:
+            extracted = _strip_trailing_commas(fenced_match.group(1).strip())
+            try:
+                parsed = _parse_json_without_duplicate_keys(extracted)
+            except Exception:
+                parsed = None
+
+    if parsed is None:
+        object_match = re.search(r"\{[\s\S]*\}|\[[\s\S]*\]", candidate)
+        if object_match:
+            extracted = _strip_trailing_commas(object_match.group(0).strip())
+            try:
+                parsed = _parse_json_without_duplicate_keys(extracted)
+            except Exception:
+                parsed = None
+
+    if parsed is None:
+        return None
+
+    if isinstance(parsed, dict):
+        items = parsed.get("changes") if isinstance(parsed.get("changes"), list) else []
+    elif isinstance(parsed, list):
+        items = parsed
+    else:
+        return None
+
+    normalized = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        change = str(item.get("change") or item.get("summary") or "").strip()
+        change_type = str(item.get("type") or "modified").strip().lower()
+        if change_type not in {"added", "modified", "removed"}:
+            change_type = "modified"
+        if not change:
+            continue
+        normalized.append({"change": trim_text(change, 220), "type": change_type})
+
+    return normalized[:2]
+
+
+def map_changes_per_clause(clause, stats: dict | None = None) -> list[dict]:
+    """MAP phase: detect up to 2 changes for a single clause pair with a short prompt."""
+    if not isinstance(clause, dict):
+        return []
+
+    clause_id = str(clause.get("clause_id") or "unknown")
+    old_content = _truncate_text_for_tokens(str(clause.get("old_content") or ""), max_tokens=350)
+    new_content = _truncate_text_for_tokens(str(clause.get("new_content") or ""), max_tokens=350)
+
+    if not old_content and not new_content:
+        return []
+
+    user_prompt = (
+        "Identify material differences between OLD and NEW for this clause. "
+        "Return at most 2 items.\n"
+        "Output JSON only with schema: "
+        '{"changes":[{"change":"...","type":"added|modified|removed"}]}\n\n'
+        f"CLAUSE_ID: {clause_id}\n"
+        f"OLD: {old_content}\n"
+        f"NEW: {new_content}"
+    )
+
+    prompt_tokens = estimate_tokens(user_prompt)
+    logger.info("map_changes_per_clause clause_id=%s tokens_used=%s", clause_id, prompt_tokens)
+
+    for attempt in range(2):
+        if isinstance(stats, dict):
+            stats["api_calls"] = int(stats.get("api_calls") or 0) + 1
+        try:
+            content = call_groq_with_retry(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a strict JSON regulatory diff assistant. Return only valid JSON.",
+                    },
+                    {"role": "user", "content": user_prompt},
+                ],
+                max_tokens=140,
+                temperature=0.0,
+                retries=1,
+                initial_backoff=1.0,
+                response_format={"type": "json_object"},
+            )
+        except Exception as exc:
+            logger.warning("map_changes_per_clause LLM call failed clause_id=%s attempt=%s error=%s", clause_id, attempt + 1, exc)
+            content = ""
+
+        parsed = _parse_mapped_changes(content)
+        if parsed is not None:
+            logger.info(
+                "map_changes_per_clause clause_id=%s tokens_used=%s",
+                clause_id,
+                prompt_tokens + estimate_tokens(content),
+            )
+            return parsed
+
+        logger.warning("Invalid JSON for clause_id=%s attempt=%s. Retrying once.", clause_id, attempt + 1)
+
+    return []
+
+
+def _normalize_change_text(value: str) -> str:
+    normalized = re.sub(r"\s+", " ", str(value or "").strip().lower())
+    return normalized
+
+
+def _is_similar_change(left: str, right: str, threshold: float = 0.9) -> bool:
+    if not left or not right:
+        return False
+    ratio = SequenceMatcher(None, left, right).ratio()
+    return ratio >= threshold
+
+
+def merge_and_dedupe_clause_changes(clause_level_outputs: list[list[dict]]) -> list[dict]:
+    """Combine clause MAP outputs and return clean unique changes."""
+    merged_items = []
+    for output in clause_level_outputs or []:
+        if not isinstance(output, list):
+            continue
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            change = str(item.get("change") or "").strip()
+            change_type = str(item.get("type") or "modified").strip().lower()
+            if change_type not in {"added", "modified", "removed"}:
+                change_type = "modified"
+            if not change:
+                continue
+            merged_items.append({"change": change, "type": change_type})
+
+    before_count = len(merged_items)
+
+    unique_changes = []
+    seen_exact = set()
+
+    for item in merged_items:
+        normalized_change = _normalize_change_text(item.get("change") or "")
+        normalized_type = str(item.get("type") or "modified").strip().lower()
+        exact_key = f"{normalized_type}|{normalized_change}"
+
+        if exact_key in seen_exact:
+            continue
+
+        is_near_duplicate = False
+        for existing in unique_changes:
+            if normalized_type != str(existing.get("type") or "modified").strip().lower():
+                continue
+            existing_text = _normalize_change_text(existing.get("change") or "")
+            if _is_similar_change(normalized_change, existing_text):
+                is_near_duplicate = True
+                break
+
+        if is_near_duplicate:
+            continue
+
+        seen_exact.add(exact_key)
+        unique_changes.append({
+            "change": re.sub(r"\s+", " ", str(item.get("change") or "").strip()),
+            "type": normalized_type,
+        })
+
+    logger.info("MAP merge/dedup: before_count=%s after_dedup=%s", before_count, len(unique_changes))
+    return unique_changes
+
+
+def _normalize_reduce_changes(items: list[dict]) -> list[dict]:
+    normalized = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+
+        summary = str(item.get("summary") or item.get("change") or "").strip()
+        if not summary:
+            continue
+
+        change_type = str(item.get("type") or "modified").strip().lower()
+        if change_type not in {"added", "modified", "removed"}:
+            change_type = "modified"
+
+        normalized.append(
+            {
+                "type": change_type,
+                "category": str(item.get("category") or "Other").strip() or "Other",
+                "summary": trim_text(summary, 220),
+                "impact": trim_text(str(item.get("impact") or "Regulatory update identified").strip(), 220),
+            }
+        )
+
+    return deduplicate_items(normalized)[:10]
+
+
+def _normalize_reduce_actions(items: list[dict]) -> list[dict]:
+    normalized = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+
+        action = str(item.get("action") or item.get("title") or "").strip()
+        if not action:
+            continue
+
+        priority = str(item.get("priority") or "Medium").strip().title()
+        if priority not in {"High", "Medium", "Low"}:
+            priority = "Medium"
+
+        owner = str(item.get("owner") or "Compliance").strip() or "Compliance"
+
+        normalized.append(
+            {
+                "action": trim_text(action, 220),
+                "priority": priority,
+                "owner": trim_text(owner, 80),
+            }
+        )
+
+    return deduplicate_items(normalized)[:10]
+
+
+def _parse_reduce_payload(raw_content: str) -> dict | None:
+    if not raw_content or not isinstance(raw_content, str):
+        return None
+
+    candidate = _strip_trailing_commas(raw_content.strip())
+    parsed = None
+
+    try:
+        parsed = _parse_json_without_duplicate_keys(candidate)
+    except Exception:
+        parsed = None
+
+    if parsed is None:
+        fenced_match = re.search(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", candidate, re.IGNORECASE)
+        if fenced_match:
+            extracted = _strip_trailing_commas(fenced_match.group(1).strip())
+            try:
+                parsed = _parse_json_without_duplicate_keys(extracted)
+            except Exception:
+                parsed = None
+
+    if not isinstance(parsed, dict):
+        return None
+
+    changes = parsed.get("changes") if isinstance(parsed.get("changes"), list) else []
+    actions = parsed.get("actions") if isinstance(parsed.get("actions"), list) else []
+
+    return {
+        "changes": _normalize_reduce_changes(changes),
+        "actions": _normalize_reduce_actions(actions),
+    }
+
+
+def reduce_changes_and_actions(merged_changes: list[dict]) -> dict:
+    """REDUCE phase: single LLM call to consolidate changes and generate actions."""
+    candidate_changes = _normalize_reduce_changes(merged_changes or [])
+    print("Starting REDUCE Phase...")
+    if not candidate_changes:
+        print("Final changes count: 0")
+        return {
+            "changes": [],
+            "actions": [],
+        }
+
+    prompt_payload = candidate_changes[:20]
+    prompt = f"""
+You are a compliance reducer.
+Task:
+1. Merge similar changes.
+2. Return final clean list of changes (max 10).
+3. Generate concrete actions from those changes (max 10).
+
+Return ONLY strict JSON matching this schema exactly:
+{{
+  "changes": [
+    {{
+      "type": "added|modified|removed",
+      "category": "Other",
+      "summary": "...",
+      "impact": "..."
+    }}
+  ],
+  "actions": [
+    {{
+      "action": "...",
+      "priority": "High|Medium|Low",
+      "owner": "..."
+    }}
+  ]
+}}
+
+INPUT_CHANGES:
+{json.dumps(prompt_payload, ensure_ascii=True)}
+"""
+
+    for attempt in range(2):
+        try:
+            content = call_groq_with_retry(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "Return only valid JSON matching the required schema.",
+                    },
+                    {"role": "user", "content": _ensure_prompt_token_safe(prompt)},
+                ],
+                max_tokens=700,
+                temperature=0.0,
+                retries=1,
+                initial_backoff=1.0,
+                response_format={"type": "json_object"},
+            )
+        except Exception as exc:
+            logger.warning("reduce_changes_and_actions LLM call failed attempt=%s error=%s", attempt + 1, exc)
+            content = ""
+
+        parsed = _parse_reduce_payload(content)
+        if parsed is not None:
+            parsed["changes"] = _normalize_reduce_changes(parsed.get("changes") or [])[:10]
+            parsed["actions"] = _normalize_reduce_actions(parsed.get("actions") or [])[:10]
+            logger.info("REDUCE phase: final_changes_count=%s", len(parsed.get("changes") or []))
+            print(f"Final changes count: {len(parsed.get('changes') or [])}")
+            return parsed
+
+        logger.warning("reduce_changes_and_actions invalid JSON attempt=%s", attempt + 1)
+
+    fallback_actions = default_actions().get("actions", [])[:10]
+    fallback_result = {
+        "changes": candidate_changes[:10],
+        "actions": _normalize_reduce_actions(fallback_actions),
+    }
+    logger.info("REDUCE phase: final_changes_count=%s", len(fallback_result.get("changes") or []))
+    print(f"Final changes count: {len(fallback_result.get('changes') or [])}")
+    return fallback_result
+
+
 def detect_changes(old_text: str, new_text: str) -> dict:
-    """Detect material changes using token-aware batched analysis."""
+    """Detect material changes using MAP phase (per-clause LLM calls)."""
     try:
         if not old_text or not new_text:
             return _default_changes_response()
@@ -992,117 +1439,80 @@ def detect_changes(old_text: str, new_text: str) -> dict:
         old_text = _truncate_text_for_tokens(trim_text(old_text, 5500))
         new_text = _truncate_text_for_tokens(trim_text(new_text, 5500))
 
-        pairs = _prepare_pairs(old_text, new_text, "OLD", "NEW")
-        if not pairs:
+        old_clauses = _extract_filtered_clauses_for_map(old_text, label="changes_old", clause_prefix="old")
+        new_clauses = _extract_filtered_clauses_for_map(new_text, label="changes_new", clause_prefix="new")
+
+        if not old_clauses and not new_clauses:
             return _default_changes_response()
 
-        use_summary = len(pairs) <= 6
-        batch_input_budget = _derive_batch_input_budget(len(pairs), use_summary=use_summary)
-        max_batch_calls = max(1, MAX_CALLS - 1 - (1 if use_summary else 0))
-        pair_batches = build_batches(pairs, max_tokens_per_batch=batch_input_budget)
-        while len(pair_batches) > max_batch_calls and batch_input_budget < MAX_INPUT_TOKENS:
-            batch_input_budget = min(MAX_INPUT_TOKENS, batch_input_budget + 250)
-            pair_batches = build_batches(pairs, max_tokens_per_batch=batch_input_budget)
+        print("Starting MAP Phase...")
 
-        logger.info("detect_changes: items=%s batches=%s batch_budget=%s", len(pairs), len(pair_batches), batch_input_budget)
+        max_len = max(len(old_clauses), len(new_clauses))
+        print(f"Processing {max_len} filtered clauses")
+        old_clauses.extend([{}] * (max_len - len(old_clauses)))
+        new_clauses.extend([{}] * (max_len - len(new_clauses)))
 
-        request_tokens_used = 0
+        all_changes = []
+        clause_level_outputs = []
+        seen_clause_pairs = set()
+        map_stats = {"api_calls": 0}
+        clauses_processed = 0
 
-        def reserve_tokens(prompt_text: str, output_tokens: int) -> bool:
-            nonlocal request_tokens_used
-            estimated_tokens = estimate_tokens(prompt_text) + output_tokens
-            if request_tokens_used + estimated_tokens > MAX_TOTAL_TOKENS_PER_REQUEST:
-                return False
-            request_tokens_used += estimated_tokens
-            return True
+        for index in range(max_len):
+            old_clause = old_clauses[index] if isinstance(old_clauses[index], dict) else {}
+            new_clause = new_clauses[index] if isinstance(new_clauses[index], dict) else {}
 
-        summary = ""
-        if use_summary:
-            combined_for_summary = "\n\n".join([f"OLD:\n{item['left']}\n\nNEW:\n{item['right']}" for item in pairs])
-            summary_prompt = f"""
-Summarize key regulatory comparison points from this document set.
-Avoid repetition. Be concise but complete.
-Limit response to essential insights only. Avoid long explanations.
-
-Return ONLY valid JSON. No explanation. No markdown. No text outside JSON.\n\nJSON schema:
-{{
-  "summary": "Compact summary preserving key obligations, thresholds, timelines, penalties, and scope"
-}}
-
-DOCUMENT:
-{_truncate_text_for_tokens(combined_for_summary)}
-"""
-            summary_prompt = _ensure_prompt_token_safe(summary_prompt)
-            if reserve_tokens(summary_prompt, SUMMARY_OUTPUT_TOKENS):
-                summary_result = _safe_call(
-                    prompt=summary_prompt,
-                    max_tokens=SUMMARY_OUTPUT_TOKENS,
-                    retries=2,
-                    initial_backoff=4,
-                    expect_schema=False,
-                )
-                if isinstance(summary_result, dict) and "error" not in summary_result:
-                    summary_text = summary_result.get("summary") if isinstance(summary_result.get("summary"), str) else None
-                    if summary_text and summary_text.strip():
-                        summary = summary_text.strip()
-
-        batch_entries = []
-        for batch_index, batch in enumerate(pair_batches, start=1):
-            prompt = _build_change_prompt(batch_index, pair_batches, batch, summary)
-            prompt = _ensure_prompt_token_safe(prompt)
-            if not reserve_tokens(prompt, BATCH_OUTPUT_TOKENS):
-                logger.warning("detect_changes token budget exhausted before batch %s", batch_index)
-                break
-            batch_entries.append(
-                {
-                    "prompt": prompt,
-                    "max_tokens": BATCH_OUTPUT_TOKENS,
-                    "retries": 3,
-                    "initial_backoff": 5,
-                    "batch_size": len(batch),
-                    "estimated_tokens": estimate_tokens(prompt),
-                }
+            clause_id = str(
+                new_clause.get("clause_id")
+                or old_clause.get("clause_id")
+                or f"pair-{index + 1}"
             )
+            print(f"Processing clause_id: {clause_id}")
 
-        partial_results = asyncio.run(process_batches_parallel(batch_entries, label="changes")) if batch_entries else []
-        partial_results = [result for result in partial_results if isinstance(result, dict) and "error" not in result]
+            pair_key = f"{clause_id}|{old_clause.get('content') or ''}|{new_clause.get('content') or ''}"
+            if pair_key in seen_clause_pairs:
+                continue
+            seen_clause_pairs.add(pair_key)
 
-        if not partial_results:
-            return _default_changes_response()
+            old_content = str(old_clause.get("content") or "").strip()
+            new_content = str(new_clause.get("content") or "").strip()
+            if not old_content and not new_content:
+                continue
+            if old_content == new_content:
+                continue
 
-        merge_prompt = f"""
-Combine the following analyses into one final JSON response.
-Avoid repetition. Be concise but complete.
-Limit response to essential insights only. Avoid long explanations.
-Keep only material, non-duplicate regulatory changes.
+            clause_payload = {
+                "clause_id": clause_id,
+                "old_content": old_content,
+                "new_content": new_content,
+            }
 
-Return ONLY valid JSON. No explanation. No markdown. No text outside JSON.\n\nJSON schema:
-{{
-  "changes": [
-    {{
-      "type": "added | removed | modified",
-      "category": "KYC | Risk | Capital | Reporting | Governance | Audit | Other",
-      "summary": "Specific change in <=2 lines",
-      "impact": "Brief significance note"
-    }}
-  ]
-}}
+            clause_changes = map_changes_per_clause(clause_payload, stats=map_stats)
+            clauses_processed += 1
+            clause_level_outputs.append(clause_changes)
+            all_changes.extend(clause_changes)
 
-PARTIAL_ANALYSES:
-{json.dumps(partial_results, ensure_ascii=True)}
-"""
-        merge_prompt = _ensure_prompt_token_safe(merge_prompt)
-        if reserve_tokens(merge_prompt, MERGE_OUTPUT_TOKENS):
-            merged = _safe_call(prompt=merge_prompt, max_tokens=MERGE_OUTPUT_TOKENS, retries=2, initial_backoff=4)
-            if isinstance(merged, dict) and "error" not in merged and isinstance(merged.get("changes"), list):
-                deduped_changes = deduplicate_items(merged.get("changes", [])[:5])
-                logger.info("deduplicated_output=%s", json.dumps({"changes": deduped_changes}, ensure_ascii=True)[:1200])
-                return _schema_response(changes=deduped_changes)
+        logger.info(
+            "MAP phase: clauses_processed=%s total_api_calls=%s",
+            clauses_processed,
+            int(map_stats.get("api_calls") or 0),
+        )
+        print(f"MAP Phase complete. Total extracted changes: {len(all_changes)}")
 
-        fallback = merge_chunk_results(partial_results, "changes")
-        deduped_changes = deduplicate_items(fallback[:5] if fallback else [])
-        logger.info("deduplicated_output=%s", json.dumps({"changes": deduped_changes}, ensure_ascii=True)[:1200])
-        return _schema_response(changes=deduped_changes)
+        unique_clean_changes = merge_and_dedupe_clause_changes(clause_level_outputs)
+
+        mapped_changes = [
+            {
+                "type": item.get("type") or "modified",
+                "category": "Other",
+                "summary": trim_text(item.get("change") or "", 220),
+                "impact": "Detected in clause-level MAP analysis",
+            }
+            for item in unique_clean_changes
+        ]
+
+        deduped_changes = deduplicate_items(mapped_changes)
+        return _schema_response(changes=deduped_changes[:5])
 
     except Exception as e:
         logger.error("detect_changes failed: %s", e)
@@ -1117,6 +1527,9 @@ def detect_compliance_gaps(new_text: str, policy_text: str) -> dict:
 
         new_text = _truncate_text_for_tokens(trim_text(new_text, 5500))
         policy_text = _truncate_text_for_tokens(trim_text(policy_text, 5500))
+
+        new_text = _filter_text_for_llm(new_text, label="gaps_regulation")
+        policy_text = _filter_text_for_llm(policy_text, label="gaps_policy")
 
         pairs = _prepare_pairs(new_text, policy_text, "REGULATION", "POLICY")
         if not pairs:
@@ -1256,6 +1669,8 @@ def analyze_impact(impact_input: dict) -> dict:
         if gaps:
             combined_text += "COMPLIANCE GAPS FOUND:\n" + json.dumps(gaps[:3], indent=2)
 
+        combined_text = _filter_text_for_llm(combined_text, label="impacts")
+
         prompt = f"""
 Analyze the business and compliance impact of these detected changes and gaps.
 Provide 2-3 key impacts with severity assessment.
@@ -1311,6 +1726,8 @@ def generate_actions(actions_input: dict) -> dict:
             combined_text += "COMPLIANCE GAPS:\n" + json.dumps(gaps[:4], indent=2) + "\n\n"
         if impacts:
             combined_text += "IMPACTS:\n" + json.dumps(impacts[:4], indent=2)
+
+        combined_text = _filter_text_for_llm(combined_text, label="actions")
 
         prompt = f"""
 Generate 2-6 concrete and implementable compliance actions.

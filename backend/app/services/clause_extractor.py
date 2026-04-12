@@ -7,6 +7,8 @@ logger = logging.getLogger(__name__)
 
 MIN_CLAUSE_TOKENS = 50
 MAX_CLAUSE_TOKENS = 800
+MIN_VALID_CLAUSE_TOKENS = 40
+TARGET_AVG_CLAUSE_TOKENS = 50
 CLAUSE_DEBUG = os.getenv("CLAUSE_DEBUG", "false").strip().lower() in {"1", "true", "yes", "on"}
 MAX_HEADING_PREVIEW = 5
 MAX_CLAUSE_PREVIEW = 5
@@ -24,6 +26,7 @@ CLAUSE_FILTER_KEYWORDS = (
     "audit",
 )
 CLAUSE_FILTER_MIN_COUNT = 5
+VALID_CLAUSE_VERBS = ("shall", "must", "required", "should")
 
 # Regex-based heading matcher for splitting by heading boundaries.
 # Supports:
@@ -70,6 +73,110 @@ def _extract_heading_text(line: str) -> str:
     line = re.sub(r"^[A-Z]\.\s*", "", line)  # Remove letter prefix
     line = re.sub(r"^(?:Chapter|Section)\s*(?:[IVXivx\d]+|[A-Z])?\s*", "", line)  # Remove chapter/section
     return line.strip()
+
+
+def is_valid_clause(text):
+    text = str(text or "").lower()
+    if len(text.split()) < 8:
+        return False
+    if not any(word in text for word in ["shall", "must", "required", "should"]):
+        return False
+    return True
+
+
+def _is_heading_only_clause(clause: Dict[str, str]) -> bool:
+    content = str((clause or {}).get("content") or "").strip()
+    title = str((clause or {}).get("title") or "").strip()
+
+    if not content:
+        return True
+
+    content_tokens = _token_count(content)
+    if content_tokens > 8:
+        return False
+
+    content_norm = re.sub(r"\s+", " ", re.sub(r"[^\w\s]", "", content)).strip().lower()
+    title_norm = re.sub(r"\s+", " ", re.sub(r"[^\w\s]", "", title)).strip().lower()
+
+    if title_norm and content_norm in {title_norm, f"section {title_norm}", f"chapter {title_norm}"}:
+        return True
+
+    return bool(re.fullmatch(r"(?i)(section|chapter)\s+[\w.()\-]+", content.strip()))
+
+
+def _merge_clause_pair(current: Dict[str, str], nxt: Dict[str, str]) -> Dict[str, str]:
+    current_title = str(current.get("title") or "").strip()
+    next_title = str(nxt.get("title") or "").strip()
+    merged_title = current_title
+    if current_title and next_title and current_title.lower() != next_title.lower():
+        merged_title = f"{current_title} + {next_title}"
+    elif not current_title:
+        merged_title = next_title
+
+    return {
+        "clause_id": str(current.get("clause_id") or nxt.get("clause_id") or "merged"),
+        "title": merged_title or "Untitled Clause",
+        "content": f"{str(current.get('content') or '').strip()}\n\n{str(nxt.get('content') or '').strip()}".strip(),
+        "has_heading": bool(current.get("has_heading") or nxt.get("has_heading")),
+    }
+
+
+def _merge_broken_clauses(clauses: List[Dict[str, str]], min_tokens: int = MIN_VALID_CLAUSE_TOKENS) -> List[Dict[str, str]]:
+    """Merge fragmented clauses until they become meaningful units."""
+    working = [dict(item) for item in (clauses or []) if isinstance(item, dict)]
+    if not working:
+        return []
+
+    merged: List[Dict[str, str]] = []
+    index = 0
+
+    while index < len(working):
+        current = dict(working[index])
+        current_tokens = _token_count(str(current.get("content") or ""))
+        needs_merge = current_tokens < min_tokens or _is_heading_only_clause(current) or not is_valid_clause(current.get("content") or "")
+
+        if needs_merge and index + 1 < len(working):
+            current = _merge_clause_pair(current, working[index + 1])
+            index += 2
+            while index < len(working):
+                merged_tokens = _token_count(str(current.get("content") or ""))
+                if merged_tokens >= min_tokens and is_valid_clause(current.get("content") or "") and not _is_heading_only_clause(current):
+                    break
+                current = _merge_clause_pair(current, working[index])
+                index += 1
+            merged.append(current)
+            continue
+
+        if needs_merge and merged and not current.get("has_heading"):
+            merged[-1] = _merge_clause_pair(merged[-1], current)
+            index += 1
+            continue
+
+        merged.append(current)
+        index += 1
+
+    return merged
+
+
+def _quality_filter_clauses(clauses: List[Dict[str, str]]) -> tuple[List[Dict[str, str]], int]:
+    filtered: List[Dict[str, str]] = []
+    rejected_small = 0
+    for clause in clauses or []:
+        if not isinstance(clause, dict):
+            continue
+        content = str(clause.get("content") or "").strip()
+        tokens = _token_count(content)
+        if tokens < MIN_VALID_CLAUSE_TOKENS:
+            rejected_small += 1
+            continue
+        if _is_heading_only_clause(clause):
+            rejected_small += 1
+            continue
+        if not is_valid_clause(content):
+            rejected_small += 1
+            continue
+        filtered.append(clause)
+    return filtered, rejected_small
 
 
 def filter_relevant_clauses(clauses: List[Dict]) -> List[Dict]:
@@ -370,16 +477,14 @@ def _merge_small_clauses(clauses: List[Dict[str, str]], min_tokens: int) -> List
     merged: List[Dict[str, str]] = []
     index = 0
 
-    # Pairwise merge only for paragraph-only clauses; heading-based clauses stay separate.
+    # Pairwise merge for undersized clauses to avoid fragmented phrase-level outputs.
     while index < len(clauses):
         current = clauses[index]
         current_tokens = _token_count(current["content"])
 
         if (
             current_tokens < min_tokens
-            and not current.get("has_heading")
             and index + 1 < len(clauses)
-            and not clauses[index + 1].get("has_heading")
         ):
             next_clause = clauses[index + 1]
             merged.append(
@@ -484,15 +589,43 @@ def extract_clauses_from_text(text: str) -> List[Dict[str, str]]:
     sized_clauses = _split_large_clauses(base_clauses, MAX_CLAUSE_TOKENS)
     _debug_print(f"[DEBUG] After splitting large clauses: {len(sized_clauses)}")
 
-    # Strategy 4: Merge only very small paragraph-only clauses (<50 tokens)
+    # Strategy 4: Merge very small clauses (<50 tokens)
     merged_clauses = _merge_small_clauses(sized_clauses, MIN_CLAUSE_TOKENS)
     _debug_print(f"[DEBUG] After merging small clauses: {len(merged_clauses)}")
 
-    # Strategy 5: Deduplicate IDs (in case merges/splits create collisions)
+    # Strategy 5: Merge broken fragments into complete regulatory units.
+    merged_clauses = _merge_broken_clauses(merged_clauses, min_tokens=MIN_VALID_CLAUSE_TOKENS)
+    _debug_print(f"[DEBUG] After merging broken clauses: {len(merged_clauses)}")
+
+    # Strategy 6: Remove heading-only/micro/non-regulatory clauses.
+    quality_clauses, rejected_small = _quality_filter_clauses(merged_clauses)
+    if not quality_clauses:
+        fallback_candidates = [
+            clause
+            for clause in merged_clauses
+            if isinstance(clause, dict)
+            and not _is_heading_only_clause(clause)
+            and _token_count(str(clause.get("content") or "")) >= 8
+            and is_valid_clause(clause.get("content") or "")
+        ]
+        if fallback_candidates:
+            fallback_candidates = sorted(
+                fallback_candidates,
+                key=lambda clause: _token_count(str(clause.get("content") or "")),
+                reverse=True,
+            )
+            quality_clauses = fallback_candidates[: max(1, min(8, len(fallback_candidates)))]
+            logger.warning(
+                "Clause quality fallback activated: strict_filter_empty=true fallback_count=%s",
+                len(quality_clauses),
+            )
+    _debug_print(f"[DEBUG] After quality filtering: {len(quality_clauses)} rejected={rejected_small}")
+
+    # Strategy 7: Deduplicate IDs (in case merges/splits create collisions)
     seen_ids = set()
     ordered_clauses: List[Dict[str, str]] = []
     
-    for clause in merged_clauses:
+    for clause in quality_clauses:
         clause_id = clause["clause_id"]
         suffix = 1
         
@@ -531,6 +664,18 @@ def extract_clauses_from_text(text: str) -> List[Dict[str, str]]:
         "Extracted %s clauses (avg=%s tokens, min=%s, max=%s)",
         clause_count, avg_tokens, min_tokens_in_clause, max_tokens_in_clause
     )
+
+    print("Clause quality check:")
+    print(f"- total clauses: {clause_count}")
+    print(f"- avg tokens per clause: {avg_tokens}")
+    print(f"- number of rejected small clauses: {rejected_small}")
+
+    if avg_tokens <= TARGET_AVG_CLAUSE_TOKENS:
+        logger.warning("Clause quality validation: average clause size too low (avg=%s target>%s)", avg_tokens, TARGET_AVG_CLAUSE_TOKENS)
+
+    phrase_like = [c for c in ordered_clauses if _token_count(c.get("content") or "") < 12]
+    if phrase_like:
+        logger.warning("Clause quality validation: phrase-like clauses still present count=%s", len(phrase_like))
 
     if clause_count < 10:
         logger.warning("Low clause count detected after extraction: %s clauses", clause_count)

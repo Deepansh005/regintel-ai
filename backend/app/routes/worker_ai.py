@@ -8,6 +8,7 @@ from pydantic import BaseModel
 from app.services.ai_service import analyze_impact
 from app.services.ai_service import detect_changes
 from app.services.ai_service import detect_compliance_gaps
+from app.services.ai_service import detect_regulatory_changes_new
 from app.services.ai_service import generate_actions
 
 logger = logging.getLogger(__name__)
@@ -26,6 +27,7 @@ class DetectChangesPayload(BaseModel):
 class DetectGapsPayload(BaseModel):
     new_text: str
     policy_text: str
+    changes: list[dict] | None = None
 
 
 class ImpactPayload(BaseModel):
@@ -59,10 +61,20 @@ async def worker_detect_changes(payload: DetectChangesPayload):
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+@router.post("/detect-changes-new")
+async def worker_detect_changes_new(payload: DetectChangesPayload):
+    """NEW SYSTEM: Semantic block-based change detection."""
+    try:
+        return await _run_limited(detect_regulatory_changes_new, payload.old_text, payload.new_text)
+    except Exception as exc:
+        logger.error("worker detect_changes_new failed: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 @router.post("/detect-compliance-gaps")
 async def worker_detect_compliance_gaps(payload: DetectGapsPayload):
     try:
-        return await _run_limited(detect_compliance_gaps, payload.new_text, payload.policy_text)
+        return await _run_limited(detect_compliance_gaps, payload.new_text, payload.policy_text, payload.changes)
     except Exception as exc:
         logger.error("worker detect_compliance_gaps failed: %s", exc)
         raise HTTPException(status_code=500, detail=str(exc)) from exc

@@ -889,19 +889,6 @@ def process_task(task_id: str, file_paths: dict, file_hashes: dict | None = None
         new_context = ""
         policy_context = ""
 
-        # If any 2+ sections have the same PDF content, return deterministic no-change response.
-        if file_hashes:
-            hashes = []
-            for section in ("old", "new", "policy"):
-                section_hashes = file_hashes.get(section)
-                if isinstance(section_hashes, list):
-                    hashes.extend([item for item in section_hashes if item])
-                elif section_hashes:
-                    hashes.append(section_hashes)
-            if len(hashes) >= 2 and len(set(hashes)) < len(hashes):
-                update_task(task_id, status="completed", result=response)
-                return
-
         # ✅ SAFE EXTRACTION WITH VALIDATION
         try:
             policy_source_chunks = []

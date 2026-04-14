@@ -94,14 +94,22 @@ def get_status(task_id: str):
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
+# Keep upload caching disabled while debugging freshness and hash differentiation.
+DISABLE_UPLOAD_CACHE = True
+
 
 def generate_file_hash(file_bytes):
     return hashlib.md5(file_bytes).hexdigest()
 
 
-def generate_combined_hash(file_hashes: list[str], mode: str) -> str:
-    normalized = [h for h in file_hashes if h]
-    combined = "".join(normalized) + f":{mode or 'all'}"
+def generate_section_hash(file_hashes: list[str]) -> str:
+    normalized = sorted(h for h in file_hashes if h)
+    combined = "|".join(normalized)
+    return hashlib.md5(combined.encode("utf-8")).hexdigest()
+
+
+def generate_combined_hash(old_hash: str, new_hash: str, policy_hash: str, mode: str) -> str:
+    combined = f"old:{old_hash}|new:{new_hash}|policy:{policy_hash}|mode:{mode or 'all'}"
     return hashlib.md5(combined.encode("utf-8")).hexdigest()
 
 @router.post("/upload-documents")
@@ -157,14 +165,33 @@ async def upload_documents(
 
     file_paths["mode"] = mode
 
-    combined_hash = generate_combined_hash(
-        (file_hashes.get("old") or []) + (file_hashes.get("new") or []) + (file_hashes.get("policy") or []),
-        mode,
-    )
+    old_hash = generate_section_hash(file_hashes.get("old") or [])
+    new_hash = generate_section_hash(file_hashes.get("new") or [])
+    policy_hash = generate_section_hash(file_hashes.get("policy") or [])
+
+    print("OLD HASH:", old_hash)
+    print("NEW HASH:", new_hash)
+    print("POLICY HASH:", policy_hash)
+
+    combined_hash = generate_combined_hash(old_hash, new_hash, policy_hash, mode)
+
+    # Cache stays disabled during debugging. Re-enable only if all section hashes must match exactly.
+    if not DISABLE_UPLOAD_CACHE:
+        pass
 
     # Force fresh processing for every upload request; never reuse cached task output.
     create_task(task_id, file_hash=combined_hash)
-    background_tasks.add_task(process_task, task_id, file_paths, file_hashes)
+    background_tasks.add_task(
+        process_task,
+        task_id,
+        file_paths,
+        {
+            "old_hash": old_hash,
+            "new_hash": new_hash,
+            "policy_hash": policy_hash,
+            "combined_hash": combined_hash,
+        },
+    )
 
     return {
         "task_id": task_id,

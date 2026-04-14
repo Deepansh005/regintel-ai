@@ -410,7 +410,7 @@ function extractHighlightTerms(...values) {
             .forEach((term) => terms.push(term));
     });
 
-    return [...new Set(terms)].slice(0, 8);
+    return [...new Set(terms)];
 }
 
 export default function Dashboard() {
@@ -588,7 +588,6 @@ export default function Dashboard() {
     const normalizedData = unwrapTaskResult(data);
     const changesArray = normalizeChanges(normalizedData);
     const changesList = changesArray;
-    const visibleChanges = changesList.slice(0, 5);
     const gapsArray = normalizeGaps(normalizedData);
     const impactsArray = normalizeImpacts(normalizedData);
     console.log("IMPACTS:", normalizedData?.impacts);
@@ -605,6 +604,11 @@ export default function Dashboard() {
         actions: actionsData,
         department_risk: departmentRisk,
     });
+    console.log("FULL API DATA:", normalizedData);
+    console.log("Rendered changes:", changesList.length);
+    console.log("Rendered impacts:", impactsArray.length);
+    console.log("Rendered compliance gaps:", gapsArray.length);
+    console.log("Rendered actions:", actionsData.length);
 
     const criticalGapsCount = gapsArray.filter((g) => getRiskValue(g) === 'high').length;
     const overallRisk = criticalGapsCount > 0 ? "High" : gapsArray.length > 0 ? "Medium" : "Low";
@@ -628,7 +632,6 @@ export default function Dashboard() {
 
     const historyScores = history
         .filter((t) => t.status === 'completed' && t.result)
-        .slice(0, 7)
         .reverse()
         .map((t, index) => ({
             date: new Date(t.created_at || Date.now()).toLocaleDateString('en-US', { weekday: 'short' }) || `Run ${index + 1}`,
@@ -848,7 +851,7 @@ export default function Dashboard() {
 
                 <div className="grid lg:grid-cols-3 gap-6 mb-8">
                     {/* 5. Regulatory Changes List */}
-                    <div className="bg-white rounded-2xl p-6 border border-slate-200 shadow-sm flex flex-col max-h-[350px] overflow-hidden hover:shadow-md transition-shadow">
+                    <div className="bg-white rounded-2xl p-6 border border-slate-200 shadow-sm flex flex-col max-h-[400px] overflow-hidden hover:shadow-md transition-shadow">
                         <h3 className="font-bold text-slate-900 mb-1">Regulatory Changes</h3>
                         <p className="text-sm text-slate-500 mb-4">Recent policy deltas from latest analysis</p>
 
@@ -859,8 +862,8 @@ export default function Dashboard() {
                         </div>
 
                         <div className="overflow-y-auto pr-2">
-                            {visibleChanges.length > 0 ? (
-                                visibleChanges.map((item, index) => (
+                            {changesList.length > 0 ? (
+                                changesList.map((item, index) => (
                                     <div key={`${item.section || 'change'}-${index}`} className="border-b border-slate-100 pb-2 mb-2 last:border-b-0 last:mb-0">
                                         <div className="flex justify-between items-center gap-3">
                                             <span className="font-medium text-sm text-slate-800 truncate">
@@ -951,11 +954,11 @@ export default function Dashboard() {
                     </div>
 
                     {/* 4. Compliance Gaps List */}
-                    <div className="bg-white rounded-2xl p-6 border border-slate-200 shadow-sm flex flex-col max-h-[350px] overflow-hidden hover:shadow-md transition-shadow">
+                    <div className="bg-white rounded-2xl p-6 border border-slate-200 shadow-sm flex flex-col max-h-[400px] overflow-hidden hover:shadow-md transition-shadow">
                         <h3 className="font-bold text-slate-900 mb-1">Compliance Gaps</h3>
                         <p className="text-sm text-slate-500 mb-4">Urgent review required</p>
                         <div className="overflow-y-auto pr-2 space-y-4">
-                            {gapsArray.length > 0 ? gapsArray.slice(0,5).map((gap, i) => {
+                            {gapsArray.length > 0 ? gapsArray.map((gap, i) => {
                                 const severity = (gap.severity || '').toLowerCase();
                                 const isHigh = severity === 'high';
                                 const color = isHigh ? 'bg-rose-500' : 'bg-amber-500';
@@ -1049,7 +1052,7 @@ export default function Dashboard() {
                         <button className="text-sm font-semibold text-violet-600 hover:text-violet-700 transition-colors">View All Actions</button>
                     </div>
                     
-                    <div className="overflow-x-auto">
+                    <div className="overflow-x-auto max-h-[400px] overflow-y-auto">
                         <table className="w-full text-left border-collapse">
                             <thead>
                                 <tr className="bg-slate-50 border-b border-slate-200">
@@ -1061,7 +1064,7 @@ export default function Dashboard() {
                                 </tr>
                             </thead>
                             <tbody className="divide-y divide-slate-100">
-                                {hasActions ? actionsData.slice(0,5).map((action, i) => {
+                                {hasActions ? actionsData.map((action, i) => {
                                         const status = String(action?.status || '').toLowerCase();
                                         const statusText = formatStatus(action?.status);
                                     const statusColor = status === 'completed' ? 'text-emerald-700 bg-emerald-100/50 border border-emerald-200' 

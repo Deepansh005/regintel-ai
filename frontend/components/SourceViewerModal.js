@@ -22,8 +22,7 @@ function normalizeTerms(terms) {
 
       seen.add(key);
       return true;
-    })
-    .slice(0, 8);
+    });
 }
 
 function highlightText(text, terms) {

@@ -4,12 +4,12 @@ import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { fetchTasks, clearTaskHistory, deleteOldTasks, fetchChunkDetails } from "../../services/api";
-import { 
-    Search, Bell, User, Upload, ArrowRight, Shield, AlertTriangle, 
+import {
+    Search, Bell, User, Upload, ArrowRight, Shield, AlertTriangle,
     CheckCircle2, Clock, AlertCircle, RefreshCw, XCircle, FileText, Eye
 } from "lucide-react";
-import { 
-    ResponsiveContainer, PieChart, Pie, Cell, LineChart, Line, XAxis, YAxis, 
+import {
+    ResponsiveContainer, PieChart, Pie, Cell, LineChart, Line, XAxis, YAxis,
     CartesianGrid, Tooltip, BarChart, Bar
 } from "recharts";
 import SourceViewerModal from "../../components/SourceViewerModal";
@@ -453,17 +453,17 @@ export default function Dashboard() {
         const activeRef = { current: true };
 
         loadDashboardData(activeRef)
-        .then(() => {
-            if (!activeRef.current) return;
-            setLoading(false);
-        })
-        .catch((err) => {
-            console.error("Dashboard load error:", err);
-            if (!activeRef.current) return;
-            setError("Unable to load dashboard data");
-            setData("EMPTY_STATE");
-            setLoading(false);
-        });
+            .then(() => {
+                if (!activeRef.current) return;
+                setLoading(false);
+            })
+            .catch((err) => {
+                console.error("Dashboard load error:", err);
+                if (!activeRef.current) return;
+                setError("Unable to load dashboard data");
+                setData("EMPTY_STATE");
+                setLoading(false);
+            });
 
         return () => {
             activeRef.current = false;
@@ -544,7 +544,7 @@ export default function Dashboard() {
     const activeTasks = actionsData.filter((a) => (a.status || '').toLowerCase() !== 'completed').length;
     const dueTodayCount = actionsData.filter((a) => (a.priority || '').toLowerCase() === 'high').length || criticalGapsCount;
     const overdueCount = actionsData.filter((a) => (a.status || '').toLowerCase() === 'overdue').length;
-    
+
     const counts = {
         added: changesList.filter((c) => c.type === 'added').length,
         removed: changesList.filter((c) => c.type === 'removed').length,
@@ -656,9 +656,9 @@ export default function Dashboard() {
     return (
         <div className="min-h-screen bg-[#F8FAFC] text-slate-900 font-sans pb-20">
             <TopNavbar user={user} />
-            
+
             <div className="max-w-[1400px] mx-auto px-6 xs:px-8 mt-8">
-                
+
                 {/* Header Section */}
                 <div className="flex flex-col md:flex-row justify-between items-start md:items-end mb-8 gap-4">
                     <div>
@@ -739,7 +739,7 @@ export default function Dashboard() {
                                     <Pie data={riskData} innerRadius={60} outerRadius={80} paddingAngle={2} dataKey="value" stroke="none">
                                         {riskData.map((entry, index) => <Cell key={`cell-${index}`} fill={entry.fill} />)}
                                     </Pie>
-                                    <Tooltip contentStyle={{ borderRadius: '12px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)' }}/>
+                                    <Tooltip contentStyle={{ borderRadius: '12px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)' }} />
                                 </PieChart>
                             </ResponsiveContainer>
                             <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
@@ -760,7 +760,7 @@ export default function Dashboard() {
                                         <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#E2E8F0" />
                                         <XAxis dataKey="date" axisLine={{ stroke: '#E2E8F0' }} tickLine={false} tick={{ fontSize: 13, fill: '#64748B', fontWeight: 500 }} padding={{ left: 30, right: 30 }} dy={15} />
                                         <YAxis type="number" domain={[0, 100]} ticks={[0, 25, 50, 75, 100]} axisLine={false} tickLine={false} tick={{ fontSize: 13, fill: '#64748B', fontWeight: 500 }} dx={-10} />
-                                        <Tooltip 
+                                        <Tooltip
                                             contentStyle={{ borderRadius: '12px', border: '1px solid #E2E8F0', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)', background: '#fff' }}
                                             itemStyle={{ color: '#0F172A', fontWeight: 600 }}
                                         />
@@ -798,13 +798,12 @@ export default function Dashboard() {
                                             </span>
 
                                             <div className="flex items-center gap-2">
-                                                <span className={`text-xs px-2 py-1 rounded-full capitalize ${
-                                                    item.type === 'added'
+                                                <span className={`text-xs px-2 py-1 rounded-full capitalize ${item.type === 'added'
                                                         ? 'bg-green-100 text-green-700'
                                                         : item.type === 'removed'
                                                             ? 'bg-red-100 text-red-700'
                                                             : 'bg-yellow-100 text-yellow-700'
-                                                }`}>
+                                                    }`}>
                                                     {item.type || 'modified'}
                                                 </span>
                                                 <button
@@ -978,7 +977,7 @@ export default function Dashboard() {
                         </div>
                         <button className="text-sm font-semibold text-violet-600 hover:text-violet-700 transition-colors">View All Actions</button>
                     </div>
-                    
+
                     <div className="overflow-x-auto max-h-[400px] overflow-y-auto">
                         <table className="w-full text-left border-collapse">
                             <thead>
@@ -992,17 +991,17 @@ export default function Dashboard() {
                             </thead>
                             <tbody className="divide-y divide-slate-100">
                                 {hasActions ? actionsData.map((action, i) => {
-                                        const status = String(action?.status || '').toLowerCase();
-                                        const statusText = formatStatus(action?.status);
-                                    const statusColor = status === 'completed' ? 'text-emerald-700 bg-emerald-100/50 border border-emerald-200' 
-                                            : status === 'in_progress' || status === 'in-progress' ? 'text-violet-700 bg-violet-100/50 border border-violet-200'
+                                    const status = String(action?.status || '').toLowerCase();
+                                    const statusText = formatStatus(action?.status);
+                                    const statusColor = status === 'completed' ? 'text-emerald-700 bg-emerald-100/50 border border-emerald-200'
+                                        : status === 'in_progress' || status === 'in-progress' ? 'text-violet-700 bg-violet-100/50 border border-violet-200'
                                             : status === 'overdue' || status === 'blocked' ? 'text-rose-700 bg-rose-100/50 border border-rose-200'
-                                            : 'text-amber-700 bg-amber-100/50 border border-amber-200';
-                                        const title = action?.title;
-                                        const description = action?.description;
-                                        const deadline = action?.deadline;
+                                                : 'text-amber-700 bg-amber-100/50 border border-amber-200';
+                                    const title = action?.title;
+                                    const description = action?.description;
+                                    const deadline = action?.deadline;
                                     const actionSourceChunks = Array.isArray(action?.source_chunks) ? action.source_chunks : [];
-                                    
+
                                     return (
                                         <tr key={action._ui_key || `${currentTaskId || 'action'}-${i}`} className="hover:bg-slate-50 transition-colors">
                                             <td className="px-6 py-4">
@@ -1057,7 +1056,7 @@ export default function Dashboard() {
                             <p className="text-sm text-slate-500">View and access your previous compliance runs</p>
                         </div>
                     </div>
-                    
+
                     <div className="overflow-x-auto">
                         <table className="w-full text-left border-collapse">
                             <thead>
@@ -1081,9 +1080,9 @@ export default function Dashboard() {
                                         </td>
                                         <td className="px-6 py-4">
                                             <span className={`inline-flex px-2.5 py-1 rounded-md text-[10px] font-bold uppercase tracking-widest 
-                                                ${task.status === 'completed' ? 'text-emerald-700 bg-emerald-100/50 border border-emerald-200' 
-                                                : task.status === 'failed' ? 'text-rose-700 bg-rose-100/50 border border-rose-200'
-                                                : 'text-violet-700 bg-violet-100/50 border border-violet-200'}`}>
+                                                ${task.status === 'completed' ? 'text-emerald-700 bg-emerald-100/50 border border-emerald-200'
+                                                    : task.status === 'failed' ? 'text-rose-700 bg-rose-100/50 border border-rose-200'
+                                                        : 'text-violet-700 bg-violet-100/50 border border-violet-200'}`}>
                                                 {task.status}
                                             </span>
                                         </td>
@@ -1146,7 +1145,7 @@ function TopNavbar({ user }) {
                     <Upload className="w-4 h-4" />
                     New Analysis
                 </Link>
-                <button 
+                <button
                     onClick={() => document.getElementById('analysis-history')?.scrollIntoView({ behavior: 'smooth' })}
                     className="text-sm font-bold text-slate-500 hover:text-violet-600 transition-colors flex items-center gap-2"
                 >
@@ -1158,7 +1157,7 @@ function TopNavbar({ user }) {
             <div className="flex-1 max-w-sm mx-6 hidden xl:block">
                 <div className="relative group">
                     <Search className="absolute left-3.5 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400 group-focus-within:text-violet-500 transition-colors" />
-                    <input type="text" placeholder="Search..." 
+                    <input type="text" placeholder="Search..."
                         className="w-full bg-slate-100 border-none rounded-full py-2.5 pl-10 pr-4 text-sm text-slate-900 font-medium focus:outline-none focus:ring-2 focus:ring-violet-500/20 transition-all placeholder:text-slate-500" />
                 </div>
             </div>

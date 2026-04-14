@@ -1,25 +1,34 @@
 "use client";
 
 import Link from "next/link";
-import { ArrowRight, Shield, Zap, BarChart3, Globe } from "lucide-react";
+import { Shield, Zap, BarChart3, ArrowRight } from "lucide-react";
+import Hero3D from "../components/landing/Hero3D";
+import FeatureTiltCard from "../components/landing/FeatureTiltCard";
+import WorkflowVisualizer from "../components/landing/WorkflowVisualizer";
+import InteractiveFeatures from "../components/landing/InteractiveFeatures";
+import AnimatedSection from "../components/landing/AnimatedSection";
+import InfiniteLogoMarquee from "../components/landing/InfiniteLogoMarquee";
+import StatsCounter from "../components/landing/StatsCounter";
+import WhySection from "../components/landing/WhySection";
+import TestimonialsSlider from "../components/landing/TestimonialsSlider";
 
 export default function LandingPage() {
   return (
-    <div className="min-h-screen bg-[#F8FAFC] text-slate-900 selection:bg-violet-200 font-sans font-medium overflow-hidden">
-      {/* Navbar */}
-      <nav className="fixed top-0 w-full z-50 border-b border-slate-200/50 bg-white/70 backdrop-blur-xl shadow-sm">
+    <div className="min-h-screen bg-surface-100 text-surface-900 selection:bg-brand-200 font-sans font-medium overflow-hidden">
+      {/* Navbar - Keep consistent but slightly elevated */}
+      <nav className="fixed top-0 w-full z-50 border-b border-white/20 bg-white/60 backdrop-blur-xl shadow-sm transition-all duration-300">
         <div className="max-w-7xl mx-auto px-6 h-20 flex items-center justify-between">
-          <div className="flex items-center gap-2.5">
-            <div className="w-10 h-10 bg-gradient-to-br from-violet-600 to-indigo-600 rounded-xl flex items-center justify-center shadow-lg shadow-violet-500/20">
+          <div className="flex items-center gap-2.5 group cursor-pointer">
+            <div className="w-10 h-10 bg-gradient-to-br from-brand-600 to-indigo-600 rounded-xl flex items-center justify-center shadow-lg shadow-brand-500/20 group-hover:scale-105 transition-transform">
               <Shield className="w-6 h-6 text-white" />
             </div>
-            <span className="text-xl font-extrabold tracking-tight text-slate-900">RegIntel AI</span>
+            <span className="text-xl font-extrabold tracking-tight text-slate-900 group-hover:text-brand-600 transition-colors">RegIntel AI</span>
           </div>
 
           <div className="hidden md:flex items-center gap-8 text-sm font-bold text-slate-500">
-            <a href="#features" className="hover:text-violet-600 transition-colors">Features</a>
-            <a href="#solutions" className="hover:text-violet-600 transition-colors">Solutions</a>
-            <a href="#pricing" className="hover:text-violet-600 transition-colors">Pricing</a>
+            <a href="#features" className="hover:text-brand-600 hover:scale-105 transition-all">Features</a>
+            <a href="#workflow" className="hover:text-brand-600 hover:scale-105 transition-all">How it Works</a>
+            <a href="#demo" className="hover:text-brand-600 hover:scale-105 transition-all">Solutions</a>
           </div>
 
           <div className="flex items-center gap-4">
@@ -31,7 +40,7 @@ export default function LandingPage() {
             </Link>
             <Link
               href="/register"
-              className="px-6 py-3 text-sm font-bold bg-slate-900 text-white rounded-full hover:bg-slate-800 transition-all shadow-[0_10px_20px_-10px_rgba(0,0,0,0.3)] active:scale-95"
+              className="px-6 py-3 text-sm font-bold bg-surface-900 text-white rounded-full hover:bg-brand-900 transition-all shadow-float hover:shadow-glow active:scale-95"
             >
               Get Started
             </Link>
@@ -39,116 +48,130 @@ export default function LandingPage() {
         </div>
       </nav>
 
-      {/* Hero Section */}
-      <section className="relative pt-48 pb-20 overflow-hidden">
-        {/* Anti-Gravity Holographic Background Glows */}
-        <div className="absolute top-0 left-1/2 -translate-x-1/2 w-full h-[600px] bg-gradient-to-b from-violet-300/30 to-transparent blur-[120px] pointer-events-none" />
-        <div className="absolute top-20 right-0 w-[500px] h-[500px] bg-indigo-300/20 rounded-full blur-[140px] pointer-events-none" />
-        <div className="absolute top-40 left-0 w-[400px] h-[400px] bg-blue-300/20 rounded-full blur-[120px] pointer-events-none" />
+      {/* Main Hero Section (3D & Highly visual) */}
+      <div className="pt-8"></div>
+      <Hero3D />
 
-        <div className="max-w-7xl mx-auto px-6 relative z-10 flex flex-col items-center text-center">
-          <div className="max-w-[54rem]">
-            <div className="inline-flex items-center gap-2 px-4 py-1.5 rounded-full bg-violet-100 border border-violet-200 text-violet-700 text-xs font-extrabold uppercase tracking-widest mb-8 shadow-sm">
-              <span className="relative flex h-2 w-2">
-                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-violet-400 opacity-75"></span>
-                <span className="relative inline-flex rounded-full h-2 w-2 bg-violet-500"></span>
-              </span>
-              v2.0 is now live
+      {/* Rolling Logos Strip */}
+      <InfiniteLogoMarquee />
+
+      {/* 3D Features Matrix */}
+      <section id="features" className="py-32 relative z-20">
+        <AnimatedSection>
+          <div className="max-w-7xl mx-auto px-6">
+            <div className="text-center max-w-2xl mx-auto mb-20">
+              <h2 className="text-4xl md:text-5xl font-extrabold mb-6 tracking-tight text-slate-900">
+                Built for Precise Compliance
+              </h2>
+              <p className="text-slate-500 text-lg leading-relaxed font-medium">
+                Advanced AI inference engines designed to silently handle the complexity of modern financial regulations.
+              </p>
             </div>
 
-            <h1 className="text-5xl sm:text-6xl md:text-[5rem] font-extrabold leading-[1.05] tracking-tight mb-8">
-              Regulatory Intelligence, <br />
-              <span className="bg-clip-text text-transparent bg-gradient-to-r from-violet-600 via-indigo-600 to-cyan-500">
-                Redefined by AI.
-              </span>
-            </h1>
-
-            <p className="text-lg md:text-xl text-slate-500 leading-relaxed mb-12 max-w-3xl mx-auto font-medium">
-              Automate compliance tracking, analyze regulatory updates in seconds, and stay ahead of changes from RBI, SEBI, and global regulators without leaving your dashboard.
-            </p>
-
-            <div className="flex flex-col sm:flex-row items-center justify-center gap-4">
-              <Link
-                href="/register"
-                className="w-full sm:w-auto px-8 py-4.5 bg-gradient-to-r from-violet-600 to-indigo-600 rounded-full font-bold text-white flex items-center justify-center gap-2 shadow-[0_20px_40px_-10px_rgba(124,58,237,0.4)] hover:shadow-[0_25px_50px_-10px_rgba(124,58,237,0.5)] hover:-translate-y-1 transition-all active:scale-[0.98] group"
-              >
-                Start Free Trial
-                <ArrowRight className="w-5 h-5 group-hover:translate-x-1.5 transition-transform" />
-              </Link>
-              <button className="w-full sm:w-auto px-8 py-4.5 bg-white border border-slate-200 rounded-full font-bold hover:bg-slate-50 hover:shadow-sm hover:-translate-y-1 transition-all active:scale-[0.98] text-slate-700 shadow-sm">
-                Watch Demo
-              </button>
-            </div>
-
-            <div className="mt-20 flex items-center justify-center gap-10 opacity-70 grayscale">
-              <span className="font-black text-2xl tracking-tighter text-slate-400">RBI</span>
-              <span className="font-black text-2xl tracking-tighter text-slate-400">SEBI</span>
-              <span className="font-black text-2xl tracking-tighter text-slate-400">BSE</span>
-              <span className="font-black text-2xl tracking-tighter text-slate-400">NSE</span>
+            <div className="grid md:grid-cols-3 gap-8">
+              <AnimatedSection delay={0.1} className="h-[320px]">
+                <FeatureTiltCard
+                  icon={<Zap className="w-8 h-8" />}
+                  color="violet"
+                  title="Instant Comparison"
+                  description="Identify exactly what changed between two versions of any regulatory circular in seconds."
+                />
+              </AnimatedSection>
+              <AnimatedSection delay={0.3} className="h-[320px]">
+                <FeatureTiltCard
+                  icon={<Shield className="w-8 h-8" />}
+                  color="indigo"
+                  title="Impact Analysis"
+                  description="Get automated mapping of changes to your departments, systems, and internal policies."
+                />
+              </AnimatedSection>
+              <AnimatedSection delay={0.5} className="h-[320px]">
+                <FeatureTiltCard
+                  icon={<BarChart3 className="w-8 h-8" />}
+                  color="cyan"
+                  title="Actionable Insights"
+                  description="Transform abstract rules into step-by-step compliance tasks assigned to your teams."
+                />
+              </AnimatedSection>
             </div>
           </div>
-        </div>
+        </AnimatedSection>
       </section>
 
-      {/* Feature Grid */}
-      <section id="features" className="py-32 bg-white relative z-20">
-        <div className="max-w-7xl mx-auto px-6">
-          <div className="text-center max-w-2xl mx-auto mb-20 text-slate-900">
-            <h2 className="text-4xl md:text-5xl font-extrabold mb-6 tracking-tight">Built for Precise Compliance</h2>
-            <p className="text-slate-500 text-lg leading-relaxed font-medium">Advanced AI inference engines designed to silently handle the complexity of modern financial regulations.</p>
-          </div>
+      {/* Stats Counter Section */}
+      <StatsCounter />
 
-          <div className="grid md:grid-cols-3 gap-8">
-            <FeatureCard
-              icon={<Zap className="w-6 h-6 text-violet-600" />}
-              title="Instant Comparison"
-              description="Identify exactly what changed between two versions of any regulatory circular in seconds."
-            />
-            <FeatureCard
-              icon={<Shield className="w-6 h-6 text-indigo-600" />}
-              title="Impact Analysis"
-              description="Get automated mapping of changes to your departments, systems, and internal policies."
-            />
-            <FeatureCard
-              icon={<BarChart3 className="w-6 h-6 text-cyan-500" />}
-              title="Actionable Insights"
-              description="Transform abstract rules into step-by-step compliance tasks assigned to your teams."
-            />
-          </div>
+      {/* Why RegIntel Section */}
+      <WhySection />
+
+      {/* Interactive Workflow */}
+      <div id="workflow">
+        <WorkflowVisualizer />
+      </div>
+
+      {/* Interactive Feature Demo */}
+      <div id="demo">
+         <InteractiveFeatures />
+      </div>
+
+      {/* Testimonials */}
+      <TestimonialsSlider />
+
+      {/* CTA Section */}
+      <section className="pt-56 pb-48 relative overflow-hidden bg-gradient-to-b from-surface-50 via-brand-950 to-surface-900 border-none">
+        {/* Low opacity noise */}
+        <div className="absolute inset-0 noise-bg opacity-[0.15] mix-blend-overlay z-0" />
+        
+        {/* Floating blur shapes for premium depth */}
+        <div className="absolute top-1/4 left-1/4 w-[30rem] h-[30rem] bg-brand-600/20 rounded-full blur-[140px] mix-blend-screen pointer-events-none animate-blob z-0"></div>
+        <div className="absolute bottom-1/4 right-1/4 w-[25rem] h-[25rem] bg-cyan-600/20 rounded-full blur-[140px] mix-blend-screen pointer-events-none animate-blob animation-delay-2000 z-0"></div>
+        <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[40rem] h-[40rem] bg-indigo-500/10 rounded-full blur-[180px] pointer-events-none z-0"></div>
+        
+        <div className="max-w-4xl mx-auto px-6 relative z-10 text-center mt-10">
+          <AnimatedSection>
+            <h2 className="text-5xl md:text-6xl font-black mb-8 tracking-tight text-white drop-shadow-sm">
+              Ready to automate compliance?
+            </h2>
+            <p className="text-xl text-brand-100/90 mb-14 font-medium max-w-2xl mx-auto">
+              Join leading financial institutions that have cut compliance research time by 85%.
+            </p>
+            <div className="relative inline-block">
+              {/* Soft radial glow strictly behind CTA button */}
+              <div className="absolute inset-0 bg-brand-400 blur-2xl opacity-40 rounded-full mix-blend-screen animate-pulse scale-150 duration-2000"></div>
+              
+              <Link
+                href="/register"
+                className="relative z-10 inline-flex items-center justify-center gap-3 px-10 py-5 bg-gradient-to-r from-brand-600 via-indigo-500 to-cyan-500 text-white font-extrabold rounded-full text-lg shadow-[0_0_40px_rgba(124,58,237,0.4)] hover:shadow-[0_0_60px_rgba(99,102,241,0.6)] hover:scale-105 transition-all duration-300 ease-[cubic-bezier(0.4,0,0.2,1)] active:scale-95 group border border-white/20"
+              >
+                <span className="absolute inset-0 bg-gradient-to-r from-brand-500 via-indigo-400 to-cyan-400 opacity-0 group-hover:opacity-100 rounded-full transition-opacity duration-300 ease-[cubic-bezier(0.4,0,0.2,1)]"></span>
+                <span className="relative z-10 flex items-center gap-2">
+                  Start Your Free Trial
+                  <ArrowRight className="w-5 h-5 group-hover:translate-x-1 transition-transform" />
+                </span>
+              </Link>
+            </div>
+          </AnimatedSection>
         </div>
       </section>
 
       {/* Footer */}
-      <footer className="py-12 border-t border-slate-200 bg-white">
+      <footer className="py-12 bg-surface-900 border-t border-white/5 relative z-10">
         <div className="max-w-7xl mx-auto px-6 flex flex-col md:flex-row justify-between items-center gap-6">
-          <div className="flex items-center gap-2">
-            <div className="w-8 h-8 bg-gradient-to-br from-violet-600 to-indigo-600 rounded-lg flex items-center justify-center shadow-sm">
-                <Shield className="w-4 h-4 text-white" />
+          <div className="flex items-center gap-3 opacity-80 hover:opacity-100 transition-opacity">
+            <div className="w-8 h-8 bg-gradient-to-br from-brand-500 to-indigo-500 rounded-lg flex items-center justify-center shadow-sm relative overflow-hidden group">
+                <div className="absolute inset-0 bg-white/20 opacity-0 group-hover:opacity-100 transition-opacity"></div>
+                <Shield className="w-4 h-4 text-white relative z-10" />
             </div>
-            <span className="font-extrabold text-slate-900 tracking-tight">RegIntel AI</span>
+            <span className="font-extrabold text-white tracking-tight">RegIntel AI</span>
           </div>
-          <p className="text-sm text-slate-500 font-medium">© 2026 RegIntel AI. All rights reserved.</p>
-          <div className="flex items-center gap-6 text-sm font-bold text-slate-400">
-            <a href="#" className="hover:text-slate-900 transition-colors">Privacy</a>
-            <a href="#" className="hover:text-slate-900 transition-colors">Terms</a>
-            <a href="#" className="hover:text-slate-900 transition-colors">Cookies</a>
+          <p className="text-sm text-slate-400 font-medium tracking-wide">© 2026 RegIntel AI. All rights reserved.</p>
+          <div className="flex items-center gap-8 text-sm font-bold text-slate-400">
+            <a href="#" className="hover:text-white transition-colors">Privacy</a>
+            <a href="#" className="hover:text-white transition-colors">Terms</a>
+            <a href="#" className="hover:text-white transition-colors">Security</a>
           </div>
         </div>
       </footer>
-    </div>
-  );
-}
-
-function FeatureCard({ icon, title, description }) {
-  return (
-    <div className="p-10 rounded-[2rem] bg-white border border-slate-100 shadow-[0_15px_40px_-15px_rgba(0,0,0,0.05)] hover:shadow-[0_40px_80px_-20px_rgba(124,58,237,0.15)] hover:border-violet-200 transition-all duration-300 group hover:-translate-y-2">
-      <div className="w-14 h-14 rounded-2xl bg-slate-50 border border-slate-100 flex items-center justify-center mb-8 group-hover:bg-violet-50 group-hover:border-violet-100 group-hover:scale-110 transition-all duration-300 shadow-sm">
-        {icon}
-      </div>
-      <h3 className="text-2xl font-extrabold mb-4 text-slate-900 tracking-tight">{title}</h3>
-      <p className="text-slate-500 leading-relaxed font-medium">
-        {description}
-      </p>
     </div>
   );
 }

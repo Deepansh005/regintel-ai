@@ -1,4 +1,4 @@
-﻿import asyncio
+import asyncio
 from difflib import SequenceMatcher
 import hashlib
 import json
@@ -37,6 +37,21 @@ STRICT_SCHEMA_INSTRUCTION = (
     "Always respond with this top-level JSON schema exactly: "
     '{"changes": [], "compliance_gaps": [], "impacts": [], "actions": []}'
 )
+RBI_ANALYSIS_RULES = """
+You are a regulatory compliance AI specializing in RBI policy analysis.
+
+CRITICAL DOMAIN RULES:
+- Evaluate NEW POLICY against BOTH OLD POLICY and RBI documents simultaneously.
+- RBI documents are additive by default.
+- Do not assume supersession unless RBI text explicitly says repeal/supersede/replace.
+- If multiple RBI documents exist, combine requirements and evaluate against all of them.
+
+ANTI-HALLUCINATION RULES (STRICT):
+- Use only information present in provided documents/evidence.
+- Do not invent generic banking risks.
+- Every output must be traceable to source content.
+- If information is missing, write exactly: "Not specified in provided documents".
+""".strip()
 VAGUE_CHANGE_TERMS = ("improve", "enhance", "develop", "updated", "improved", "policy updated")
 CONDITION_SIGNAL_TERMS = (
     "shall",
@@ -161,6 +176,7 @@ def _normalize_impact_item(item: dict) -> dict:
             "description": "Impact identified from regulatory changes and policy gaps",
             "severity": "Medium",
             "impacted_departments": [],
+            "source": "Not specified in provided documents",
         }
 
     departments = item.get("impacted_departments")
@@ -188,12 +204,16 @@ def _normalize_impact_item(item: dict) -> dict:
 
     title = str(item.get("title") or item.get("area") or "Compliance Impact").strip()
     description = str(item.get("description") or item.get("summary") or "Impact identified from regulatory changes and policy gaps").strip()
+    source = str(item.get("source") or item.get("evidence") or "Not specified in provided documents").strip()
+    if not source:
+        source = "Not specified in provided documents"
 
     return {
         "title": title,
         "description": description,
         "severity": _normalize_severity(item.get("severity")),
         "impacted_departments": normalized_departments,
+        "source": source,
     }
 
 
@@ -718,7 +738,7 @@ def _infer_impact_severity(text: str) -> str:
 
 
 def _build_impact_description(gap_text: str, department: str, severity: str) -> str:
-    gap_text = _clean_text_for_llm(gap_text, label="impact") if "_clean_text_for_llm" in globals() else str(gap_text or "").strip()
+    gap_text = str(gap_text or "").strip()
     base_gap = gap_text[:180] if gap_text else "the identified compliance gap"
     department_key = str(department or "").strip().lower()
 
@@ -752,6 +772,14 @@ def _infer_impacts_from_inputs(changes: list[dict], gaps: list[dict]) -> list[di
         ).strip()
         departments = _infer_impact_departments(gap_text)
         severity = _infer_impact_severity(gap_text)
+        source_text = str(
+            item.get("source")
+            or item.get("regulation_requirement")
+            or item.get("policy_current_state")
+            or "Not specified in provided documents"
+        ).strip()
+        if not source_text:
+            source_text = "Not specified in provided documents"
 
         for department in departments:
             inferred.append(
@@ -759,6 +787,7 @@ def _infer_impacts_from_inputs(changes: list[dict], gaps: list[dict]) -> list[di
                     "department": department,
                     "severity": severity,
                     "description": _build_impact_description(gap_text, department, severity),
+                    "source": source_text,
                 }
             )
 
@@ -776,6 +805,194 @@ def _infer_impacts_from_inputs(changes: list[dict], gaps: list[dict]) -> list[di
         deduped.append(item)
 
     return deduped[:30]
+
+
+def _ensure_gap_impact_coverage(gaps: list[dict], impacts: list[dict]) -> list[dict]:
+    if not isinstance(impacts, list):
+        impacts = []
+
+    if not isinstance(gaps, list) or not gaps:
+        return impacts
+
+    if len(impacts) >= len(gaps):
+        return impacts
+
+    inferred = _infer_impacts_from_inputs([], gaps)
+    merged = deduplicate_items([*impacts, *inferred])
+    return merged[: max(len(gaps), len(merged))]
+
+
+def _strict_level(value: Any, default: str = "medium") -> str:
+    text = str(value or "").strip().lower()
+    if text in {"high", "h"}:
+        return "high"
+    if text in {"medium", "med", "m"}:
+        return "medium"
+    if text in {"low", "l"}:
+        return "low"
+    return default
+
+
+def _extract_clause_reference(text: str) -> str:
+    value = str(text or "")
+    patterns = [
+        r"\b(?:clause|section|para|paragraph)\s*[:\-]?\s*([0-9]+(?:\.[0-9]+)*)\b",
+        r"\b([0-9]+(?:\.[0-9]+){1,3})\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, value, flags=re.IGNORECASE)
+        if match:
+            return match.group(0).strip()
+    return ""
+
+
+def _normalize_gap_records(gaps: list[dict], limit: int = 10) -> list[dict]:
+    records = []
+    seen = set()
+    for index, gap in enumerate(gaps or [], start=1):
+        if not isinstance(gap, dict):
+            continue
+        gap_text = str(gap.get("gap") or gap.get("title") or gap.get("issue") or gap.get("description") or "").strip()
+        if not gap_text:
+            continue
+        raw_reference = str(gap.get("reference") or gap.get("source") or gap.get("regulation_requirement") or "").strip()
+        reference = _extract_clause_reference(raw_reference) or _extract_clause_reference(gap_text) or f"GAP-{index:03d}"
+        severity = _strict_level(gap.get("severity") or gap.get("risk") or gap.get("risk_level"), default="medium")
+        key = (gap_text.lower(), reference.lower(), severity)
+        if key in seen:
+            continue
+        seen.add(key)
+        records.append(
+            {
+                "gap": trim_text(gap_text, 240),
+                "reference": reference,
+                "severity": severity,
+                "source": str(gap.get("source") or gap.get("regulation_requirement") or "Not specified in provided documents").strip() or "Not specified in provided documents",
+            }
+        )
+        if len(records) >= limit:
+            break
+    return records
+
+
+def _impact_from_gap_record(gap_record: dict) -> dict:
+    gap_text = str(gap_record.get("gap") or "").strip()
+    reference = str(gap_record.get("reference") or "").strip()
+    severity = _strict_level(gap_record.get("severity"), default="medium")
+    departments = _infer_impact_departments(gap_text)
+    department = departments[0] if departments else "Compliance"
+    impact_text = _build_impact_description(gap_text, department, severity.title())
+    return {
+        "gap_reference": reference,
+        "impact": trim_text(impact_text, 260),
+        "risk_level": severity,
+        "department": department,
+        "severity": severity.title(),
+        "description": trim_text(impact_text, 260),
+        "reason": trim_text(impact_text, 260),
+        "source": str(gap_record.get("source") or "Not specified in provided documents").strip() or "Not specified in provided documents",
+    }
+
+
+def _action_from_gap_record(gap_record: dict) -> dict:
+    gap_text = str(gap_record.get("gap") or "").strip()
+    reference = str(gap_record.get("reference") or "").strip()
+    level = _strict_level(gap_record.get("severity"), default="medium")
+    department = (_infer_impact_departments(gap_text) or ["Compliance"])[0]
+    action_text = f"Update control and policy wording for {gap_text} and enforce implementation in operating procedures."
+    return {
+        "gap_reference": reference,
+        "action": trim_text(action_text, 260),
+        "priority": level,
+        "title": trim_text(action_text, 120),
+        "description": trim_text(action_text, 260),
+        "department": department,
+    }
+
+
+def _normalize_impacts_by_gap(result_impacts: list[dict], gap_records: list[dict]) -> list[dict]:
+    gap_map = {str(item.get("reference") or "").strip(): item for item in gap_records if isinstance(item, dict)}
+    normalized = []
+    seen = set()
+
+    for index, item in enumerate(result_impacts or [], start=1):
+        if not isinstance(item, dict):
+            continue
+        gap_reference = str(item.get("gap_reference") or item.get("reference") or "").strip()
+        if gap_reference not in gap_map and gap_records:
+            gap_reference = gap_records[min(index - 1, len(gap_records) - 1)].get("reference")
+        impact_text = str(item.get("impact") or item.get("description") or item.get("reason") or "").strip()
+        if not impact_text:
+            continue
+        risk_level = _strict_level(item.get("risk_level") or item.get("severity"), default="medium")
+        source = str(item.get("source") or (gap_map.get(gap_reference) or {}).get("source") or "Not specified in provided documents").strip()
+        department = str(item.get("department") or "").strip() or ((_infer_impact_departments(impact_text) or ["Compliance"])[0])
+        key = (gap_reference.lower(), impact_text.lower(), risk_level)
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(
+            {
+                "gap_reference": gap_reference,
+                "impact": trim_text(impact_text, 260),
+                "risk_level": risk_level,
+                "department": department,
+                "severity": risk_level.title(),
+                "description": trim_text(impact_text, 260),
+                "reason": trim_text(impact_text, 260),
+                "source": source or "Not specified in provided documents",
+            }
+        )
+
+    for gap in gap_records:
+        ref = str(gap.get("reference") or "").strip()
+        if not ref:
+            continue
+        if not any(str(item.get("gap_reference") or "").strip() == ref for item in normalized):
+            normalized.append(_impact_from_gap_record(gap))
+
+    return normalized[:10]
+
+
+def _normalize_actions_by_gap(result_actions: list[dict], gap_records: list[dict]) -> list[dict]:
+    gap_map = {str(item.get("reference") or "").strip(): item for item in gap_records if isinstance(item, dict)}
+    normalized = []
+    seen = set()
+
+    for index, item in enumerate(result_actions or [], start=1):
+        if not isinstance(item, dict):
+            continue
+        gap_reference = str(item.get("gap_reference") or item.get("reference") or "").strip()
+        if gap_reference not in gap_map and gap_records:
+            gap_reference = gap_records[min(index - 1, len(gap_records) - 1)].get("reference")
+        action_text = str(item.get("action") or item.get("title") or item.get("description") or "").strip()
+        if not action_text:
+            continue
+        priority = _strict_level(item.get("priority"), default="medium")
+        department = str(item.get("department") or "").strip() or ((_infer_impact_departments(action_text) or ["Compliance"])[0])
+        key = (gap_reference.lower(), action_text.lower(), priority)
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(
+            {
+                "gap_reference": gap_reference,
+                "action": trim_text(action_text, 260),
+                "priority": priority,
+                "title": trim_text(action_text, 120),
+                "description": trim_text(action_text, 260),
+                "department": department,
+            }
+        )
+
+    for gap in gap_records:
+        ref = str(gap.get("reference") or "").strip()
+        if not ref:
+            continue
+        if not any(str(item.get("gap_reference") or "").strip() == ref for item in normalized):
+            normalized.append(_action_from_gap_record(gap))
+
+    return normalized[:10]
 
 
 def _extract_changes(payload) -> list:
@@ -2674,8 +2891,9 @@ def detect_compliance_gaps(new_text: str, policy_text: str, changes: list[dict] 
                 )
 
             deduped = deduplicate_items(gaps)[:15]
+            strict_gaps = _normalize_gap_records(deduped, limit=10)
             print(f"Compliance gaps generated: {len(deduped)}")
-            return _schema_response(compliance_gaps=deduped)
+            return _schema_response(compliance_gaps=strict_gaps)
 
         if not new_text or not policy_text:
             return _default_gaps_response()
@@ -2755,6 +2973,7 @@ def detect_compliance_gaps(new_text: str, policy_text: str, changes: list[dict] 
 
             compliance_gaps = sorted(compliance_gaps, key=lambda g: _priority_value((g or {}).get("risk", "Low")), reverse=True)
             deduped = deduplicate_items(compliance_gaps[:6])
+            strict_gaps = _normalize_gap_records(deduped, limit=10)
             logger.info(
                 "Policy coverage summary | input_changes=%s evaluated=%s gaps=%s llm_calls=%s",
                 len(changes),
@@ -2762,7 +2981,7 @@ def detect_compliance_gaps(new_text: str, policy_text: str, changes: list[dict] 
                 len(deduped),
                 int(policy_eval_stats.get("policy_eval_calls") or 0),
             )
-            return _schema_response(compliance_gaps=deduped)
+            return _schema_response(compliance_gaps=strict_gaps)
 
         pairs = _prepare_pairs(new_text, policy_text, "REGULATION", "POLICY")
         if not pairs:
@@ -2870,14 +3089,16 @@ PARTIAL_ANALYSES:
                 gaps = merged.get("compliance_gaps", [])
                 gaps = sorted(gaps, key=lambda g: _priority_value((g or {}).get("risk", "Low")), reverse=True)
                 deduped = deduplicate_items(gaps[:6])
+                strict_gaps = _normalize_gap_records(deduped, limit=10)
                 logger.info("deduplicated_output=%s", json.dumps({"compliance_gaps": deduped}, ensure_ascii=True)[:1200])
-                return _schema_response(compliance_gaps=deduped)
+                return _schema_response(compliance_gaps=strict_gaps)
 
         fallback = merge_chunk_results(partial_results, "compliance_gaps")
         fallback = sorted(fallback, key=lambda g: _priority_value((g or {}).get("risk", "Low")), reverse=True)
         deduped = deduplicate_items(fallback[:6] if fallback else [])
+        strict_gaps = _normalize_gap_records(deduped, limit=10)
         logger.info("deduplicated_output=%s", json.dumps({"compliance_gaps": deduped}, ensure_ascii=True)[:1200])
-        return _schema_response(compliance_gaps=deduped)
+        return _schema_response(compliance_gaps=strict_gaps)
 
     except Exception as e:
         logger.error("detect_compliance_gaps failed: %s", e)
@@ -2892,6 +3113,7 @@ def analyze_impact(impact_input: dict) -> dict:
 
         changes = impact_input.get("changes", [])
         gaps = impact_input.get("compliance_gaps", [])
+        gap_records = _normalize_gap_records(gaps, limit=10)
 
         if not changes and not gaps:
             raise ValueError("No input changes/gaps available for impact generation")
@@ -2903,23 +3125,16 @@ def analyze_impact(impact_input: dict) -> dict:
             combined_text += "REGULATION DELTAS / COMPLIANCE GAPS:\n" + json.dumps(gaps[:3], indent=2)
 
         gap_evidence = []
-        for gap in gaps[:6]:
-            if not isinstance(gap, dict):
-                continue
-            gap_evidence.append(
-                {
-                    "title": str(gap.get("title") or gap.get("issue") or gap.get("gap") or "").strip(),
-                    "description": str(gap.get("description") or gap.get("reason") or "").strip(),
-                    "recommendation": str(gap.get("recommendation") or "").strip(),
-                    "severity": str(gap.get("severity") or gap.get("risk") or gap.get("risk_level") or "Medium").strip(),
-                }
-            )
+        for gap in gap_records[:10]:
+            gap_evidence.append(gap)
 
         required_impacts = max(1, len(gap_evidence) or len([item for item in changes if isinstance(item, dict)]) or 1)
 
         combined_text = _filter_text_for_llm(combined_text, label="impacts")
 
         prompt = f"""
+    {RBI_ANALYSIS_RULES}
+
 Analyze business and compliance impacts from detected changes and gaps.
 Return only concrete, non-vague impacts.
 For EVERY compliance_gap, you MUST generate at least 1 impact.
@@ -2941,9 +3156,15 @@ MAPPING RULES:
 
 IMPACT STRUCTURE:
 Each impact must include:
-- department
-- severity
-- description
+- gap_reference (must exactly match a compliance gap reference)
+- impact (direct business/system consequence)
+- risk_level (low | medium | high)
+
+IMPACT GENERATION RULE:
+- For EACH compliance_gap generate at least one impact.
+- Impact must be derived from RBI text and gap evidence.
+- Avoid generic statements like "may cause risk".
+- If source is missing, set source to "Not specified in provided documents".
 
 TARGET COUNT:
 Generate at least {required_impacts} impacts.
@@ -2955,9 +3176,11 @@ Return ONLY valid JSON. No explanation. No markdown. No text outside JSON.\n\nJS
 {{
   "impacts": [
     {{
-            "department": "Finance | Compliance | Risk | Operations | Legal | Audit",
-            "severity": "HIGH | MEDIUM | LOW",
-            "description": "Specific business consequence"
+                        "gap_reference": "must match compliance gap reference",
+                        "impact": "Specific business/system consequence",
+                        "risk_level": "low | medium | high",
+                        "department": "Compliance | Risk | Finance | Operations",
+                        "source": "RBI clause reference or Not specified in provided documents"
     }}
   ]
 }}
@@ -2968,13 +3191,11 @@ Return ONLY valid JSON. No explanation. No markdown. No text outside JSON.\n\nJS
         print("LLM RESPONSE:", result)
 
         if isinstance(result, dict) and "error" not in result and isinstance(result.get("impacts"), list):
-            deduped_impacts = deduplicate_items(_normalize_impacts_list(result.get("impacts", [])[:30]))
-            if not deduped_impacts:
-                deduped_impacts = _infer_impacts_from_inputs(changes, gaps)
+            deduped_impacts = _normalize_impacts_by_gap(result.get("impacts", [])[:30], gap_records)
             logger.info("deduplicated_output=%s", json.dumps({"impacts": deduped_impacts}, ensure_ascii=True)[:1200])
             return _schema_response(impacts=deduped_impacts)
 
-        inferred_impacts = _infer_impacts_from_inputs(changes, gaps)
+        inferred_impacts = _normalize_impacts_by_gap([], gap_records)
         if inferred_impacts:
             logger.info("inferred_impacts=%s", json.dumps({"impacts": inferred_impacts}, ensure_ascii=True)[:1200])
             return _schema_response(impacts=inferred_impacts)
@@ -2995,22 +3216,14 @@ def generate_actions(actions_input: dict) -> dict:
         changes = actions_input.get("changes", [])
         gaps = actions_input.get("compliance_gaps", [])
         impacts = actions_input.get("impacts", [])
+        gap_records = _normalize_gap_records(gaps, limit=10)
 
         if not gaps and not impacts:
             raise ValueError("No compliance gaps/impacts available for action generation")
 
         gap_evidence = []
-        for gap in gaps[:6]:
-            if not isinstance(gap, dict):
-                continue
-            gap_evidence.append(
-                {
-                    "title": str(gap.get("title") or gap.get("issue") or gap.get("gap") or "").strip(),
-                    "severity": _normalize_severity(gap.get("severity") or gap.get("risk") or gap.get("risk_level")),
-                    "description": str(gap.get("description") or gap.get("reason") or "").strip(),
-                    "recommendation": str(gap.get("recommendation") or "").strip(),
-                }
-            )
+        for gap in gap_records[:10]:
+            gap_evidence.append(gap)
 
         impact_evidence = []
         for impact in impacts[:6]:
@@ -3025,7 +3238,7 @@ def generate_actions(actions_input: dict) -> dict:
                 }
             )
 
-        required_actions = max(1, min(6, len(gap_evidence) or len(impact_evidence) or 1))
+        required_actions = max(1, min(10, len(gap_evidence) or len(impact_evidence) or 1))
 
         combined_text = ""
         if changes:
@@ -3038,8 +3251,10 @@ def generate_actions(actions_input: dict) -> dict:
         combined_text = _filter_text_for_llm(combined_text, label="actions")
 
         prompt = f"""
+    {RBI_ANALYSIS_RULES}
+
 Generate exactly {required_actions} concrete and implementable compliance actions.
-If compliance gaps are present, return one action per gap, capped at 6.
+If compliance gaps are present, return one action per gap, capped at 10.
 Do not return an empty actions array.
 Each action must map to a specific gap title, recommendation, or impact from the evidence.
 No placeholders. No vague wording. No generic policy advice.
@@ -3062,12 +3277,10 @@ Return ONLY valid JSON. No explanation. No markdown. No text outside JSON.\n\nJS
 {{
   "actions": [
     {{
-            "title": "Action title",
-            "description": "Execution detail",
-            "department": "Owner department",
-      "priority": "High | Medium | Low",
-            "status": "Pending",
-            "deadline": "Current compliance cycle"
+                        "gap_reference": "must match compliance gap reference",
+                        "action": "Clear actionable fix step",
+                        "priority": "low | medium | high",
+                        "department": "Owner department"
     }}
   ]
 }}
@@ -3078,9 +3291,9 @@ Return ONLY valid JSON. No explanation. No markdown. No text outside JSON.\n\nJS
         print("LLM RESPONSE:", result)
 
         if isinstance(result, dict) and "error" not in result and isinstance(result.get("actions"), list):
-            deduped_actions = deduplicate_items(result.get("actions", [])[:6])
+            deduped_actions = _normalize_actions_by_gap(result.get("actions", [])[:30], gap_records)
             if not deduped_actions:
-                raise RuntimeError("Action LLM returned empty actions")
+                deduped_actions = _normalize_actions_by_gap([], gap_records)
             logger.info("deduplicated_output=%s", json.dumps({"actions": deduped_actions}, ensure_ascii=True)[:1200])
             return _schema_response(actions=deduped_actions)
 

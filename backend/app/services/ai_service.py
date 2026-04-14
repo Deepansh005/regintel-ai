@@ -662,6 +662,122 @@ def _default_gaps_response() -> dict:
     return _schema_response()
 
 
+def _normalize_impact_department(value: str) -> str:
+    label = str(value or "").strip()
+    if not label:
+        return "Compliance"
+    return label
+
+
+def _infer_impact_departments(text: str) -> list[str]:
+    content = str(text or "").lower()
+    departments: list[str] = []
+
+    def add_department(name: str) -> None:
+        normalized = _normalize_impact_department(name)
+        if normalized not in departments:
+            departments.append(normalized)
+
+    if any(keyword in content for keyword in ["capital", "adequacy", "tier 1", "tier-1", "ccar", "provisioning", "limit", "exposure"]):
+        add_department("Finance")
+        add_department("Risk")
+
+    if any(keyword in content for keyword in ["kyc", "customer due diligence", "cdd", "onboarding"]):
+        add_department("Compliance")
+        add_department("Operations")
+
+    if any(keyword in content for keyword in ["aml", "anti-money", "anti money", "cft", "sanction", "suspicious transaction", "str"]):
+        add_department("Risk")
+        add_department("Compliance")
+
+    if any(keyword in content for keyword in ["report", "reporting", "filing", "submission", "timeline", "deadline"]):
+        add_department("Operations")
+        add_department("Compliance")
+
+    if any(keyword in content for keyword in ["audit", "evidence", "control", "traceability", "document"]):
+        add_department("Audit")
+        add_department("Compliance")
+
+    if any(keyword in content for keyword in ["legal", "statutory", "regulation", "obligation", "penalty", "sanction"]):
+        add_department("Legal")
+        add_department("Compliance")
+
+    if not departments:
+        add_department("Compliance")
+
+    return departments[:3]
+
+
+def _infer_impact_severity(text: str) -> str:
+    content = str(text or "").lower()
+    if any(keyword in content for keyword in ["capital", "aml", "sanction", "penalty", "breach", "restriction", "prohibition", "exposure", "provisioning", "tier 1", "tier-1"]):
+        return "High"
+    if any(keyword in content for keyword in ["kyc", "report", "reporting", "filing", "deadline", "timeline", "audit"]):
+        return "Medium"
+    return "Medium"
+
+
+def _build_impact_description(gap_text: str, department: str, severity: str) -> str:
+    gap_text = _clean_text_for_llm(gap_text, label="impact") if "_clean_text_for_llm" in globals() else str(gap_text or "").strip()
+    base_gap = gap_text[:180] if gap_text else "the identified compliance gap"
+    department_key = str(department or "").strip().lower()
+
+    consequence_map = {
+        "finance": "can lead to regulatory penalties, capital constraints, and funding restrictions",
+        "risk": "can increase control failures, supervisory scrutiny, and residual risk exposure",
+        "compliance": "can result in compliance breaches, remediation escalation, and regulatory findings",
+        "operations": "can disrupt operational workflows, increase exception handling, and delay execution",
+        "legal": "can create legal exposure, enforcement action risk, and adverse statutory consequences",
+        "audit": "can weaken audit defensibility, evidence trails, and assurance outcomes",
+    }
+
+    consequence = consequence_map.get(department_key, "can create business disruption and regulatory exposure")
+    severity_label = str(severity or "Medium").upper()
+    return f"Failure to address {base_gap} in {department} can {consequence}. Severity: {severity_label}."
+
+
+def _infer_impacts_from_inputs(changes: list[dict], gaps: list[dict]) -> list[dict]:
+    inferred: list[dict] = []
+
+    source_items = []
+    if gaps:
+        source_items.extend([item for item in gaps if isinstance(item, dict)])
+    if not source_items and changes:
+        source_items.extend([item for item in changes if isinstance(item, dict)])
+
+    for item in source_items:
+        gap_text = " ".join(
+            str(item.get(field) or "")
+            for field in ("title", "issue", "gap", "description", "reason", "recommendation", "summary")
+        ).strip()
+        departments = _infer_impact_departments(gap_text)
+        severity = _infer_impact_severity(gap_text)
+
+        for department in departments:
+            inferred.append(
+                {
+                    "department": department,
+                    "severity": severity,
+                    "description": _build_impact_description(gap_text, department, severity),
+                }
+            )
+
+    deduped: list[dict] = []
+    seen = set()
+    for item in inferred:
+        key = (
+            str(item.get("department") or "").strip().lower(),
+            str(item.get("severity") or "").strip().lower(),
+            str(item.get("description") or "").strip().lower(),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+
+    return deduped[:30]
+
+
 def _extract_changes(payload) -> list:
     if isinstance(payload, dict):
         items = payload.get("changes")
@@ -2786,19 +2902,51 @@ def analyze_impact(impact_input: dict) -> dict:
         if gaps:
             combined_text += "REGULATION DELTAS / COMPLIANCE GAPS:\n" + json.dumps(gaps[:3], indent=2)
 
+        gap_evidence = []
+        for gap in gaps[:6]:
+            if not isinstance(gap, dict):
+                continue
+            gap_evidence.append(
+                {
+                    "title": str(gap.get("title") or gap.get("issue") or gap.get("gap") or "").strip(),
+                    "description": str(gap.get("description") or gap.get("reason") or "").strip(),
+                    "recommendation": str(gap.get("recommendation") or "").strip(),
+                    "severity": str(gap.get("severity") or gap.get("risk") or gap.get("risk_level") or "Medium").strip(),
+                }
+            )
+
+        required_impacts = max(1, len(gap_evidence) or len([item for item in changes if isinstance(item, dict)]) or 1)
+
         combined_text = _filter_text_for_llm(combined_text, label="impacts")
 
         prompt = f"""
 Analyze business and compliance impacts from detected changes and gaps.
 Return only concrete, non-vague impacts.
+For EVERY compliance_gap, you MUST generate at least 1 impact.
+If no direct impact is found, infer logical business impact.
+Do not return an empty impacts array.
 
 Analyze these documents:
 
 OLD POLICY:
 {_truncate_text_for_tokens(json.dumps(changes[:3], indent=2) if changes else "")}
 
-NEW POLICY:
-{_truncate_text_for_tokens(json.dumps(gaps[:3], indent=2) if gaps else "")}
+COMPLIANCE GAPS:
+{_truncate_text_for_tokens(json.dumps(gap_evidence, indent=2) if gap_evidence else "")}
+
+MAPPING RULES:
+- Capital requirement -> Finance impact (HIGH)
+- KYC -> Compliance + Operations impact (MEDIUM/HIGH)
+- AML -> Risk + Compliance impact (HIGH)
+
+IMPACT STRUCTURE:
+Each impact must include:
+- department
+- severity
+- description
+
+TARGET COUNT:
+Generate at least {required_impacts} impacts.
 
 REGULATION:
 {_truncate_text_for_tokens(combined_text)}
@@ -2807,9 +2955,9 @@ Return ONLY valid JSON. No explanation. No markdown. No text outside JSON.\n\nJS
 {{
   "impacts": [
     {{
-            "department": "Compliance | Risk | Operations | Legal | Finance | Audit",
-            "severity": "High | Medium | Low",
-            "reason": "Specific operational/compliance impact"
+            "department": "Finance | Compliance | Risk | Operations | Legal | Audit",
+            "severity": "HIGH | MEDIUM | LOW",
+            "description": "Specific business consequence"
     }}
   ]
 }}
@@ -2820,9 +2968,16 @@ Return ONLY valid JSON. No explanation. No markdown. No text outside JSON.\n\nJS
         print("LLM RESPONSE:", result)
 
         if isinstance(result, dict) and "error" not in result and isinstance(result.get("impacts"), list):
-            deduped_impacts = deduplicate_items(_normalize_impacts_list(result.get("impacts", [])[:3]))
+            deduped_impacts = deduplicate_items(_normalize_impacts_list(result.get("impacts", [])[:30]))
+            if not deduped_impacts:
+                deduped_impacts = _infer_impacts_from_inputs(changes, gaps)
             logger.info("deduplicated_output=%s", json.dumps({"impacts": deduped_impacts}, ensure_ascii=True)[:1200])
             return _schema_response(impacts=deduped_impacts)
+
+        inferred_impacts = _infer_impacts_from_inputs(changes, gaps)
+        if inferred_impacts:
+            logger.info("inferred_impacts=%s", json.dumps({"impacts": inferred_impacts}, ensure_ascii=True)[:1200])
+            return _schema_response(impacts=inferred_impacts)
 
         raise RuntimeError("Impact LLM response invalid or empty")
 

@@ -4,6 +4,7 @@ import os
 import uuid
 import asyncio
 import logging
+import json
 
 logger = logging.getLogger(__name__)
 
@@ -214,14 +215,17 @@ def _dedupe_changes_by_field_new(changes: list[dict]) -> list[dict]:
 
 
 def _build_action_from_gap(gap: dict) -> dict:
-    issue = str((gap or {}).get("gap") or (gap or {}).get("issue") or "Regulatory gap").strip()
+    issue = str((gap or {}).get("title") or (gap or {}).get("gap") or (gap or {}).get("issue") or "Regulatory gap").strip()
     severity = str((gap or {}).get("severity") or (gap or {}).get("risk") or "Medium").strip().title()
     if severity not in {"High", "Medium", "Low"}:
         severity = "Medium"
     return {
-        "action": f"Implement control update in policy/compliance workflow to close gap: {issue}",
-        "owner": "Compliance",
+        "title": f"Close gap: {issue[:90]}",
+        "description": f"Implement control update in policy and operating workflow to close: {issue}",
+        "department": "Compliance",
         "priority": severity,
+        "status": "Pending",
+        "deadline": "Current compliance cycle",
     }
 
 
@@ -236,6 +240,248 @@ def _align_actions_to_gaps(actions: list[dict], gaps: list[dict]) -> list[dict]:
         for gap in (gaps or [])[len(normalized):target]:
             normalized.append(_build_action_from_gap(gap if isinstance(gap, dict) else {}))
     return normalized
+
+
+_INVALID_TEXT_VALUES = {
+    "",
+    "-",
+    "n/a",
+    "na",
+    "none",
+    "null",
+    "no description provided",
+    "no summary provided",
+    "tbd",
+}
+
+
+def _clean_text(value, fallback: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return fallback
+    compact = re.sub(r"\s+", " ", text)
+    if compact.lower() in _INVALID_TEXT_VALUES:
+        return fallback
+    return compact
+
+
+def _normalize_level(value: str, default: str = "Medium") -> str:
+    normalized = str(value or "").strip().title()
+    if normalized in {"High", "Medium", "Low"}:
+        return normalized
+    return default
+
+
+def _dedupe_items(items: list[dict], key_builder) -> list[dict]:
+    result = []
+    seen = set()
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        key = key_builder(item)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(item)
+    return result
+
+
+def _normalize_change_type(change_type: str) -> str:
+    normalized = str(change_type or "").strip().lower()
+    if normalized in {"added", "missing_requirement"}:
+        return "added"
+    if normalized in {"removed", "extra_policy_rule"}:
+        return "removed"
+    return "modified"
+
+
+def _is_real_extra_policy_rule(change: dict) -> bool:
+    if not isinstance(change, dict):
+        return False
+    change_type = str(change.get("type") or "").strip().lower()
+    if change_type != "extra_policy_rule":
+        return True
+    field = str(change.get("field") or "").strip()
+    evidence = str(change.get("evidence") or "").strip()
+    old_value = str(change.get("old") or "").strip()
+    return len(field.split()) >= 2 and len(evidence.split()) >= 6 and len(old_value) >= 6
+
+
+def _build_change_summary(change: dict) -> str:
+    old_value = str(change.get("old") or "").strip()
+    new_value = str(change.get("new") or "").strip()
+    evidence = str(change.get("evidence") or "").strip()
+    field = str(change.get("field") or "Regulatory requirement").strip()
+    if old_value and new_value:
+        return _clean_text(f"{field} updated from '{old_value}' to '{new_value}'.", "Regulatory requirement updated.")
+    if new_value and not old_value:
+        return _clean_text(f"New requirement introduced for {field}: '{new_value}'.", "New regulatory requirement introduced.")
+    if old_value and not new_value:
+        return _clean_text(f"Policy-only rule removed for {field}: '{old_value}'.", "Policy-only rule removed.")
+    return _clean_text(evidence, f"Requirement change identified for {field}.")
+
+
+def _to_structured_changes(changes: list[dict]) -> list[dict]:
+    mapped = []
+    for change in changes or []:
+        if not isinstance(change, dict):
+            continue
+        if not _is_real_extra_policy_rule(change):
+            continue
+        title = _clean_text(change.get("field"), "Regulatory requirement updated")
+        mapped.append(
+            {
+                "title": title,
+                "type": _normalize_change_type(change.get("type")),
+                "summary": _build_change_summary(change),
+                "source": _clean_text(change.get("source"), "RBI/POLICY"),
+                "source_chunks": change.get("source_chunks") if isinstance(change.get("source_chunks"), list) else [],
+            }
+        )
+
+    deduped = _dedupe_items(
+        mapped,
+        lambda item: (
+            str(item.get("type") or "").lower(),
+            str(item.get("title") or "").lower(),
+            str(item.get("summary") or "").lower(),
+        ),
+    )
+    return deduped[:15]
+
+
+def _to_structured_impacts(impacts: list[dict]) -> list[dict]:
+    mapped = []
+    for impact in impacts or []:
+        if not isinstance(impact, dict):
+            continue
+
+        departments = impact.get("impacted_departments") if isinstance(impact.get("impacted_departments"), list) else []
+        reason = _clean_text(impact.get("description") or impact.get("reason"), "Regulatory change requires operational control updates.")
+        severity = _normalize_level(impact.get("severity") or impact.get("impact_level"), default="Medium")
+
+        if not departments and str(impact.get("department") or "").strip():
+            departments = [str(impact.get("department") or "").strip()]
+
+        for department in departments:
+            label = _clean_text(department, "Compliance")
+            mapped.append(
+                {
+                    "department": label,
+                    "severity": severity,
+                    "reason": reason,
+                    "source_chunks": impact.get("source_chunks") if isinstance(impact.get("source_chunks"), list) else [],
+                }
+            )
+
+    deduped = _dedupe_items(
+        mapped,
+        lambda item: (
+            str(item.get("department") or "").lower(),
+            str(item.get("severity") or "").lower(),
+            str(item.get("reason") or "").lower(),
+        ),
+    )
+    return deduped[:30]
+
+
+def _to_structured_gaps(gaps: list[dict]) -> list[dict]:
+    mapped = []
+    for gap in gaps or []:
+        if not isinstance(gap, dict):
+            continue
+        title = _clean_text(gap.get("issue") or gap.get("gap") or gap.get("title"), "Compliance gap identified")
+        severity = _normalize_level(gap.get("severity") or gap.get("risk") or gap.get("risk_level"), default="Medium")
+        regulation_requirement = _clean_text(gap.get("regulation_requirement"), "Regulatory requirement is not fully covered.")
+        policy_state = _clean_text(gap.get("policy_current_state"), "Current policy coverage is incomplete.")
+        description = _clean_text(gap.get("description") or gap.get("reason"), f"{regulation_requirement} Current policy state: {policy_state}")
+        recommendation = _clean_text(
+            gap.get("recommendation"),
+            f"Update policy controls to align with: {regulation_requirement}",
+        )
+        mapped.append(
+            {
+                "title": title,
+                "severity": severity,
+                "description": description,
+                "recommendation": recommendation,
+                "source_chunks": gap.get("source_chunks") if isinstance(gap.get("source_chunks"), list) else [],
+            }
+        )
+
+    deduped = _dedupe_items(
+        mapped,
+        lambda item: (
+            str(item.get("title") or "").lower(),
+            str(item.get("severity") or "").lower(),
+            str(item.get("description") or "").lower(),
+        ),
+    )
+    return deduped[:15]
+
+
+def _to_structured_actions(actions: list[dict], gaps: list[dict]) -> list[dict]:
+    mapped = []
+    for action in actions or []:
+        if not isinstance(action, dict):
+            continue
+        title = _clean_text(action.get("title") or action.get("action") or action.get("step"), "Compliance action required")
+        description = _clean_text(
+            action.get("description") or action.get("summary"),
+            f"Execute control update for: {title}",
+        )
+        department = _clean_text(action.get("department") or action.get("owner"), "Compliance")
+        priority = _normalize_level(action.get("priority"), default="Medium")
+        mapped.append(
+            {
+                "title": title,
+                "description": description,
+                "department": department,
+                "priority": priority,
+                "status": _clean_text(action.get("status"), "Pending"),
+                "deadline": _clean_text(action.get("deadline") or action.get("timeline"), "Current compliance cycle"),
+                "source_chunks": action.get("source_chunks") if isinstance(action.get("source_chunks"), list) else [],
+            }
+        )
+
+    aligned = _align_actions_to_gaps(mapped, gaps)
+    deduped = _dedupe_items(
+        aligned,
+        lambda item: (
+            str(item.get("title") or "").lower(),
+            str(item.get("department") or "").lower(),
+        ),
+    )
+    return deduped[:30]
+
+
+def _compute_department_risk_from_impacts(impacts: list[dict]) -> list[dict]:
+    counts = {}
+    for impact in impacts or []:
+        if not isinstance(impact, dict):
+            continue
+        department = str(impact.get("department") or "").strip()
+        if not department:
+            continue
+        counts[department] = counts.get(department, 0) + 1
+
+    total = sum(counts.values())
+    if total <= 0:
+        return []
+
+    result = []
+    allocated = 0
+    items = sorted(counts.items(), key=lambda item: item[1], reverse=True)
+    for index, (department, count) in enumerate(items):
+        if index == len(items) - 1:
+            percent = 100 - allocated
+        else:
+            percent = int(round((count / total) * 100))
+            allocated += percent
+        result.append({"department": department, "risk_percent": max(0, min(100, percent))})
+
+    result.sort(key=lambda item: item.get("risk_percent", 0), reverse=True)
+    return result
 
 
 def _build_department_risk(results_payload: list[dict]) -> list[dict]:
@@ -834,13 +1080,13 @@ def process_task(task_id: str, file_paths: dict, file_hashes: dict | None = None
             actions_payload = _empty_pipeline_schema()
             results_payload = []
 
-        changes_items = _extract_changes(changes_payload)
-        changes_items = _dedupe_changes_by_field_new(changes_items)[:15]
-        gaps_items = _extract_gaps(compliance_gaps_payload)
-        gaps_items = sorted(gaps_items, key=lambda item: _risk_priority((item or {}).get("risk") or (item or {}).get("risk_level")), reverse=True)
-        gaps_items = deduplicate_items(gaps_items[:15])
-        impacts_items = deduplicate_items(_normalize_impact(impacts_payload)[:30])
-        actions_items = deduplicate_items(_normalize_actions(actions_payload)[:30])
+        changes_items_raw = _extract_changes(changes_payload)
+        changes_items_raw = _dedupe_changes_by_field_new(changes_items_raw)[:15]
+        gaps_items_raw = _extract_gaps(compliance_gaps_payload)
+        gaps_items_raw = sorted(gaps_items_raw, key=lambda item: _risk_priority((item or {}).get("risk") or (item or {}).get("risk_level")), reverse=True)
+        gaps_items_raw = deduplicate_items(gaps_items_raw[:15])
+        impacts_items_raw = deduplicate_items(_normalize_impact(impacts_payload)[:30])
+        actions_items_raw = deduplicate_items(_normalize_actions(actions_payload)[:30])
 
         old_lookup = _build_source_lookup(old_source_chunks)
         new_lookup = _build_source_lookup(new_source_chunks)
@@ -856,17 +1102,17 @@ def process_task(task_id: str, file_paths: dict, file_hashes: dict | None = None
             change_candidates = list(new_lookup.values()) + list(policy_lookup.values())
             gap_candidates = list(new_lookup.values()) + list(policy_lookup.values())
 
-        changes_items = _attach_source_chunks(changes_items, change_candidates, ["field", "new", "evidence"], max_sources=2)
-        gaps_items = _attach_source_chunks(gaps_items, gap_candidates, ["issue", "regulation_requirement", "policy_current_state"], max_sources=2)
+        changes_items_raw = _attach_source_chunks(changes_items_raw, change_candidates, ["field", "new", "evidence"], max_sources=2)
+        gaps_items_raw = _attach_source_chunks(gaps_items_raw, gap_candidates, ["issue", "regulation_requirement", "policy_current_state"], max_sources=2)
 
-        actions_items = _align_actions_to_gaps(actions_items, gaps_items)
+        actions_items_raw = _align_actions_to_gaps(actions_items_raw, gaps_items_raw)
 
-        gap_source_ids = _collect_source_chunks_from_items(gaps_items)
+        gap_source_ids = _collect_source_chunks_from_items(gaps_items_raw)
         gap_candidate_lookup = {chunk_id: record for chunk_id, record in {**old_lookup, **new_lookup, **policy_lookup}.items()}
         gap_source_candidates = [gap_candidate_lookup[chunk_id] for chunk_id in gap_source_ids if chunk_id in gap_candidate_lookup]
 
         action_source_candidates = gap_source_candidates or gap_candidates
-        for impact_item in impacts_items:
+        for impact_item in impacts_items_raw:
             if isinstance(impact_item, dict):
                 impact_item["source_chunks"] = _pick_source_chunks(
                     f"{impact_item.get('title') or ''} {impact_item.get('description') or ''}",
@@ -874,7 +1120,7 @@ def process_task(task_id: str, file_paths: dict, file_hashes: dict | None = None
                     max_sources=3,
                 )
 
-        for action in actions_items:
+        for action in actions_items_raw:
             if isinstance(action, dict):
                 action["source_chunks"] = _pick_source_chunks(
                     f"{action.get('action') or ''} {action.get('owner') or ''}",
@@ -882,13 +1128,31 @@ def process_task(task_id: str, file_paths: dict, file_hashes: dict | None = None
                     max_sources=2,
                 )
 
+        changes_items = _to_structured_changes(changes_items_raw)
+        gaps_items = _to_structured_gaps(gaps_items_raw)
+        impacts_items = _to_structured_impacts(impacts_items_raw)
+        actions_items = _to_structured_actions(actions_items_raw, gaps_items)
+
+        logger.info("dashboard_raw_payload=%s", json.dumps({
+            "changes": changes_items_raw,
+            "compliance_gaps": gaps_items_raw,
+            "impacts": impacts_items_raw,
+            "actions": actions_items_raw,
+        }, ensure_ascii=True)[:2000])
+        logger.info("dashboard_structured_payload=%s", json.dumps({
+            "changes": changes_items,
+            "compliance_gaps": gaps_items,
+            "impacts": impacts_items,
+            "actions": actions_items,
+        }, ensure_ascii=True)[:2000])
+
         response = {
             "changes": changes_items,
             "compliance_gaps": gaps_items,
             "impacts": impacts_items,
             "actions": actions_items,
             "results": results_payload if isinstance(results_payload, list) else [],
-            "department_risk": _build_department_risk(results_payload if isinstance(results_payload, list) else []),
+            "department_risk": _compute_department_risk_from_impacts(impacts_items),
             "file_block_map": {
                 file_name: [
                     {

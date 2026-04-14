@@ -1086,10 +1086,10 @@ Return ONLY valid JSON. No explanation. No markdown. No text outside JSON.\n\nJS
 {{
   "changes": [
     {{
-      "type": "added | removed | modified",
-      "category": "KYC | Risk | Capital | Reporting | Governance | Audit | Other",
-      "summary": "Specific change in <=2 lines",
-      "impact": "Brief significance note"
+            "title": "Requirement title",
+            "type": "added | removed | modified",
+            "summary": "Specific factual change in <=2 lines",
+            "source": "RBI | POLICY"
     }}
   ]
 }}
@@ -1127,10 +1127,10 @@ Return ONLY valid JSON. No explanation. No markdown. No text outside JSON.\n\nJS
 {{
   "compliance_gaps": [
     {{
-      "issue": "Gap description <=2 lines",
-      "risk": "High | Medium | Low",
-      "regulation_requirement": "What regulation requires",
-      "policy_current_state": "What policy says/doesn't say"
+            "title": "Gap title",
+            "severity": "High | Medium | Low",
+            "description": "Specific mismatch between regulation and policy",
+            "recommendation": "Direct remediation action"
     }}
   ]
 }}
@@ -2789,8 +2789,8 @@ def analyze_impact(impact_input: dict) -> dict:
         combined_text = _filter_text_for_llm(combined_text, label="impacts")
 
         prompt = f"""
-Analyze the business and compliance impact of these detected changes and gaps.
-Provide 2-3 key impacts with severity assessment.
+Analyze business and compliance impacts from detected changes and gaps.
+Return only concrete, non-vague impacts.
 
 CONTEXT:
 {_truncate_text_for_tokens(combined_text)}
@@ -2799,10 +2799,9 @@ Return ONLY valid JSON. No explanation. No markdown. No text outside JSON.\n\nJS
 {{
   "impacts": [
     {{
-            "title": "Impact title",
-      "description": "Impact description",
+            "department": "Compliance | Risk | Operations | Legal | Finance | Audit",
             "severity": "High | Medium | Low",
-            "impacted_departments": ["Compliance", "Risk", "Operations"]
+            "reason": "Specific operational/compliance impact"
     }}
   ]
 }}
@@ -2848,8 +2847,8 @@ def generate_actions(actions_input: dict) -> dict:
 
         prompt = f"""
 Generate 2-6 concrete and implementable compliance actions.
-Each action must map to one or more compliance gaps and the corresponding impacts.
-Each action should include owner, priority, and timeline.
+Each action must map to one or more compliance gaps and impacts.
+No placeholders. No vague wording.
 
 CONTEXT:
 {_truncate_text_for_tokens(combined_text)}
@@ -2858,9 +2857,12 @@ Return ONLY valid JSON. No explanation. No markdown. No text outside JSON.\n\nJS
 {{
   "actions": [
     {{
-      "action": "Specific action description",
+            "title": "Action title",
+            "description": "Execution detail",
+            "department": "Owner department",
       "priority": "High | Medium | Low",
-      "owner": "Team/Department responsible"
+            "status": "Pending",
+            "deadline": "Current compliance cycle"
     }}
   ]
 }}

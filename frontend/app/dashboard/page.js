@@ -126,79 +126,170 @@ function pickLatestCompletedTask(tasks) {
     }, null);
 }
 
+function firstNonEmpty(...values) {
+    for (const value of values) {
+        const text = String(value ?? '').trim();
+        if (text) return text;
+    }
+    return '';
+}
+
+function normalizeLevel(value, fallback = 'Medium') {
+    const level = String(value || '').trim().toLowerCase();
+    if (level === 'high') return 'High';
+    if (level === 'medium') return 'Medium';
+    if (level === 'low') return 'Low';
+    return fallback;
+}
+
+function normalizeChangeType(value) {
+    const type = String(value || '').trim().toLowerCase();
+    if (type === 'added' || type === 'missing_requirement') return 'added';
+    if (type === 'removed' || type === 'extra_policy_rule') return 'removed';
+    return 'modified';
+}
+
 function normalizeChanges(payload) {
-    const root = unwrapTaskResult(payload)?.changes ?? unwrapTaskResult(payload) ?? [];
-    if (typeof root === 'string') return [];
-    if (Array.isArray(root)) {
-        return root.map((c) => ({
-            ...c,
-            type: (c?.type || '').toString().toLowerCase()
-        }));
-    }
+    const root = unwrapTaskResult(payload);
+    const changes = toArray(root?.changes);
 
-    if (Array.isArray(root.changes)) {
-        return root.changes.map((c) => ({
-            ...c,
-            type: (c?.type || '').toString().toLowerCase()
-        }));
-    }
+    const mapped = changes
+        .filter((item) => item && typeof item === 'object')
+        .map((item, index) => {
+            const type = normalizeChangeType(item?.type);
+            const title = firstNonEmpty(item?.title, item?.field, item?.section, item?.category);
+            const summary = firstNonEmpty(
+                item?.summary,
+                item?.evidence,
+                item?.change,
+                item?.old || item?.new ? `${String(item?.old || '').trim()} -> ${String(item?.new || '').trim()}` : ''
+            );
+            const source = firstNonEmpty(item?.source, item?.type === 'extra_policy_rule' ? 'POLICY' : 'RBI');
 
-    const added = toArray(root.added).map((c) => ({ ...c, type: c?.type || 'added' }));
-    const modified = toArray(root.modified).map((c) => ({ ...c, type: c?.type || 'modified' }));
-    const removed = toArray(root.removed).map((c) => ({ ...c, type: c?.type || 'removed' }));
-    return [...added, ...modified, ...removed].map((c) => ({
-        ...c,
-        type: (c?.type || '').toString().toLowerCase()
-    }));
+            if (!title || !summary || !source) {
+                console.warn('Skipped invalid change item from backend:', { index, item });
+                return null;
+            }
+
+            return {
+                title,
+                type,
+                summary,
+                source,
+                source_chunks: Array.isArray(item?.source_chunks) ? item.source_chunks : [],
+            };
+        })
+        .filter(Boolean);
+
+    return mapped;
 }
 
 function normalizeGaps(payload) {
-    const root = unwrapTaskResult(payload)?.compliance_gaps ?? unwrapTaskResult(payload) ?? [];
-    if (typeof root === 'string') return [];
-    if (Array.isArray(root)) {
-        const seen = new Map();
-        return root
-            .filter((item) => item && typeof item === 'object')
-            .map((item, index) => {
-                const base = String(item.id || item.issue || item.gap || `gap-${index}`).trim();
-                const count = (seen.get(base) || 0) + 1;
-                seen.set(base, count);
-                return {
-                    ...item,
-                    _ui_key: `${base}-${count}`,
-                };
-            });
-    }
-    return [];
+    const root = unwrapTaskResult(payload);
+    const gaps = toArray(root?.compliance_gaps);
+
+    const seen = new Map();
+    return gaps
+        .filter((item) => item && typeof item === 'object')
+        .map((item, index) => {
+            const title = firstNonEmpty(item?.title, item?.issue, item?.gap);
+            const severity = normalizeLevel(item?.severity || item?.risk || item?.risk_level, 'Medium');
+            const description = firstNonEmpty(
+                item?.description,
+                item?.reason,
+                item?.regulation_requirement || item?.policy_current_state
+                    ? `Requirement: ${String(item?.regulation_requirement || '').trim()} Current policy: ${String(item?.policy_current_state || '').trim()}`
+                    : ''
+            );
+            const recommendation = firstNonEmpty(
+                item?.recommendation,
+                item?.regulation_requirement ? `Align policy controls to: ${String(item?.regulation_requirement).trim()}` : ''
+            );
+
+            if (!title || !severity || !description || !recommendation) {
+                console.warn('Skipped invalid compliance gap item from backend:', { index, item });
+                return null;
+            }
+
+            const base = String(item.id || title || `gap-${index}`).trim();
+            const count = (seen.get(base) || 0) + 1;
+            seen.set(base, count);
+
+            return {
+                title,
+                severity,
+                description,
+                recommendation,
+                source_chunks: Array.isArray(item?.source_chunks) ? item.source_chunks : [],
+                _ui_key: `${base}-${count}`,
+            };
+        })
+        .filter(Boolean);
 }
 
 function normalizeImpacts(payload) {
-    const root = unwrapTaskResult(payload)?.impacts ?? unwrapTaskResult(payload) ?? [];
-    if (typeof root === 'string') return [];
-    return Array.isArray(root) ? root : [];
+    const root = unwrapTaskResult(payload);
+    const impacts = toArray(root?.impacts);
+
+    return impacts
+        .filter((item) => item && typeof item === 'object')
+        .flatMap((item, index) => {
+            const severity = normalizeLevel(item?.severity || item?.impact_level, 'Medium');
+            const reason = firstNonEmpty(item?.reason, item?.description, item?.summary);
+
+            const explicitDepartment = firstNonEmpty(item?.department);
+            const deptList = explicitDepartment
+                ? [explicitDepartment]
+                : toArray(item?.impacted_departments).map((d) => String(d || '').trim()).filter(Boolean);
+
+            if (!reason || deptList.length === 0) {
+                console.warn('Skipped invalid impact item from backend:', { index, item });
+                return [];
+            }
+
+            return deptList.map((department) => ({
+                department,
+                severity,
+                reason,
+                source_chunks: Array.isArray(item?.source_chunks) ? item.source_chunks : [],
+            }));
+        })
+        .filter(Boolean);
 }
 
 function normalizeActions(payload) {
     const normalized = unwrapTaskResult(payload);
-    const actions = findFirstArrayCandidate(normalized?.actions) || [];
-
-    if (!Array.isArray(actions)) {
-        console.warn("Actions is not array", actions);
-        return [];
-    }
-
+    const actions = toArray(normalized?.actions);
     const seen = new Map();
     return actions
         .filter((item) => item && typeof item === 'object')
         .map((item, index) => {
-            const base = String(item.id || item.step || item.title || item.action || `action-${index}`).trim();
+            const title = firstNonEmpty(item?.title, item?.action, item?.step, item?.action_required);
+            const description = firstNonEmpty(item?.description, item?.summary, title ? `Execute: ${title}` : '');
+            const department = firstNonEmpty(item?.department, item?.owner);
+            const priority = normalizeLevel(item?.priority, 'Medium');
+
+            if (!title || !description || !department || !priority) {
+                console.warn('Skipped invalid action item from backend:', { index, item });
+                return null;
+            }
+
+            const base = String(item.id || title || `action-${index}`).trim();
             const count = (seen.get(base) || 0) + 1;
             seen.set(base, count);
+
             return {
-                ...item,
+                title,
+                description,
+                department,
+                priority,
+                status: String(item?.status || 'Pending').trim(),
+                deadline: String(item?.deadline || 'Current compliance cycle').trim(),
+                source_chunks: Array.isArray(item?.source_chunks) ? item.source_chunks : [],
                 _ui_key: `${base}-${count}`,
             };
-        });
+        })
+        .filter(Boolean);
 }
 
 function normalizeComplianceTrend(payload) {
@@ -225,8 +316,7 @@ function normalizeComplianceTrend(payload) {
 
 function normalizeImpactedDepartments(payload, impacts) {
     const impactDepartments = toArray(impacts)
-        .flatMap((impact) => toArray(impact?.impacted_departments))
-        .map((entry) => (typeof entry === 'string' ? entry : entry?.name))
+        .map((impact) => impact?.department)
         .filter(Boolean);
 
     return [...new Set(impactDepartments.map((entry) => String(entry).trim()).filter(Boolean))];
@@ -250,26 +340,29 @@ function normalizeDepartmentRisk(payload, impacts) {
             .sort((a, b) => b.risk_percent - a.risk_percent);
     }
 
-    const weights = { high: 3, medium: 2, low: 1 };
-    const aggregate = new Map();
-
+    console.warn('Missing department_risk in backend payload. Falling back to impact-count normalization.');
+    const counts = new Map();
     toArray(impacts).forEach((impact) => {
-        const severity = String(impact?.severity || 'Medium').toLowerCase();
-        const weight = weights[severity] || 2;
-        toArray(impact?.impacted_departments).forEach((department) => {
-            const label = String(department || '').trim();
-            if (!label) return;
-            aggregate.set(label, (aggregate.get(label) || 0) + weight);
-        });
+        const department = String(impact?.department || '').trim();
+        if (!department) return;
+        counts.set(department, (counts.get(department) || 0) + 1);
     });
 
-    const max = Math.max(...Array.from(aggregate.values()), 1);
-    return Array.from(aggregate.entries())
-        .map(([department, score]) => ({
+    const total = Array.from(counts.values()).reduce((sum, value) => sum + value, 0);
+    if (!total) return [];
+
+    let allocated = 0;
+    const sorted = Array.from(counts.entries()).sort((a, b) => b[1] - a[1]);
+    return sorted.map(([department, count], index) => {
+        let risk_percent = index === sorted.length - 1
+            ? Math.max(0, 100 - allocated)
+            : Math.round((count / total) * 100);
+        allocated += risk_percent;
+        return {
             department,
-            risk_percent: Math.max(0, Math.min(100, Math.round((score / max) * 100))),
-        }))
-        .sort((a, b) => b.risk_percent - a.risk_percent);
+            risk_percent: Math.max(0, Math.min(100, risk_percent)),
+        };
+    });
 }
 
 function formatStatus(status) {
@@ -282,7 +375,7 @@ function formatStatus(status) {
 }
 
 function getRiskValue(gap) {
-    return (gap?.risk_level || gap?.risk || '').toString().toLowerCase();
+    return (gap?.severity || '').toString().toLowerCase();
 }
 
 function getCompletionScore(result) {
@@ -499,12 +592,19 @@ export default function Dashboard() {
     const gapsArray = normalizeGaps(normalizedData);
     const impactsArray = normalizeImpacts(normalizedData);
     console.log("IMPACTS:", normalizedData?.impacts);
-    const impactSystems = [...new Set(toArray(impactsArray).flatMap((impact) => toArray(impact?.systems)).filter(Boolean))];
+    const impactSystems = [...new Set(toArray(impactsArray).map((impact) => impact?.department).filter(Boolean))];
     const impactSourceChunks = [...new Set(toArray(impactsArray).flatMap((impact) => toArray(impact?.source_chunks)).filter(Boolean))];
     const impactDepartments = normalizeImpactedDepartments(normalizedData, impactsArray);
     const departmentRisk = normalizeDepartmentRisk(normalizedData, impactsArray);
     const actionsData = normalizeActions(normalizedData);
     const complianceTrendData = normalizeComplianceTrend(normalizedData);
+    console.log("Dashboard mapped data:", {
+        changes: changesList,
+        compliance_gaps: gapsArray,
+        impacts: impactsArray,
+        actions: actionsData,
+        department_risk: departmentRisk,
+    });
 
     const criticalGapsCount = gapsArray.filter((g) => getRiskValue(g) === 'high').length;
     const overallRisk = criticalGapsCount > 0 ? "High" : gapsArray.length > 0 ? "Medium" : "Low";
@@ -552,7 +652,7 @@ export default function Dashboard() {
     ];
 
     const hasTrendData = trendData.length > 0;
-    const hasImpactData = impactChartData.length > 0;
+    const hasImpactData = impactChartData.some((item) => Number(item?.value || 0) > 0);
     const hasActions = actionsData.length > 0;
 
     const handleClearHistory = async () => {
@@ -764,7 +864,7 @@ export default function Dashboard() {
                                     <div key={`${item.section || 'change'}-${index}`} className="border-b border-slate-100 pb-2 mb-2 last:border-b-0 last:mb-0">
                                         <div className="flex justify-between items-center gap-3">
                                             <span className="font-medium text-sm text-slate-800 truncate">
-                                                {item.section || item.category || 'General Update'}
+                                                {item.title}
                                             </span>
 
                                             <div className="flex items-center gap-2">
@@ -782,7 +882,7 @@ export default function Dashboard() {
                                                     onClick={() => openSourceViewer({
                                                         title: item.section || item.category || 'Regulatory Change Source',
                                                         sourceChunks: item.source_chunks,
-                                                        highlightValues: [item.summary, item.impact, item.section],
+                                                        highlightValues: [item.summary, item.source, item.title],
                                                     })}
                                                     disabled={!Array.isArray(item.source_chunks) || item.source_chunks.length === 0}
                                                     className="inline-flex items-center gap-1 rounded-full border border-slate-200 px-2.5 py-1 text-[11px] font-bold uppercase tracking-wider text-slate-600 transition-colors hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
@@ -794,7 +894,7 @@ export default function Dashboard() {
                                         </div>
 
                                         <p className="text-sm text-gray-600 mt-1">
-                                            {item.summary || 'No summary provided'}
+                                            {item.summary}
                                         </p>
                                     </div>
                                 ))
@@ -856,27 +956,28 @@ export default function Dashboard() {
                         <p className="text-sm text-slate-500 mb-4">Urgent review required</p>
                         <div className="overflow-y-auto pr-2 space-y-4">
                             {gapsArray.length > 0 ? gapsArray.slice(0,5).map((gap, i) => {
-                                const isHigh = gap.risk_level?.toLowerCase() === 'high' || gap.risk?.toLowerCase() === 'high';
+                                const severity = (gap.severity || '').toLowerCase();
+                                const isHigh = severity === 'high';
                                 const color = isHigh ? 'bg-rose-500' : 'bg-amber-500';
                                 const bg = isHigh ? 'bg-rose-50' : 'bg-amber-50';
                                 return (
                                     <div key={gap._ui_key || `${currentTaskId || 'gap'}-${i}`} className={`p-4 rounded-[12px] border ${isHigh ? 'border-rose-100' : 'border-amber-100'} ${bg} flex items-start gap-4`}>
                                         <div className="mt-1"><AlertTriangle className={`w-5 h-5 ${isHigh ? 'text-rose-500' : 'text-amber-500'}`} /></div>
                                         <div className="flex-1">
-                                            <p className="text-sm font-bold text-slate-900 leading-tight mb-1">{gap.issue || gap.gap_identified || gap.gap || "Policy alignment gap identified"}</p>
-                                            <p className="text-xs text-slate-600 mb-3 line-clamp-1">{gap.policy_reference ? `Ref: ${gap.policy_reference} (${gap.regulation_reference})` : gap.recommendation || "Review and align internal controls with updated circular."}</p>
+                                            <p className="text-sm font-bold text-slate-900 leading-tight mb-1">{gap.title}</p>
+                                            <p className="text-xs text-slate-600 mb-3 line-clamp-2">{gap.description}</p>
                                             <div className="flex items-center justify-between gap-3">
                                                 <div className="h-1.5 w-full bg-slate-200/50 rounded-full overflow-hidden border border-black/5">
-                                                    <div className={`h-full ${color}`} style={{ width: isHigh ? '90%' : '50%' }} />
+                                                    <div className={`h-full ${color}`} style={{ width: severity === 'low' ? '35%' : isHigh ? '90%' : '60%' }} />
                                                 </div>
                                                 <div className="flex items-center gap-2 shrink-0">
-                                                    <span className={`text-[10px] font-bold uppercase tracking-widest ${isHigh ? 'text-rose-600' : 'text-amber-600'}`}>{isHigh ? 'High' : 'Med'}</span>
+                                                    <span className={`text-[10px] font-bold uppercase tracking-widest ${isHigh ? 'text-rose-600' : 'text-amber-600'}`}>{gap.severity}</span>
                                                     <button
                                                         type="button"
                                                         onClick={() => openSourceViewer({
                                                             title: 'Compliance Gap Source Details',
                                                             sourceChunks: gap.source_chunks,
-                                                            highlightValues: [gap.issue, gap.regulation_requirement, gap.policy_current_state],
+                                                            highlightValues: [gap.title, gap.description, gap.recommendation],
                                                         })}
                                                         disabled={!Array.isArray(gap.source_chunks) || gap.source_chunks.length === 0}
                                                         className="inline-flex items-center gap-1 rounded-full border border-slate-200 px-2.5 py-1 text-[11px] font-bold uppercase tracking-wider text-slate-600 transition-colors hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
@@ -961,15 +1062,15 @@ export default function Dashboard() {
                             </thead>
                             <tbody className="divide-y divide-slate-100">
                                 {hasActions ? actionsData.slice(0,5).map((action, i) => {
-                                    const status = (action?.status || '').toLowerCase();
-                                    const statusText = formatStatus(action?.status);
+                                        const status = String(action?.status || '').toLowerCase();
+                                        const statusText = formatStatus(action?.status);
                                     const statusColor = status === 'completed' ? 'text-emerald-700 bg-emerald-100/50 border border-emerald-200' 
                                             : status === 'in_progress' || status === 'in-progress' ? 'text-violet-700 bg-violet-100/50 border border-violet-200'
                                             : status === 'overdue' || status === 'blocked' ? 'text-rose-700 bg-rose-100/50 border border-rose-200'
                                             : 'text-amber-700 bg-amber-100/50 border border-amber-200';
-                                    const title = action?.title || action?.step || action?.action || action?.action_required || 'Untitled action';
-                                    const description = action?.description || action?.summary || 'No description provided';
-                                    const deadline = action?.deadline || action?.timeline || action?.due_date || 'TBD';
+                                        const title = action?.title;
+                                        const description = action?.description;
+                                        const deadline = action?.deadline;
                                     const actionSourceChunks = Array.isArray(action?.source_chunks) ? action.source_chunks : [];
                                     
                                     return (

@@ -236,7 +236,7 @@ def call_groq_with_retry(
     """Retry across available keys before giving up."""
     if not _key_states:
         logger.error("No Groq API keys configured")
-        return json.dumps({"changes": [], "error": "No Groq API keys configured"})
+        raise RuntimeError("No Groq API keys configured")
 
     last_error: Exception | None = None
     timeout_retry_used = False
@@ -262,6 +262,7 @@ def call_groq_with_retry(
             )
 
             attempted_key_indices.add(key_index)
+            print("LLM CALLED")
             print(f"[LLM] Using key index: {key_index}")
             print(f"[LLM] Retry attempt: {attempt}")
             logger.info(
@@ -288,6 +289,7 @@ def call_groq_with_retry(
             )
 
             _release_api_key(api_key, success=True)
+            print("LLM RESPONSE:", result)
             return result
         except Exception as exc:
             last_error = exc
@@ -311,7 +313,8 @@ def call_groq_with_retry(
 
     if last_error:
         logger.error("Groq failed after retries=%s error=%s", retries, last_error)
-    return json.dumps({"changes": [], "error": "LLM failed"})
+        raise RuntimeError(f"LLM failed after retries: {last_error}")
+    raise RuntimeError("LLM failed after retries")
 
 
 def llm_chat_completion(

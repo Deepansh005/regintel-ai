@@ -2772,19 +2772,19 @@ def analyze_impact(impact_input: dict) -> dict:
     """Analyze impacts based on detected changes and compliance gaps."""
     try:
         if not impact_input or not isinstance(impact_input, dict):
-            return _schema_response()
+            raise ValueError("impact_input is required for impact generation")
 
         changes = impact_input.get("changes", [])
         gaps = impact_input.get("compliance_gaps", [])
 
         if not changes and not gaps:
-            return _schema_response()
+            raise ValueError("No input changes/gaps available for impact generation")
 
         combined_text = ""
         if changes:
-            combined_text += "CHANGES DETECTED:\n" + json.dumps(changes[:3], indent=2) + "\n\n"
+            combined_text += "OLD POLICY / CHANGE BASELINE:\n" + json.dumps(changes[:3], indent=2) + "\n\n"
         if gaps:
-            combined_text += "COMPLIANCE GAPS FOUND:\n" + json.dumps(gaps[:3], indent=2)
+            combined_text += "REGULATION DELTAS / COMPLIANCE GAPS:\n" + json.dumps(gaps[:3], indent=2)
 
         combined_text = _filter_text_for_llm(combined_text, label="impacts")
 
@@ -2792,7 +2792,15 @@ def analyze_impact(impact_input: dict) -> dict:
 Analyze business and compliance impacts from detected changes and gaps.
 Return only concrete, non-vague impacts.
 
-CONTEXT:
+Analyze these documents:
+
+OLD POLICY:
+{_truncate_text_for_tokens(json.dumps(changes[:3], indent=2) if changes else "")}
+
+NEW POLICY:
+{_truncate_text_for_tokens(json.dumps(gaps[:3], indent=2) if gaps else "")}
+
+REGULATION:
 {_truncate_text_for_tokens(combined_text)}
 
 Return ONLY valid JSON. No explanation. No markdown. No text outside JSON.\n\nJSON schema:
@@ -2807,50 +2815,92 @@ Return ONLY valid JSON. No explanation. No markdown. No text outside JSON.\n\nJS
 }}
 """
         prompt = _ensure_prompt_token_safe(prompt)
+        print("LLM CALLED")
         result = _safe_call(prompt=prompt, max_tokens=BATCH_OUTPUT_TOKENS, retries=2, initial_backoff=4)
+        print("LLM RESPONSE:", result)
 
         if isinstance(result, dict) and "error" not in result and isinstance(result.get("impacts"), list):
             deduped_impacts = deduplicate_items(_normalize_impacts_list(result.get("impacts", [])[:3]))
             logger.info("deduplicated_output=%s", json.dumps({"impacts": deduped_impacts}, ensure_ascii=True)[:1200])
             return _schema_response(impacts=deduped_impacts)
 
-        return _schema_response()
+        raise RuntimeError("Impact LLM response invalid or empty")
 
     except Exception as e:
         logger.error("analyze_impact failed: %s", e)
-        return _schema_response()
+        raise
 
 
 def generate_actions(actions_input: dict) -> dict:
     """Generate actionable remediation steps from compliance gaps and impacts."""
     try:
         if not actions_input or not isinstance(actions_input, dict):
-            return _schema_response()
+            raise ValueError("actions_input is required for action generation")
 
         changes = actions_input.get("changes", [])
         gaps = actions_input.get("compliance_gaps", [])
         impacts = actions_input.get("impacts", [])
 
         if not gaps and not impacts:
-            fallback_actions = default_actions().get("actions", [])
-            return _schema_response(actions=fallback_actions)
+            raise ValueError("No compliance gaps/impacts available for action generation")
+
+        gap_evidence = []
+        for gap in gaps[:6]:
+            if not isinstance(gap, dict):
+                continue
+            gap_evidence.append(
+                {
+                    "title": str(gap.get("title") or gap.get("issue") or gap.get("gap") or "").strip(),
+                    "severity": _normalize_severity(gap.get("severity") or gap.get("risk") or gap.get("risk_level")),
+                    "description": str(gap.get("description") or gap.get("reason") or "").strip(),
+                    "recommendation": str(gap.get("recommendation") or "").strip(),
+                }
+            )
+
+        impact_evidence = []
+        for impact in impacts[:6]:
+            if not isinstance(impact, dict):
+                continue
+            impact_evidence.append(
+                {
+                    "title": str(impact.get("title") or impact.get("area") or "").strip(),
+                    "severity": _normalize_severity(impact.get("severity") or impact.get("impact_level")),
+                    "description": str(impact.get("description") or impact.get("summary") or impact.get("reason") or "").strip(),
+                    "departments": impact.get("impacted_departments") if isinstance(impact.get("impacted_departments"), list) else [],
+                }
+            )
+
+        required_actions = max(1, min(6, len(gap_evidence) or len(impact_evidence) or 1))
 
         combined_text = ""
         if changes:
-            combined_text += "CHANGES:\n" + json.dumps(changes[:2], indent=2) + "\n\n"
+            combined_text += "OLD POLICY:\n" + json.dumps(changes[:2], indent=2) + "\n\n"
         if gaps:
-            combined_text += "COMPLIANCE GAPS:\n" + json.dumps(gaps[:4], indent=2) + "\n\n"
+            combined_text += "COMPLIANCE GAPS:\n" + json.dumps(gap_evidence, indent=2) + "\n\n"
         if impacts:
-            combined_text += "IMPACTS:\n" + json.dumps(impacts[:4], indent=2)
+            combined_text += "IMPACTS:\n" + json.dumps(impact_evidence, indent=2)
 
         combined_text = _filter_text_for_llm(combined_text, label="actions")
 
         prompt = f"""
-Generate 2-6 concrete and implementable compliance actions.
-Each action must map to one or more compliance gaps and impacts.
-No placeholders. No vague wording.
+Generate exactly {required_actions} concrete and implementable compliance actions.
+If compliance gaps are present, return one action per gap, capped at 6.
+Do not return an empty actions array.
+Each action must map to a specific gap title, recommendation, or impact from the evidence.
+No placeholders. No vague wording. No generic policy advice.
 
-CONTEXT:
+Analyze these documents:
+
+OLD POLICY:
+{_truncate_text_for_tokens(json.dumps(changes[:2], indent=2) if changes else "")}
+
+COMPLIANCE GAPS:
+{_truncate_text_for_tokens(json.dumps(gap_evidence, indent=2) if gap_evidence else "")}
+
+IMPACTS:
+{_truncate_text_for_tokens(json.dumps(impact_evidence, indent=2) if impact_evidence else "")}
+
+EVIDENCE SUMMARY:
 {_truncate_text_for_tokens(combined_text)}
 
 Return ONLY valid JSON. No explanation. No markdown. No text outside JSON.\n\nJSON schema:
@@ -2868,20 +2918,22 @@ Return ONLY valid JSON. No explanation. No markdown. No text outside JSON.\n\nJS
 }}
 """
         prompt = _ensure_prompt_token_safe(prompt)
+        print("LLM CALLED")
         result = _safe_call(prompt=prompt, max_tokens=BATCH_OUTPUT_TOKENS, retries=2, initial_backoff=4)
+        print("LLM RESPONSE:", result)
 
         if isinstance(result, dict) and "error" not in result and isinstance(result.get("actions"), list):
             deduped_actions = deduplicate_items(result.get("actions", [])[:6])
             if not deduped_actions:
-                deduped_actions = default_actions().get("actions", [])
+                raise RuntimeError("Action LLM returned empty actions")
             logger.info("deduplicated_output=%s", json.dumps({"actions": deduped_actions}, ensure_ascii=True)[:1200])
             return _schema_response(actions=deduped_actions)
 
-        return _schema_response(actions=default_actions().get("actions", []))
+        raise RuntimeError("Action LLM response invalid or empty")
 
     except Exception as e:
         logger.error("generate_actions failed: %s", e)
-        return _schema_response(actions=default_actions().get("actions", []))
+        raise
 
 
 

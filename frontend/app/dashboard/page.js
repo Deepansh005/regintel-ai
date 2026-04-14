@@ -10,12 +10,9 @@ import {
 } from "lucide-react";
 import { 
     ResponsiveContainer, PieChart, Pie, Cell, LineChart, Line, XAxis, YAxis, 
-    CartesianGrid, Tooltip, BarChart, Bar, Legend
+    CartesianGrid, Tooltip, BarChart, Bar
 } from "recharts";
 import SourceViewerModal from "../../components/SourceViewerModal";
-
-const COLORS = ['#7C3AED', '#A78BFA', '#C4B5FD', '#EDE9FE'];
-const RISK_COLORS = { 'Low': '#10B981', 'Medium': '#F59E0B', 'High': '#EF4444' };
 
 function toArray(value) {
     return Array.isArray(value) ? value : [];
@@ -32,69 +29,6 @@ function parseMaybeJson(value) {
     } catch (error) {
         return value;
     }
-}
-
-function deepParse(value, maxDepth = 2) {
-    let current = value;
-    for (let i = 0; i < maxDepth; i += 1) {
-        if (current && typeof current === 'object' && typeof current.raw === 'string') {
-            const parsedRaw = parseMaybeJson(current.raw);
-            if (parsedRaw !== current.raw) {
-                current = parsedRaw;
-                continue;
-            }
-        }
-
-        const parsed = parseMaybeJson(current);
-        if (parsed === current) break;
-        current = parsed;
-    }
-    return current;
-}
-
-function findFirstArrayCandidate(value, seen = new Set()) {
-    const parsed = deepParse(value, 3);
-
-    if (Array.isArray(parsed)) {
-        return parsed;
-    }
-
-    if (!parsed || typeof parsed !== 'object') {
-        return null;
-    }
-
-    if (seen.has(parsed)) {
-        return null;
-    }
-
-    seen.add(parsed);
-
-    const keys = [
-        'actions',
-        'generated_actions',
-        'remediation_actions',
-        'result',
-        'analysis',
-        'data',
-        'raw',
-    ];
-
-    for (const key of keys) {
-        if (parsed[key] === undefined || parsed[key] === null) {
-            continue;
-        }
-
-        const candidate = findFirstArrayCandidate(parsed[key], seen);
-        if (Array.isArray(candidate)) {
-            return candidate;
-        }
-    }
-
-    if (Array.isArray(parsed.actions)) {
-        return parsed.actions;
-    }
-
-    return null;
 }
 
 function unwrapTaskResult(source) {
@@ -387,12 +321,6 @@ function getCompletionScore(result) {
     return Math.max(0, 100 - penalty);
 }
 
-function formatAxisLabel(label, max = 18) {
-    const text = (label ?? '').toString().trim();
-    if (text.length <= max) return text;
-    return `${text.slice(0, max - 1)}…`;
-}
-
 const HIGHLIGHT_STOP_WORDS = new Set([
     'the', 'and', 'for', 'with', 'that', 'this', 'from', 'into', 'have', 'has', 'are', 'was', 'were', 'will', 'shall',
     'must', 'should', 'may', 'can', 'could', 'would', 'does', 'done', 'your', 'their', 'them', 'its', 'about', 'into',
@@ -593,7 +521,6 @@ export default function Dashboard() {
     console.log("IMPACTS:", normalizedData?.impacts);
     const impactSystems = [...new Set(toArray(impactsArray).map((impact) => impact?.department).filter(Boolean))];
     const impactSourceChunks = [...new Set(toArray(impactsArray).flatMap((impact) => toArray(impact?.source_chunks)).filter(Boolean))];
-    const impactDepartments = normalizeImpactedDepartments(normalizedData, impactsArray);
     const departmentRisk = normalizeDepartmentRisk(normalizedData, impactsArray);
     const actionsData = normalizeActions(normalizedData);
     const complianceTrendData = normalizeComplianceTrend(normalizedData);

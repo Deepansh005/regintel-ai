@@ -9,8 +9,6 @@ from db.database import (
     get_all_tasks,
     clear_task_history,
     delete_old_tasks,
-    get_cached_result,
-    update_task,
 )
 from app.services.task_worker import process_task
 
@@ -164,17 +162,7 @@ async def upload_documents(
         mode,
     )
 
-    cached = get_cached_result(combined_hash)
-    if cached:
-        create_task(task_id, file_hash=combined_hash)
-        update_task(task_id, status="completed", result=cached)
-        return {
-            "task_id": task_id,
-            "status": "completed",
-            "cached": True,
-            "result": cached,
-        }
-
+    # Force fresh processing for every upload request; never reuse cached task output.
     create_task(task_id, file_hash=combined_hash)
     background_tasks.add_task(process_task, task_id, file_paths, file_hashes)
 

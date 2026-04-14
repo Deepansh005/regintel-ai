@@ -53,6 +53,40 @@ CONDITION_SIGNAL_TERMS = (
     "within",
 )
 
+FIELD_NORMALIZATION_RULES = [
+    ("Dividend Payout Cap", [r"dividend", r"payout|cap|limit"]),
+    ("STR Reporting Timeline", [r"str|suspicious transaction", r"report|reporting|timeline|deadline|day"]),
+    ("CET1 Ratio Eligibility", [r"cet1|common equity tier\s*1", r"eligib|threshold|bucket|ratio"]),
+    ("Regulatory Reporting Requirement", [r"report|reporting|disclosure|filing", r"shall|must|required|within"]),
+    ("Eligibility Condition", [r"eligib|condition|criteria|qualif"]),
+    ("Restriction or Prohibition", [r"prohibit|restriction|shall not|must not|not allowed"]),
+    ("PAT-Based Payout Formula", [r"pat|profit after tax", r"formula|ratio|payout|distribution"]),
+    ("Regulatory Limit Threshold", [r"threshold|limit|ceiling|cap|not exceed|max(?:imum)?"]),
+    ("Capital Adequacy Requirement", [r"crar|capital adequacy|capital to risk|tier\s*1|tier\s*2"]),
+    ("NPA Classification Rule", [r"npa|non-performing asset|overdue", r"classif|stage|bucket|aging"]),
+    ("Provisioning Requirement", [r"provision|provisioning|expected credit loss|ecl", r"percent|%|minimum"]),
+    ("Exposure Limit", [r"exposure|single borrower|group borrower|large exposure", r"limit|cap|ceiling|%"]),
+    ("KYC Periodicity Requirement", [r"kyc|know your customer", r"periodic|periodicity|refresh|update|year|month"]),
+    ("AML-CFT Monitoring Requirement", [r"aml|cft|anti[-\s]?money|terror", r"monitor|screen|surveillance|transaction"]),
+    ("Board Approval Requirement", [r"board|committee|governance|approval", r"approve|ratify|sanction|required"]),
+    ("Return Filing Timeline", [r"return|filing|submission", r"within|day|days|month|timeline|deadline"]),
+]
+
+FIELD_ALIAS_NORMALIZATION = [
+    (r"\bdividend\s+(?:payout\s+)?cap\b|\bpayout\s+cap\b", "Dividend Payout Cap"),
+    (r"\bstr\b.*\b(?:timeline|deadline|reporting)\b|\bsuspicious\s+transaction\s+report", "STR Reporting Timeline"),
+    (r"\bcet1\b.*\b(?:eligib|threshold|bucket|ratio)\b|\bcommon\s+equity\s+tier\s*1\b", "CET1 Ratio Eligibility"),
+    (r"\bpat\b.*\b(?:formula|ratio|payout)\b|\bprofit\s+after\s+tax\b", "PAT-Based Payout Formula"),
+    (r"\bcrar\b|\bcapital\s+adequacy\b|\btier\s*1\b", "Capital Adequacy Requirement"),
+    (r"\bnpa\b|\bnon[-\s]?performing\s+asset\b", "NPA Classification Rule"),
+    (r"\bprovision(?:ing)?\b|\becl\b|\bexpected\s+credit\s+loss\b", "Provisioning Requirement"),
+    (r"\bexposure\s+limit\b|\bsingle\s+borrower\b|\bgroup\s+borrower\b", "Exposure Limit"),
+    (r"\bkyc\b|\bknow\s+your\s+customer\b", "KYC Periodicity Requirement"),
+    (r"\baml\b|\bcft\b|\banti[-\s]?money\b", "AML-CFT Monitoring Requirement"),
+    (r"\bboard\s+approval\b|\bcommittee\s+approval\b", "Board Approval Requirement"),
+    (r"\breturn\s+filing\b|\bfiling\s+timeline\b|\bsubmission\s+deadline\b", "Return Filing Timeline"),
+]
+
 
 class UnifiedResponseSchema(BaseModel):
     changes: list[dict] = Field(default_factory=list)
@@ -2058,6 +2092,20 @@ def _normalize_change_summary_text(value: str) -> str:
     return text
 
 
+def _normalize_field_label(value: str) -> str:
+    text = _normalize_change_summary_text(value)
+    lowered = text.lower()
+
+    for alias_pattern, canonical in FIELD_ALIAS_NORMALIZATION:
+        if re.search(alias_pattern, lowered, re.IGNORECASE):
+            return canonical
+
+    for canonical, patterns in FIELD_NORMALIZATION_RULES:
+        if all(re.search(pattern, lowered, re.IGNORECASE) for pattern in patterns):
+            return canonical
+    return text[:140]
+
+
 def _clean_detected_changes(changes: list[dict], max_items: int = 10) -> list[dict]:
     """Return only strict high-quality changes in {type, field, old, new} shape."""
     normalized_items = []
@@ -2389,6 +2437,7 @@ def detect_changes(old_blocks: Any, new_blocks: Any, policy_blocks: Any = None) 
                 continue
 
             field = trim_text(str(item.get("field") or item.get("statement") or "").strip(), 140)
+            field = _normalize_field_label(field)
             old_value = str(item.get("old") if item.get("old") is not None else item.get("old_text") or "").strip()
             new_value = str(item.get("new") if item.get("new") is not None else item.get("new_text") or "").strip()
             evidence = trim_text(str(item.get("evidence") or item.get("statement") or "").strip(), 220)
@@ -2415,9 +2464,7 @@ def detect_changes(old_blocks: Any, new_blocks: Any, policy_blocks: Any = None) 
         seen = set()
         for item in mapped_changes:
             key = (
-                str(item.get("type") or "").strip().lower(),
                 _normalize_change_text(str(item.get("field") or "")),
-                _normalize_change_text(str(item.get("old") or "")),
                 _normalize_change_text(str(item.get("new") or "")),
             )
             if key in seen:
@@ -2430,6 +2477,7 @@ def detect_changes(old_blocks: Any, new_blocks: Any, policy_blocks: Any = None) 
                 old_text = str(pair.get("old") or "").strip()
                 new_text = str(pair.get("new") or "").strip()
                 field = str(pair.get("new_heading") or pair.get("old_heading") or "Regulatory requirement").strip()
+                field = _normalize_field_label(field)
                 if not new_text:
                     continue
                 inferred_type = "modified_requirement" if old_text else "missing_requirement"
@@ -2442,9 +2490,7 @@ def detect_changes(old_blocks: Any, new_blocks: Any, policy_blocks: Any = None) 
                     "source": "RBI",
                 }
                 key = (
-                    str(candidate.get("type") or "").strip().lower(),
                     _normalize_change_text(str(candidate.get("field") or "")),
-                    _normalize_change_text(str(candidate.get("old") or "")),
                     _normalize_change_text(str(candidate.get("new") or "")),
                 )
                 if key in seen:

@@ -158,14 +158,14 @@ def generate_actions(changes: list[Any]) -> list[dict]:
         if any(token in lowered for token in ["cet1", "dividend", "payout", "pat", "threshold", "%", "limit"]):
             actions.append(
                 {
-                    "action": f"Implement rule-engine validation for {field} using RBI thresholds.",
+                    "action": f"Implement automated rule validation in the finance decision workflow for {field} using RBI thresholds.",
                     "owner": "Finance",
                     "priority": "High",
                 }
             )
             actions.append(
                 {
-                    "action": f"Update compliance controls and test cases for {field}.",
+                    "action": f"Update compliance control matrix and regression test pack for {field} in policy governance process.",
                     "owner": "Compliance",
                     "priority": "High",
                 }
@@ -173,14 +173,14 @@ def generate_actions(changes: list[Any]) -> list[dict]:
         elif any(token in lowered for token in ["str", "report", "timeline", "day", "deadline"]):
             actions.append(
                 {
-                    "action": f"Configure automated reporting workflow deadlines for {field}.",
+                    "action": f"Configure automated deadline checks in transaction monitoring/reporting system for {field}.",
                     "owner": "Compliance",
                     "priority": "High",
                 }
             )
             actions.append(
                 {
-                    "action": f"Deploy operational SLA checks to enforce {field} submission timelines.",
+                    "action": f"Deploy SLA escalation in operations workflow to enforce {field} submission timelines.",
                     "owner": "Operations",
                     "priority": "Medium",
                 }
@@ -188,14 +188,14 @@ def generate_actions(changes: list[Any]) -> list[dict]:
         elif any(token in lowered for token in ["eligib", "condition", "restriction", "prohibit"]):
             actions.append(
                 {
-                    "action": f"Implement eligibility and restriction controls aligned with {field}.",
+                    "action": f"Implement eligibility and restriction checks in risk control process aligned with {field}.",
                     "owner": "Risk",
                     "priority": "High",
                 }
             )
             actions.append(
                 {
-                    "action": f"Revise policy clauses to align legal wording for {field}.",
+                    "action": f"Revise policy clause text in compliance documentation process to align legal wording for {field}.",
                     "owner": "Compliance",
                     "priority": "Medium",
                 }
@@ -203,7 +203,7 @@ def generate_actions(changes: list[Any]) -> list[dict]:
         else:
             actions.append(
                 {
-                    "action": f"Update policy implementation controls for {field}.",
+                    "action": f"Update implementation controls in policy management process for {field}.",
                     "owner": "Compliance",
                     "priority": "Medium",
                 }
@@ -213,7 +213,7 @@ def generate_actions(changes: list[Any]) -> list[dict]:
             actions.insert(
                 0,
                 {
-                    "action": f"Remove or justify policy-only rule for {field} with RBI mapping evidence.",
+                    "action": f"Remove or justify policy-only rule for {field} in policy governance workflow with RBI mapping evidence.",
                     "owner": "Compliance",
                     "priority": "Medium",
                 },

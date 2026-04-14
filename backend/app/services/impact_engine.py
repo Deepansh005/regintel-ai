@@ -164,32 +164,32 @@ def generate_impacts(changes: list[Any]) -> list[dict]:
         if any(token in lowered for token in ["dividend", "payout", "cet1", "pat", "%", "threshold", "limit"]):
             impacts.extend(
                 [
-                    {"department": "Finance", "impact_level": "High", "reason": f"Finance must enforce RBI value changes for {field}."},
-                    {"department": "Risk", "impact_level": "High", "reason": f"Risk controls must be recalibrated to the updated {field} rule."},
-                    {"department": "Compliance", "impact_level": "High", "reason": f"Compliance monitoring must verify adherence to {field}."},
+                    {"department": "Finance", "impact_level": "High", "reason": f"Violation of RBI regulation for {field} can trigger supervisory findings; this can directly affect dividend decisions and capital planning."},
+                    {"department": "Risk", "impact_level": "High", "reason": f"RBI rule non-compliance in {field} can create audit flags and elevated control risk, impacting risk appetite governance."},
+                    {"department": "Compliance", "impact_level": "High", "reason": f"RBI requirement for {field} must be enforced; failure can lead to compliance breaches and regulatory escalation."},
                 ]
             )
         elif any(token in lowered for token in ["report", "reporting", "str", "day", "timeline", "deadline"]):
             impacts.extend(
                 [
-                    {"department": "Compliance", "impact_level": "High", "reason": f"Compliance must enforce regulatory reporting obligations for {field}."},
-                    {"department": "Operations", "impact_level": "Medium", "reason": f"Operations workflow timelines must satisfy {field}."},
-                    {"department": "Legal", "impact_level": "Medium", "reason": f"Legal exposure increases if {field} reporting is missed."},
+                    {"department": "Compliance", "impact_level": "High", "reason": f"Breach of RBI reporting regulation for {field} can attract penalties and adverse supervisory remarks, affecting compliance posture."},
+                    {"department": "Operations", "impact_level": "Medium", "reason": f"RBI timeline non-adherence in {field} can delay operational reporting flows and increase exception handling workload."},
+                    {"department": "Legal", "impact_level": "Medium", "reason": f"Missing RBI-mandated reporting in {field} raises legal exposure and can impact audit defensibility."},
                 ]
             )
         elif any(token in lowered for token in ["eligib", "condition", "restriction", "prohibit", "must not", "shall not"]):
             impacts.extend(
                 [
-                    {"department": "Compliance", "impact_level": "High", "reason": f"Eligibility and restriction controls must reflect {field}."},
-                    {"department": "Legal", "impact_level": "Medium", "reason": f"Policy wording and legal controls must align to {field}."},
-                    {"department": "Risk", "impact_level": "Medium", "reason": f"Control failures are possible if {field} remains misaligned."},
+                    {"department": "Compliance", "impact_level": "High", "reason": f"RBI eligibility/restriction rule for {field} must be implemented; failure can create direct non-compliance findings."},
+                    {"department": "Legal", "impact_level": "Medium", "reason": f"Non-alignment with RBI wording for {field} can weaken legal defensibility and policy enforceability."},
+                    {"department": "Risk", "impact_level": "Medium", "reason": f"RBI control condition mismatch in {field} can increase operational and conduct risk."},
                 ]
             )
         else:
             impacts.extend(
                 [
-                    {"department": "Compliance", "impact_level": "Medium", "reason": f"Compliance framework must be updated for {field}."},
-                    {"department": "Operations", "impact_level": "Low", "reason": f"Operational SOPs require updates tied to {field}."},
+                    {"department": "Compliance", "impact_level": "Medium", "reason": f"RBI regulatory update for {field} requires control updates; otherwise compliance exceptions can rise."},
+                    {"department": "Operations", "impact_level": "Low", "reason": f"RBI-driven process update for {field} affects SOP execution and documentation quality."},
                 ]
             )
 

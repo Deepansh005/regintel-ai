@@ -156,7 +156,18 @@ function normalizeGaps(payload) {
     const root = unwrapTaskResult(payload)?.compliance_gaps ?? unwrapTaskResult(payload) ?? [];
     if (typeof root === 'string') return [];
     if (Array.isArray(root)) {
-        return root;
+        const seen = new Map();
+        return root
+            .filter((item) => item && typeof item === 'object')
+            .map((item, index) => {
+                const base = String(item.id || item.issue || item.gap || `gap-${index}`).trim();
+                const count = (seen.get(base) || 0) + 1;
+                seen.set(base, count);
+                return {
+                    ...item,
+                    _ui_key: `${base}-${count}`,
+                };
+            });
     }
     return [];
 }
@@ -176,7 +187,18 @@ function normalizeActions(payload) {
         return [];
     }
 
-    return actions;
+    const seen = new Map();
+    return actions
+        .filter((item) => item && typeof item === 'object')
+        .map((item, index) => {
+            const base = String(item.id || item.step || item.title || item.action || `action-${index}`).trim();
+            const count = (seen.get(base) || 0) + 1;
+            seen.set(base, count);
+            return {
+                ...item,
+                _ui_key: `${base}-${count}`,
+            };
+        });
 }
 
 function normalizeComplianceTrend(payload) {
@@ -838,7 +860,7 @@ export default function Dashboard() {
                                 const color = isHigh ? 'bg-rose-500' : 'bg-amber-500';
                                 const bg = isHigh ? 'bg-rose-50' : 'bg-amber-50';
                                 return (
-                                    <div key={gap.id || gap.issue || `${currentTaskId || 'gap'}-${i}`} className={`p-4 rounded-[12px] border ${isHigh ? 'border-rose-100' : 'border-amber-100'} ${bg} flex items-start gap-4`}>
+                                    <div key={gap._ui_key || `${currentTaskId || 'gap'}-${i}`} className={`p-4 rounded-[12px] border ${isHigh ? 'border-rose-100' : 'border-amber-100'} ${bg} flex items-start gap-4`}>
                                         <div className="mt-1"><AlertTriangle className={`w-5 h-5 ${isHigh ? 'text-rose-500' : 'text-amber-500'}`} /></div>
                                         <div className="flex-1">
                                             <p className="text-sm font-bold text-slate-900 leading-tight mb-1">{gap.issue || gap.gap_identified || gap.gap || "Policy alignment gap identified"}</p>
@@ -951,7 +973,7 @@ export default function Dashboard() {
                                     const actionSourceChunks = Array.isArray(action?.source_chunks) ? action.source_chunks : [];
                                     
                                     return (
-                                        <tr key={action.id || action.step || action.title || `${currentTaskId || 'action'}-${i}`} className="hover:bg-slate-50 transition-colors">
+                                        <tr key={action._ui_key || `${currentTaskId || 'action'}-${i}`} className="hover:bg-slate-50 transition-colors">
                                             <td className="px-6 py-4">
                                                 <p className="text-sm font-bold text-slate-900">{title}</p>
                                             </td>

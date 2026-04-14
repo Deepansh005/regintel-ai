@@ -24,11 +24,21 @@ RULE_SPLIT_REGEX = re.compile(r"(?<=[.!?])\s+|\n+")
 VALUE_PERCENT_REGEX = re.compile(r"\b\d+(?:\.\d+)?\s*%\b", re.IGNORECASE)
 VALUE_TIMELINE_REGEX = re.compile(r"\b\d+\s*(?:day|days|month|months|year|years)\b", re.IGNORECASE)
 VALUE_NUMBER_REGEX = re.compile(r"\b\d+(?:\.\d+)?\b")
+VALUE_BPS_REGEX = re.compile(r"\b\d+(?:\.\d+)?\s*bps\b", re.IGNORECASE)
+VALUE_AMOUNT_REGEX = re.compile(r"\b(?:inr|rs\.?|rupees?)\s*\d+(?:,\d{3})*(?:\.\d+)?(?:\s*(?:crore|lakh|million|billion))?\b", re.IGNORECASE)
 
 RULE_FIELD_PATTERNS = [
     ("Dividend payout cap", [r"dividend", r"payout|distribution", r"cap|limit|not exceed|up to|maximum"]),
     ("CET1 ratio eligibility", [r"cet1|common equity tier\s*1", r"eligib|minimum|threshold|bucket"]),
     ("STR reporting timeline", [r"str|suspicious transaction report", r"report|timeline|submit|file", r"day|days|month|months"]),
+    ("Capital adequacy requirement", [r"capital adequacy|crar|tier\s*1|tier\s*2", r"minimum|threshold|ratio|%"]),
+    ("Exposure limit", [r"exposure|single borrower|group borrower|large exposure", r"limit|cap|ceiling|%"]),
+    ("NPA classification rule", [r"npa|non[-\s]?performing asset|overdue", r"classif|stage|bucket|aging"]),
+    ("Provisioning requirement", [r"provision|ecl|expected credit loss", r"minimum|percent|%|ratio"]),
+    ("KYC periodicity requirement", [r"kyc|know your customer", r"periodic|periodicity|refresh|update|year|month"]),
+    ("AML-CFT monitoring requirement", [r"aml|cft|anti[-\s]?money|terror", r"monitor|screen|surveillance|transaction"]),
+    ("Board approval requirement", [r"board|committee|approval|governance", r"approve|ratify|required|sanction"]),
+    ("Return filing timeline", [r"return|filing|submission|report", r"within|timeline|deadline|day|days|month"]),
     ("Reporting requirement", [r"report|reporting|return filing|disclosure", r"shall|must|required|within"]),
     ("Eligibility condition", [r"eligib|qualif|criteria|condition", r"shall|must|required|subject to"]),
     ("Restriction or prohibition", [r"prohibit|not allowed|shall not|must not|restricted|restriction"]),
@@ -163,9 +173,17 @@ def _normalize_value(value: str) -> str:
 
 def _extract_value(sentence: str) -> str:
     sentence_text = str(sentence or "")
+    bps = VALUE_BPS_REGEX.search(sentence_text)
+    if bps:
+        return bps.group(0).strip()
+
     percent = VALUE_PERCENT_REGEX.search(sentence_text)
     if percent:
         return percent.group(0).strip()
+
+    amount = VALUE_AMOUNT_REGEX.search(sentence_text)
+    if amount:
+        return amount.group(0).strip()
 
     timeline = VALUE_TIMELINE_REGEX.search(sentence_text)
     if timeline:

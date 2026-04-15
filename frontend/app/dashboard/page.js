@@ -92,23 +92,27 @@ function normalizeChanges(payload) {
         .map((item, index) => {
             const type = normalizeChangeType(item?.type);
             const title = firstNonEmpty(item?.title, item?.field, item?.section, item?.category);
-            const summary = firstNonEmpty(
+            const description = firstNonEmpty(
+                item?.description,
                 item?.summary,
                 item?.evidence,
                 item?.change,
                 item?.old || item?.new ? `${String(item?.old || '').trim()} -> ${String(item?.new || '').trim()}` : ''
             );
+            const severity = normalizeLevel(item?.severity, 'Medium');
             const source = firstNonEmpty(item?.source, item?.type === 'extra_policy_rule' ? 'POLICY' : 'RBI');
 
-            if (!title || !summary || !source) {
+            if (!title || !description || !source) {
                 console.warn('Skipped invalid change item from backend:', { index, item });
                 return null;
             }
 
             return {
                 title,
+                description,
+                severity,
                 type,
-                summary,
+                summary: description,
                 source,
                 source_chunks: Array.isArray(item?.source_chunks) ? item.source_chunks : [],
             };
@@ -137,7 +141,8 @@ function normalizeGaps(payload) {
             );
             const recommendation = firstNonEmpty(
                 item?.recommendation,
-                item?.regulation_requirement ? `Align policy controls to: ${String(item?.regulation_requirement).trim()}` : ''
+                item?.regulation_requirement ? `Align policy controls to: ${String(item?.regulation_requirement).trim()}` : '',
+                title ? `Update controls to address ${title}.` : ''
             );
 
             if (!title || !severity || !description || !recommendation) {
@@ -169,22 +174,32 @@ function normalizeImpacts(payload) {
         .filter((item) => item && typeof item === 'object')
         .flatMap((item, index) => {
             const severity = normalizeLevel(item?.severity || item?.impact_level, 'Medium');
-            const reason = firstNonEmpty(item?.reason, item?.description, item?.summary);
+            const riskLevel = String(item?.risk_level || severity).trim().toLowerCase() || 'medium';
+            const description = firstNonEmpty(
+                item?.reason,
+                item?.description,
+                item?.summary,
+                item?.impact,
+                item?.gap_reference ? `Impact linked to ${String(item?.gap_reference).trim()}` : ''
+            );
 
             const explicitDepartment = firstNonEmpty(item?.department);
             const deptList = explicitDepartment
                 ? [explicitDepartment]
                 : toArray(item?.impacted_departments).map((d) => String(d || '').trim()).filter(Boolean);
 
-            if (!reason || deptList.length === 0) {
+            const normalizedDepartments = deptList.length > 0 ? deptList : [firstNonEmpty(item?.department, 'Compliance')];
+
+            if (!description) {
                 console.warn('Skipped invalid impact item from backend:', { index, item });
                 return [];
             }
 
-            return deptList.map((department) => ({
+            return normalizedDepartments.map((department) => ({
                 department,
                 severity,
-                reason,
+                risk_level: riskLevel,
+                description,
                 source_chunks: Array.isArray(item?.source_chunks) ? item.source_chunks : [],
             }));
         })
@@ -200,10 +215,10 @@ function normalizeActions(payload) {
         .map((item, index) => {
             const title = firstNonEmpty(item?.title, item?.action, item?.step, item?.action_required);
             const description = firstNonEmpty(item?.description, item?.summary, title ? `Execute: ${title}` : '');
-            const department = firstNonEmpty(item?.department, item?.owner);
+            const department = firstNonEmpty(item?.department, item?.owner, 'Compliance');
             const priority = normalizeLevel(item?.priority, 'Medium');
 
-            if (!title || !description || !department || !priority) {
+            if (!title || !description) {
                 console.warn('Skipped invalid action item from backend:', { index, item });
                 return null;
             }
@@ -408,6 +423,7 @@ export default function Dashboard() {
     const loadDashboardData = async (activeRef = { current: true }) => {
         const response = await fetchTasks();
         console.log("Dashboard API response:", response);
+        console.log("API RESPONSE:", response);
 
         if (!activeRef.current) return;
 
@@ -422,6 +438,7 @@ export default function Dashboard() {
             const normalizedResult = unwrapTaskResult(completed.result);
             console.log("Dashboard selected task result:", normalizedResult);
             console.log("FULL API:", normalizedResult);
+            console.log("API RESPONSE:", completed?.result);
             console.log("ACTIONS PATH CHECK:", {
                 actions1: normalizedResult?.actions,
                 actions2: normalizedResult?.result?.actions,
@@ -514,6 +531,18 @@ export default function Dashboard() {
 
     // DYNAMIC DATA MAPPING (BACKEND-DRIVEN)
     const normalizedData = unwrapTaskResult(data);
+    const changes = Array.isArray(normalizedData?.changes) ? normalizedData.changes : [];
+    const gaps = Array.isArray(normalizedData?.compliance_gaps) ? normalizedData.compliance_gaps : [];
+    const impacts = Array.isArray(normalizedData?.impacts) ? normalizedData.impacts : [];
+    const actions = Array.isArray(normalizedData?.actions) ? normalizedData.actions : [];
+    console.log("API RESPONSE:", normalizedData);
+    console.log("API RESPONSE FIELDS:", {
+        changes: changes.length,
+        compliance_gaps: gaps.length,
+        impacts: impacts.length,
+        actions: actions.length,
+    });
+
     const changesArray = normalizeChanges(normalizedData);
     const changesList = changesArray;
     const gapsArray = normalizeGaps(normalizedData);
@@ -849,7 +878,10 @@ export default function Dashboard() {
                                         </div>
 
                                         <p className="text-sm text-gray-600 mt-1">
-                                            {item.summary}
+                                            {item.description}
+                                        </p>
+                                        <p className="text-[11px] font-semibold uppercase tracking-wider text-slate-500 mt-1">
+                                            {item.severity}
                                         </p>
                                     </div>
                                 ))
@@ -953,6 +985,27 @@ export default function Dashboard() {
                             )}
                         </div>
                     </div>
+                </div>
+
+                <div className="group bg-white/70 backdrop-blur-xl rounded-2xl border border-white shadow-[0_4px_24px_rgba(0,0,0,0.02)] p-6 mb-8 hover:shadow-[0_8px_30px_rgba(0,0,0,0.06)] transition-all duration-300">
+                    <h3 className="font-bold text-slate-900 mb-1 drop-shadow-sm">Impacts</h3>
+                    <p className="text-sm text-slate-500 mb-4">Operational impact details from analysis</p>
+                    {impactsArray.length === 0 ? (
+                        <p className="text-sm text-slate-500">No impacts</p>
+                    ) : (
+                        <div className="space-y-3">
+                            {impactsArray.map((impact, i) => (
+                                <div key={`${impact.department || 'impact'}-${i}`} className="rounded-xl border border-slate-200 px-4 py-3 bg-slate-50/60">
+                                    <p className="text-sm text-slate-700">{impact.description}</p>
+                                    <div className="mt-2 flex items-center gap-2 text-xs font-semibold text-slate-600">
+                                        <span>{impact.department}</span>
+                                        <span className="text-slate-400">|</span>
+                                        <span>{impact.risk_level}</span>
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+                    )}
                 </div>
 
                 <div className="group bg-white/70 backdrop-blur-xl rounded-2xl border border-white shadow-[0_4px_24px_rgba(0,0,0,0.02)] p-6 mb-8 hover:shadow-[0_8px_30px_rgba(0,0,0,0.06)] transition-all duration-300">

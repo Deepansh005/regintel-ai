@@ -14,6 +14,8 @@ from db.database import update_task
 from app.services.pdf_service import extract_pdf_pages
 from app.services.ai_service import (
     deduplicate_items,
+    detect_changes,
+    detect_compliance_gaps,
     run_full_analysis,
 )
 from app.services.context_optimizer import optimize_context_chunks
@@ -25,6 +27,10 @@ from app.rag.vector_store import store_chunks
 
 def _tokenize(text: str):
     return set(re.findall(r"[a-z0-9]+", (text or "").lower()))
+
+
+def _normalize_change_text(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip().lower())
 
 
 def _extract_changes(payload):
@@ -969,6 +975,43 @@ def _build_department_risk(results_payload: list[dict]) -> list[dict]:
     return result
 
 
+def _merge_section_payloads(section_name: str, *payloads) -> list[dict]:
+    merged = []
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            continue
+        items = payload.get(section_name)
+        if isinstance(items, list):
+            merged.extend([item for item in items if isinstance(item, dict)])
+    return deduplicate_items(merged)
+
+
+def build_impacts(gaps: list[dict]) -> list[dict]:
+    impacts = []
+    for gap in gaps or []:
+        if not isinstance(gap, dict):
+            continue
+        impact_obj = gap.get("impact") if isinstance(gap.get("impact"), dict) else None
+        if impact_obj is None:
+            impact_obj = _build_fallback_impact(gap)
+        impacts.append(
+            {
+                "gap_id": str(gap.get("gap_id") or gap.get("reference") or "").strip(),
+                "gap_reference": str(gap.get("reference") or gap.get("regulation_reference") or gap.get("gap_id") or "").strip(),
+                "department": str((impact_obj or {}).get("department") or "Compliance").strip(),
+                "risk_level": str((impact_obj or {}).get("risk_level") or (impact_obj or {}).get("severity") or "medium").strip().lower(),
+                "severity": str((impact_obj or {}).get("risk_level") or (impact_obj or {}).get("severity") or "medium").strip().title(),
+                "description": str((impact_obj or {}).get("reason") or (impact_obj or {}).get("description") or gap.get("description") or "").strip(),
+                "reason": str((impact_obj or {}).get("reason") or (impact_obj or {}).get("description") or gap.get("description") or "").strip(),
+                "impact": str((impact_obj or {}).get("reason") or (impact_obj or {}).get("description") or gap.get("description") or "").strip(),
+                "source": str(gap.get("source") or gap.get("regulation_reference") or "Not specified in provided documents").strip(),
+                "based_on_blocks": gap.get("source_blocks") if isinstance(gap.get("source_blocks"), list) else [],
+                "source_chunks": gap.get("source_chunks") if isinstance(gap.get("source_chunks"), list) else [],
+            }
+        )
+    return deduplicate_items([item for item in impacts if isinstance(item, dict)])
+
+
 async def _run_analysis_pipeline(
     mode: str,
     old_context: str,
@@ -982,7 +1025,13 @@ async def _run_analysis_pipeline(
     Dependency-safe flow: changes -> compliance_gaps -> impacts -> actions
     Stage internals remain batched/parallel in ai_service.
     """
-    logger.warning("task_worker._run_analysis_pipeline: unified analysis path")
+    logger.warning(
+        "[FLOW] pipeline_start mode=%s old_blocks=%s new_blocks=%s policy_blocks=%s",
+        mode,
+        len(old_blocks or []),
+        len(new_blocks or []),
+        len(policy_blocks or []),
+    )
     if not old_context or not new_context or not policy_context:
         raise ValueError("Missing input data")
 
@@ -990,7 +1039,27 @@ async def _run_analysis_pipeline(
     if not isinstance(analysis_payload, dict):
         raise RuntimeError("LLM pipeline failed")
 
-    return analysis_payload, analysis_payload, analysis_payload, analysis_payload, []
+    detected_changes = await asyncio.to_thread(detect_changes, old_blocks, new_blocks)
+    merged_changes = _merge_section_payloads("changes", detected_changes, analysis_payload)
+
+    detected_gaps = await asyncio.to_thread(detect_compliance_gaps, new_context, policy_context, merged_changes)
+    merged_gaps = _merge_section_payloads("compliance_gaps", detected_gaps, analysis_payload)
+
+    logger.info(
+        "[FLOW] pipeline_ai_counts changes=%s compliance_gaps=%s impacts=%s actions=%s",
+        len(merged_changes),
+        len(merged_gaps),
+        len(analysis_payload.get("impacts") if isinstance(analysis_payload.get("impacts"), list) else []),
+        len(analysis_payload.get("actions") if isinstance(analysis_payload.get("actions"), list) else []),
+    )
+
+    return (
+        {"changes": merged_changes},
+        {"compliance_gaps": merged_gaps},
+        analysis_payload,
+        analysis_payload,
+        analysis_payload.get("results") if isinstance(analysis_payload.get("results"), list) else [],
+    )
 
 
 def _pick_source_chunks(item_text: str, candidate_chunks: list[dict], max_sources: int = 2):
@@ -1366,9 +1435,14 @@ def process_task(task_id: str, file_paths: dict, file_hashes: dict | None = None
 
         # ✅ VALIDATE THAT WE HAVE CONTENT TO PROCESS
         total_context = len((old_context + new_context + policy_context).replace(" ", "").replace("\n", ""))
-        print("OLD TEXT LENGTH:", len(old_context or ""))
-        print("NEW TEXT LENGTH:", len(new_context or ""))
-        print("REG TEXT LENGTH:", len(policy_context or ""))
+        print("OLD:", len(old_context or ""))
+        print("NEW:", len(new_context or ""))
+        print("POLICY:", len(policy_context or ""))
+        if not old_context or not new_context or not policy_context:
+            raise ValueError("One or more documents are empty after extraction")
+        docs_identical = _normalize_change_text(old_context) == _normalize_change_text(new_context)
+        if docs_identical:
+            logger.warning("OLD and NEW regulation documents are identical after normalization")
         if total_context < 100:
             error_msg = "Insufficient meaningful content extracted from PDFs to perform analysis"
             failed_response = _default_response_template()
@@ -1431,6 +1505,18 @@ def process_task(task_id: str, file_paths: dict, file_hashes: dict | None = None
         impacts_items_raw = deduplicate_items(_normalize_impact(impacts_payload))
         actions_items_raw = deduplicate_items(_normalize_actions(actions_payload))
 
+        print("CHANGES RAW:", changes_items_raw)
+        print("GAPS RAW:", gaps_items_raw)
+        print("ACTIONS RAW:", actions_items_raw)
+
+        logger.info(
+            "[FLOW] ai_raw_counts changes=%s compliance_gaps=%s impacts=%s actions=%s",
+            len(changes_items_raw),
+            len(gaps_items_raw),
+            len(impacts_items_raw),
+            len(actions_items_raw),
+        )
+
         old_lookup = _build_source_lookup(old_source_chunks)
         new_lookup = _build_source_lookup(new_source_chunks)
         policy_lookup = _build_source_lookup(policy_source_chunks)
@@ -1447,6 +1533,9 @@ def process_task(task_id: str, file_paths: dict, file_hashes: dict | None = None
 
         changes_items_raw = _attach_source_chunks(changes_items_raw, change_candidates, ["field", "new", "evidence"], max_sources=2)
         gaps_items_raw = _attach_source_chunks(gaps_items_raw, gap_candidates, ["issue", "regulation_requirement", "policy_current_state"], max_sources=2)
+
+        if gaps_items_raw and not impacts_items_raw:
+            impacts_items_raw = build_impacts(gaps_items_raw)
 
         actions_items_raw = _align_actions_to_gaps(actions_items_raw, gaps_items_raw)
 
@@ -1475,6 +1564,46 @@ def process_task(task_id: str, file_paths: dict, file_hashes: dict | None = None
         gaps_items = _to_structured_gaps(gaps_items_raw)
         impacts_items = _to_structured_impacts(impacts_items_raw, gaps_items)
         actions_items = _to_structured_actions(actions_items_raw, gaps_items)
+
+        if not docs_identical and len(changes_items) == 0:
+            changes_items = [
+                {
+                    "title": "Regulation Updated",
+                    "description": "Differences detected but parsing failed",
+                    "type": "modified",
+                    "summary": "Differences detected but parsing failed",
+                    "source": "RBI/POLICY",
+                    "source_blocks": [],
+                    "source_chunks": [],
+                }
+            ]
+
+        if not docs_identical and len(gaps_items) == 0:
+            gaps_items = [
+                {
+                    "gap_id": "GAP-FALLBACK-001",
+                    "gap": "Detected regulatory differences require policy review",
+                    "reference": "Not specified in provided documents",
+                    "regulation_reference": "Not specified in provided documents",
+                    "title": "Policy alignment review required",
+                    "severity": "medium",
+                    "description": "Differences were detected between OLD and NEW regulations, but detailed mapping was incomplete.",
+                    "recommendation": "Review policy controls and align with updated regulation.",
+                    "source": "Not specified in provided documents",
+                    "policy_blocks": [],
+                    "regulation_blocks": [],
+                    "source_blocks": [],
+                    "policy_evidence": "Not specified in provided documents",
+                    "regulation_evidence": "Not specified in provided documents",
+                    "source_chunks": [],
+                }
+            ]
+
+        if len(impacts_items) == 0 and len(gaps_items) > 0:
+            impacts_items = _to_structured_impacts(build_impacts(gaps_items), gaps_items)
+
+        if len(actions_items) == 0 and len(gaps_items) > 0:
+            actions_items = _to_structured_actions([], gaps_items)
 
         lookup_list = [old_lookup, new_lookup, policy_lookup]
         for gap in gaps_items:
@@ -1515,7 +1644,6 @@ def process_task(task_id: str, file_paths: dict, file_hashes: dict | None = None
 
         response = {
             "changes": strict_changes,
-            "gaps": strict_gaps,
             "changes_detailed": changes_items,
             "compliance_gaps": gaps_items,
             "impacts": impacts_items,
@@ -1535,7 +1663,15 @@ def process_task(task_id: str, file_paths: dict, file_hashes: dict | None = None
                 for file_name, items in per_pdf_block_map.items()
             },
         }
+
+        assert isinstance(response.get("changes"), list)
+        assert isinstance(response.get("compliance_gaps"), list)
+        assert isinstance(response.get("impacts"), list)
+        assert isinstance(response.get("actions"), list)
+
         response["file_clause_map"] = response.get("file_block_map", {})
+        print("FINAL JSON:", response)
+        logger.info("dashboard_final_response=%s", json.dumps(response, ensure_ascii=True)[:2000])
         # ✅ SAVE SUCCESS
         update_task(task_id, status="completed", result=response)
 

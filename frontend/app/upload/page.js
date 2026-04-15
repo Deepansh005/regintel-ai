@@ -187,6 +187,7 @@ export default function UploadPage() {
                 
                 const data = await res.json();
                 console.log("FULL API RESPONSE:", data);
+                console.log("API RESPONSE:", data);
 
                 if (data?.result && typeof data.result === "object") {
                     setAnalysis((prev) => {

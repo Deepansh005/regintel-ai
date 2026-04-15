@@ -1438,6 +1438,78 @@ def _safe_call(
     raise RuntimeError(f"Groq failed after retries: {last_error}")
 
 
+def safe_json_parse(response) -> dict | None:
+    if response is None:
+        return None
+    if isinstance(response, dict):
+        return response
+    if isinstance(response, list):
+        return {"changes": response}
+
+    parsed = _extract_first_valid_json(str(response))
+    if isinstance(parsed, dict):
+        return parsed
+    if isinstance(parsed, list):
+        return {"changes": parsed}
+    return None
+
+
+def _strict_detect_changes_prompt(old_text: str, new_text: str) -> str:
+    return f"""
+Compare OLD vs NEW regulation.
+
+Return ONLY JSON:
+{{
+  "changes": [
+    {{
+      "title": "",
+      "description": "",
+      "severity": "low | medium | high"
+    }}
+  ]
+}}
+
+Rules:
+- MUST return at least 1 change if documents differ.
+- Return empty changes only if OLD and NEW are identical.
+- No text outside JSON.
+
+OLD:
+{_truncate_text_for_tokens(old_text, max_tokens=MAX_INPUT_TOKENS)}
+
+NEW:
+{_truncate_text_for_tokens(new_text, max_tokens=MAX_INPUT_TOKENS)}
+""".strip()
+
+
+def _to_internal_change_shape(items: list[dict]) -> list[dict]:
+    normalized: list[dict] = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or item.get("field") or "Regulatory change").strip()
+        description = str(item.get("description") or item.get("summary") or item.get("evidence") or "Change detected").strip()
+        severity = str(item.get("severity") or "medium").strip().lower()
+        if severity not in {"low", "medium", "high"}:
+            severity = "medium"
+        normalized.append(
+            {
+                "type": "modified_requirement",
+                "field": trim_text(title, 140),
+                "old": None,
+                "new": trim_text(description, 220),
+                "evidence": trim_text(description, 220),
+                "severity": severity,
+                "title": trim_text(title, 140),
+                "description": trim_text(description, 240),
+                "source": "RBI",
+                "source_blocks": item.get("source_blocks") if isinstance(item.get("source_blocks"), list) else [],
+                "source_chunks": item.get("source_chunks") if isinstance(item.get("source_chunks"), list) else [],
+            }
+        )
+    return deduplicate_items(normalized)
+
+
 def _optional_summary(label: str, text: str, call_budget: int) -> str:
     """Build a compact context summary when input is large and there is call budget left."""
     value = (text or "").strip()
@@ -2926,15 +2998,24 @@ def detect_changes(old_blocks: Any, new_blocks: Any, policy_blocks: Any = None) 
                 if isinstance(block, dict) and str(block.get("content") or "").strip()
             ]
 
-        rbi_items = _normalize_blocks(new_blocks, prefix="rbi")
-        policy_items = _normalize_blocks(policy_blocks, prefix="policy") if policy_blocks is not None else _normalize_blocks(old_blocks, prefix="policy")
+        old_items = _normalize_blocks(old_blocks, prefix="old")
+        new_items = _normalize_blocks(new_blocks, prefix="new")
 
-        print("Using semantic blocks:", len(rbi_items) + len(policy_items))
+        if policy_blocks is not None:
+            logger.warning("detect_changes received policy blocks; ignoring them to preserve OLD vs NEW-only comparison")
 
-        if not rbi_items or not policy_items:
+        print("Using semantic blocks:", len(old_items) + len(new_items))
+
+        if not old_items or not new_items:
             return _default_changes_response()
 
-        matches = match_blocks(policy_items, rbi_items)
+        old_text = "\n\n".join(str(item.get("content") or "") for item in old_items if isinstance(item, dict)).strip()
+        new_text = "\n\n".join(str(item.get("content") or "") for item in new_items if isinstance(item, dict)).strip()
+
+        if not old_text or not new_text:
+            return _default_changes_response()
+
+        matches = match_blocks(old_items, new_items)
         matched_blocks = to_matched_blocks_payload(matches)
 
         matched_count = len([item for item in matched_blocks if str(item.get("match_type") or "") == "matched"])
@@ -3091,6 +3172,45 @@ def detect_changes(old_blocks: Any, new_blocks: Any, policy_blocks: Any = None) 
                     break
 
         cleaned_changes = deduped[:15]
+
+        strict_prompt = _strict_detect_changes_prompt(old_text, new_text)
+        strict_response = _safe_call(
+            prompt=strict_prompt,
+            max_tokens=700,
+            retries=2,
+            initial_backoff=2,
+            expect_schema=False,
+        )
+        parsed = safe_json_parse(strict_response)
+        if not parsed:
+            print("❌ JSON PARSE FAILED:", strict_response)
+            strict_changes = []
+        else:
+            strict_changes = parsed.get("changes", []) if isinstance(parsed.get("changes"), list) else []
+
+        strict_internal = _to_internal_change_shape([item for item in strict_changes if isinstance(item, dict)])
+        if strict_internal:
+            cleaned_changes.extend(strict_internal)
+
+        cleaned_changes = deduplicate_items(cleaned_changes)
+
+        docs_differ = _normalize_change_text(old_text) != _normalize_change_text(new_text)
+        if docs_differ and not cleaned_changes:
+            cleaned_changes = [
+                {
+                    "type": "modified_requirement",
+                    "field": "Regulation Updated",
+                    "old": None,
+                    "new": "Differences detected but parsing failed",
+                    "evidence": "Differences detected but parsing failed",
+                    "severity": "medium",
+                    "title": "Regulation Updated",
+                    "description": "Differences detected but parsing failed",
+                    "source": "RBI",
+                    "source_blocks": [],
+                    "source_chunks": [],
+                }
+            ]
 
         print("\n✅ FINAL:")
         print(f"Changes: {len(cleaned_changes)}")

@@ -2,14 +2,13 @@ import logging
 import os
 import threading
 import time
-import json
 import random
 from dataclasses import dataclass
 from typing import Optional
 
 from groq import Groq
 
-from app.core.config import GROQ_API_KEYS
+from app.core.config import GROQ_API_KEYS, refresh_groq_settings
 
 logger = logging.getLogger(__name__)
 
@@ -37,23 +36,44 @@ class KeyState:
     cooldown_until: float = 0.0
     last_used_at: float = 0.0
     total_uses: int = 0
+    invalid: bool = False
+    invalid_reason: str = ""
 
 
 _key_lock = threading.Lock()
-GROQ_KEYS = [
-    os.getenv("GROQ_API_KEY_1"),
-    os.getenv("GROQ_API_KEY_2"),
-    os.getenv("GROQ_API_KEY_3"),
-]
-_resolved_keys = [key for key in GROQ_KEYS if key] or [key for key in GROQ_API_KEYS if key]
-_key_states: list[KeyState] = [KeyState(api_key=key, index=index) for index, key in enumerate(_resolved_keys)]
-_round_robin_index = 0
+_key_states: list[KeyState] = []
 
-logger.info(
-    "Groq key pool loaded: count=%s keys=%s",
-    len(_key_states),
-    [_mask_key(state.api_key) for state in _key_states],
-)
+
+def _rebuild_key_pool(keys: list[str]) -> None:
+    normalized = []
+    for key in keys or []:
+        value = str(key or "").strip().strip('"').strip("'")
+        if value and value not in normalized:
+            normalized.append(value)
+
+    global _key_states
+    _key_states = [KeyState(api_key=key, index=index) for index, key in enumerate(normalized)]
+
+    logger.info(
+        "Groq key pool loaded: count=%s keys=%s",
+        len(_key_states),
+        [_mask_key(state.api_key) for state in _key_states],
+    )
+
+
+def reload_key_pool(force_reload_env: bool = True) -> list[dict]:
+    if force_reload_env:
+        _, refreshed_keys = refresh_groq_settings()
+    else:
+        refreshed_keys = GROQ_API_KEYS
+
+    with _key_lock:
+        _rebuild_key_pool(refreshed_keys)
+
+    return key_health_snapshot()
+
+
+_rebuild_key_pool(GROQ_API_KEYS)
 
 
 def _now() -> float:
@@ -61,7 +81,16 @@ def _now() -> float:
 
 
 def _is_available(state: KeyState, now: float) -> bool:
-    return now >= state.cooldown_until
+    return (not state.invalid) and now >= state.cooldown_until
+
+
+def _state_label(state: KeyState, now: float | None = None) -> str:
+    ts = now if now is not None else _now()
+    if state.invalid:
+        return "INVALID"
+    if ts < state.cooldown_until:
+        return "COOLDOWN"
+    return "ACTIVE"
 
 
 def _select_state(
@@ -100,8 +129,12 @@ def _min_cooldown_wait_seconds() -> float:
     if not _key_states:
         return 0.0
     now = _now()
-    waits = [max(0.0, state.cooldown_until - now) for state in _key_states]
+    waits = [max(0.0, state.cooldown_until - now) for state in _key_states if not state.invalid]
     return min(waits) if waits else 0.0
+
+
+def _has_active_or_cooldown_keys() -> bool:
+    return any(not state.invalid for state in _key_states)
 
 
 def get_next_api_key(
@@ -129,6 +162,9 @@ def get_next_api_key(
                     state.active_calls,
                 )
                 return state.api_key, state.index
+
+            if not _has_active_or_cooldown_keys():
+                raise RuntimeError("No valid Groq API keys available (all keys invalid)")
 
         if not wait_for_key:
             raise RuntimeError("No Groq API key currently available")
@@ -172,6 +208,8 @@ def _release_api_key(api_key: str, success: bool = True, cooldown_seconds: int |
         for state in _key_states:
             if state.api_key == api_key:
                 state.active_calls = max(0, state.active_calls - 1)
+                if state.invalid:
+                    return
                 if success:
                     state.failures = 0
                 else:
@@ -181,11 +219,21 @@ def _release_api_key(api_key: str, success: bool = True, cooldown_seconds: int |
                 return
 
 
-def _mark_key_cooldown(api_key: str, reason: str, cooldown_seconds: int | None = None) -> None:
+def _mark_key_cooldown(
+    api_key: str,
+    reason: str,
+    cooldown_seconds: int | None = None,
+    force: bool = False,
+) -> None:
     with _key_lock:
         for state in _key_states:
             if state.api_key == api_key:
+                state.active_calls = max(0, state.active_calls - 1)
+                if state.invalid:
+                    return
                 state.failures += 1
+                if force:
+                    state.failures = max(state.failures, KEY_FAILURE_THRESHOLD)
                 if state.failures >= KEY_FAILURE_THRESHOLD:
                     state.cooldown_until = _now() + (cooldown_seconds or KEY_COOLDOWN_SECONDS)
                 logger.warning(
@@ -198,9 +246,37 @@ def _mark_key_cooldown(api_key: str, reason: str, cooldown_seconds: int | None =
                 return
 
 
+def _mark_key_invalid(api_key: str, reason: str) -> None:
+    with _key_lock:
+        for state in _key_states:
+            if state.api_key == api_key:
+                state.active_calls = max(0, state.active_calls - 1)
+                state.invalid = True
+                state.invalid_reason = reason
+                state.cooldown_until = 0.0
+                state.failures = max(state.failures + 1, KEY_FAILURE_THRESHOLD)
+                logger.error(
+                    "Groq key index=%s marked INVALID reason=%s key=%s",
+                    state.index,
+                    reason,
+                    _mask_key(state.api_key),
+                )
+                return
+
+
 def _should_retry_with_next_key(exc: Exception) -> bool:
     message = str(exc).lower()
     return "429" in message or "rate_limit_exceeded" in message or "quota" in message or "tokens per minute" in message
+
+
+def _is_auth_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return (
+        "401" in message
+        or "invalid api key" in message
+        or "authentication" in message
+        or "unauthorized" in message
+    )
 
 
 def _is_timeout_error(exc: Exception) -> bool:
@@ -240,7 +316,8 @@ def call_groq_with_retry(
 
     last_error: Exception | None = None
     timeout_retry_used = False
-    retries = max(1, min(2, retries))
+    # Ensure we can try every available key at least once before failing.
+    retries = max(1, retries, len(_key_states))
     max_tokens = min(max_tokens, MAX_OUTPUT_TOKENS)
     prepared_messages = _prepare_messages_for_llm(messages, enforce_json=True)
     attempted_key_indices: set[int] = set()
@@ -296,7 +373,9 @@ def call_groq_with_retry(
             logger.warning("Groq call failed attempt=%s/%s error=%s", attempt, retries, exc)
 
             if api_key:
-                if _should_retry_with_next_key(exc):
+                if _is_auth_error(exc):
+                    _mark_key_invalid(api_key, reason=f"auth_error:{exc}")
+                elif _should_retry_with_next_key(exc):
                     _mark_key_cooldown(api_key, reason=str(exc))
                 elif _is_timeout_error(exc) and not timeout_retry_used:
                     timeout_retry_used = True
@@ -304,7 +383,7 @@ def call_groq_with_retry(
                 else:
                     _release_api_key(api_key, success=False)
 
-            if _should_retry_with_next_key(exc) or (_is_timeout_error(exc) and timeout_retry_used):
+            if _is_auth_error(exc) or _should_retry_with_next_key(exc) or (_is_timeout_error(exc) and timeout_retry_used):
                 continue
 
             if attempt < retries:
@@ -348,7 +427,7 @@ def llm_chat_completion(
         )
     except Exception as exc:
         logger.error("Groq call for task '%s' failed: %s", task_type, exc)
-        return json.dumps({"changes": [], "error": "LLM failed"})
+        raise RuntimeError(f"Pipeline failed before LLM response: {exc}") from exc
 
 
 def key_health_snapshot() -> list[dict]:
@@ -358,14 +437,54 @@ def key_health_snapshot() -> list[dict]:
             {
                 "index": state.index,
                 "masked_key": _mask_key(state.api_key),
-                "available": now >= state.cooldown_until,
-                "cooldown_remaining": max(0.0, round(state.cooldown_until - now, 2)),
+                "available": (not state.invalid) and now >= state.cooldown_until,
+                "state": _state_label(state, now),
+                "cooldown_remaining": max(0.0, round(state.cooldown_until - now, 2)) if not state.invalid else 0.0,
                 "failures": state.failures,
                 "total_uses": state.total_uses,
                 "active_calls": state.active_calls,
+                "invalid_reason": state.invalid_reason,
             }
             for state in _key_states
         ]
+
+
+def validate_keys_on_startup(model: str = GROQ_MODEL) -> dict:
+    """Perform a lightweight probe for each key and mark unusable keys immediately."""
+    startup_summary = {"total": 0, "usable": 0, "invalid": 0, "cooldown": 0}
+    snapshot = key_health_snapshot()
+    startup_summary["total"] = len(snapshot)
+
+    for state in list(_key_states):
+        masked = _mask_key(state.api_key)
+        try:
+            _ = call_groq(
+                messages=[
+                    {"role": "system", "content": "Return only valid JSON."},
+                    {"role": "user", "content": '{"ok":true}'},
+                ],
+                model=model,
+                api_key=state.api_key,
+                max_tokens=16,
+                temperature=0.0,
+            )
+            startup_summary["usable"] += 1
+            logger.info("Startup validation success for key index=%s key=%s", state.index, masked)
+        except Exception as exc:
+            if _is_auth_error(exc):
+                _mark_key_invalid(state.api_key, reason=f"startup_auth_error:{exc}")
+                startup_summary["invalid"] += 1
+            elif _should_retry_with_next_key(exc):
+                _mark_key_cooldown(state.api_key, reason=f"startup_rate_limit:{exc}", force=True)
+                startup_summary["cooldown"] += 1
+            else:
+                _mark_key_cooldown(state.api_key, reason=f"startup_other_error:{exc}", force=True)
+                startup_summary["cooldown"] += 1
+
+            logger.warning("Startup validation failed for key index=%s key=%s error=%s", state.index, masked, exc)
+
+    logger.info("Groq startup key validation summary=%s", startup_summary)
+    return startup_summary
 
 
 def _call_groq_with_format(

@@ -584,6 +584,7 @@ export default function Dashboard() {
     const hasTrendData = trendData.length > 0;
     const hasImpactData = impactChartData.some((item) => Number(item?.value || 0) > 0);
     const hasActions = actionsData.length > 0;
+    const policyCompliant = changesArray.length === 0 && gapsArray.length === 0 && impactsArray.length === 0 && actionsData.length === 0;
 
     const handleClearHistory = async () => {
         const confirmed = window.confirm("Are you sure you want to delete all task history?");
@@ -654,46 +655,55 @@ export default function Dashboard() {
     };
 
     return (
-        <div className="min-h-screen bg-[#F8FAFC] text-slate-900 font-sans pb-20">
-            <TopNavbar user={user} />
+        <div className="min-h-screen bg-slate-50 text-slate-900 font-sans pb-20 relative overflow-hidden">
+            {/* Ambient Background Enhancements */}
+            <div className="fixed inset-0 pointer-events-none z-0">
+                <div className="absolute inset-0 noise-bg opacity-[0.03] mix-blend-overlay"></div>
+                <div className="absolute top-[-10%] left-[-10%] w-[40vw] h-[40vw] bg-violet-400/20 rounded-full blur-[120px] mix-blend-multiply opacity-50 animate-blob"></div>
+                <div className="absolute top-[20%] right-[-10%] w-[35vw] h-[35vw] bg-cyan-400/20 rounded-full blur-[120px] mix-blend-multiply opacity-50 animate-blob" style={{ animationDelay: '2s' }}></div>
+                <div className="absolute bottom-[-10%] left-[20%] w-[40vw] h-[40vw] bg-rose-400/10 rounded-full blur-[120px] mix-blend-multiply opacity-50 animate-blob" style={{ animationDelay: '4s' }}></div>
+            </div>
 
-            <div className="max-w-[1400px] mx-auto px-6 xs:px-8 mt-8">
+            <div className="relative z-10 w-full h-full">
+                <TopNavbar user={user} />
 
-                {/* Header Section */}
-                <div className="flex flex-col md:flex-row justify-between items-start md:items-end mb-8 gap-4">
-                    <div>
-                        <h1 className="text-[2rem] font-bold tracking-tight text-slate-900 mb-1">Company Dashboard</h1>
-                        <p className="text-slate-500 font-medium">Monitoring circulars and regulatory adherence for RegIntel AI.</p>
-                    </div>
-                    <div className="flex gap-3">
-                        <button
-                            onClick={handleClearHistory}
-                            disabled={isClearingHistory || isDeletingOld}
-                            className="flex items-center gap-2 bg-rose-600 hover:bg-rose-700 disabled:opacity-60 disabled:cursor-not-allowed text-white px-4 py-2.5 rounded-xl text-sm font-semibold shadow-md transition-colors"
-                        >
-                            {isClearingHistory ? <RefreshCw className="w-4 h-4 animate-spin" /> : <XCircle className="w-4 h-4" />}
-                            Clear History
-                        </button>
-                        <button
-                            onClick={handleDeleteOldTasks}
-                            disabled={isClearingHistory || isDeletingOld}
-                            className="flex items-center gap-2 bg-amber-500 hover:bg-amber-600 disabled:opacity-60 disabled:cursor-not-allowed text-white px-4 py-2.5 rounded-xl text-sm font-semibold shadow-md transition-colors"
-                        >
-                            {isDeletingOld ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Clock className="w-4 h-4" />}
-                            Delete Old (7 days)
-                        </button>
-                        <button
-                            onClick={handleReloadData}
-                            disabled={loading}
-                            className="flex items-center gap-2 bg-slate-100 hover:bg-slate-200 disabled:opacity-60 disabled:cursor-not-allowed text-slate-700 px-4 py-2.5 rounded-xl text-sm font-semibold shadow-sm transition-colors"
-                        >
-                            <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
-                            Reload Data
-                        </button>
-                        <Link href="/select-mode" className="flex items-center gap-2 bg-white border border-slate-200 hover:bg-slate-50 px-4 py-2.5 rounded-xl text-sm font-semibold text-slate-700 shadow-sm transition-colors">
-                            <Upload className="w-4 h-4" />
-                            New Analysis
-                        </Link>
+                <div className="max-w-[1400px] mx-auto px-6 xs:px-8 mt-8">
+
+                    {/* Header Section */}
+                    <div className="flex flex-col md:flex-row justify-between items-start md:items-end mb-8 gap-4">
+                        <div className="relative z-10">
+                            <h1 className="text-[2.25rem] font-black tracking-tight text-slate-900 mb-1 drop-shadow-sm">Company Dashboard</h1>
+                            <p className="text-slate-500 font-medium">Monitoring circulars and regulatory adherence for RegIntel AI.</p>
+                        </div>
+                        <div className="flex flex-wrap gap-3 relative z-10">
+                            <button
+                                onClick={handleClearHistory}
+                                disabled={isClearingHistory || isDeletingOld}
+                                className="flex items-center gap-2 bg-white/80 backdrop-blur-md border border-rose-200 hover:bg-rose-50 hover:border-rose-300 disabled:opacity-50 text-rose-600 px-4 py-2.5 rounded-xl text-sm font-bold shadow-[0_2px_10px_rgba(225,29,72,0.05)] hover:shadow-[0_4px_15px_rgba(225,29,72,0.1)] transition-all"
+                            >
+                                {isClearingHistory ? <RefreshCw className="w-4 h-4 animate-spin" /> : <XCircle className="w-4 h-4" />}
+                                Clear History
+                            </button>
+                            <button
+                                onClick={handleDeleteOldTasks}
+                                disabled={isClearingHistory || isDeletingOld}
+                                className="flex items-center gap-2 bg-white/80 backdrop-blur-md border border-amber-200 hover:bg-amber-50 hover:border-amber-300 disabled:opacity-50 text-amber-600 px-4 py-2.5 rounded-xl text-sm font-bold shadow-[0_2px_10px_rgba(217,119,6,0.05)] hover:shadow-[0_4px_15px_rgba(217,119,6,0.1)] transition-all"
+                            >
+                                {isDeletingOld ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Clock className="w-4 h-4" />}
+                                Delete Old (7 days)
+                            </button>
+                            <button
+                                onClick={handleReloadData}
+                                disabled={loading}
+                                className="flex items-center gap-2 bg-white/80 backdrop-blur-md border border-slate-200 hover:bg-slate-50 disabled:opacity-50 text-slate-700 px-4 py-2.5 rounded-xl text-sm font-bold shadow-[0_2px_10px_rgba(0,0,0,0.02)] hover:shadow-[0_4px_15px_rgba(0,0,0,0.06)] transition-all"
+                            >
+                                <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
+                                Reload Data
+                            </button>
+                            <Link href="/select-mode" className="flex items-center gap-2 bg-gradient-to-r from-violet-600 to-indigo-600 hover:from-violet-500 hover:to-indigo-500 text-white px-5 py-2.5 rounded-xl text-sm font-bold shadow-[0_4px_14px_rgba(124,58,237,0.3)] hover:shadow-[0_6px_20px_rgba(124,58,237,0.4)] hover:-translate-y-0.5 transition-all">
+                                <Upload className="w-4 h-4" />
+                                New Analysis
+                            </Link>
                         <div className="relative group/export">
                             <button className="flex items-center gap-2 bg-slate-900 hover:bg-slate-800 text-white px-5 py-2.5 rounded-xl text-sm font-semibold shadow-md transition-all">
                                 <FileText className="w-4 h-4" />
@@ -719,6 +729,12 @@ export default function Dashboard() {
                     </div>
                 )}
 
+                {policyCompliant && (
+                    <div className="mb-6 rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm font-semibold text-emerald-700">
+                        Policy is compliant.
+                    </div>
+                )}
+
                 {/* 1. KPI Row */}
                 <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
                     <KPICard title="Due Today" value={dueTodayCount} icon={<AlertCircle className="w-5 h-5 text-rose-500" />} color="rose" />
@@ -730,46 +746,56 @@ export default function Dashboard() {
                 {/* Main Charts Grid */}
                 <div className="grid lg:grid-cols-3 gap-6 mb-8">
                     {/* 2. Risk Summary Donut */}
-                    <div className="bg-white rounded-2xl p-6 border border-slate-200 shadow-sm flex flex-col hover:shadow-md transition-shadow">
-                        <h3 className="font-bold text-slate-900 mb-1">Overall Risk</h3>
-                        <p className="text-sm text-slate-500 mb-6">Current compliance posture</p>
-                        <div className="flex-grow flex items-center justify-center relative min-h-[200px]">
+                    <div className="group bg-white/70 backdrop-blur-xl rounded-2xl p-6 border border-white shadow-[0_4px_24px_rgba(0,0,0,0.02)] flex flex-col hover:shadow-[0_8px_30px_rgba(0,0,0,0.06)] transition-all duration-300 relative overflow-hidden">
+                        <div className="absolute top-0 right-0 w-32 h-32 bg-gradient-to-br from-rose-500/5 to-transparent rounded-bl-full pointer-events-none"></div>
+                        <h3 className="font-bold text-slate-900 mb-1 drop-shadow-sm">Overall Risk</h3>
+                        <p className="text-sm text-slate-500 mb-6 relative z-10">Current compliance posture</p>
+                        <div className="flex-grow flex items-center justify-center relative min-h-[200px] z-10 group-hover:scale-105 transition-transform duration-500">
                             <ResponsiveContainer width="100%" height="100%">
                                 <PieChart>
-                                    <Pie data={riskData} innerRadius={60} outerRadius={80} paddingAngle={2} dataKey="value" stroke="none">
-                                        {riskData.map((entry, index) => <Cell key={`cell-${index}`} fill={entry.fill} />)}
+                                    <Pie data={riskData} innerRadius={60} outerRadius={80} paddingAngle={4} dataKey="value" stroke="rgba(255,255,255,0.5)" strokeWidth={2} cornerRadius={5} animationDuration={1000} animationEasing="ease-out">
+                                        {riskData.map((entry, index) => <Cell key={`cell-${index}`} fill={entry.fill} className="hover:opacity-80 transition-opacity" />)}
                                     </Pie>
-                                    <Tooltip contentStyle={{ borderRadius: '12px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)' }} />
+                                    <Tooltip contentStyle={{ borderRadius: '16px', border: '1px solid rgba(255,255,255,0.5)', boxShadow: '0 10px 40px -10px rgba(0,0,0,0.1)', background: 'rgba(255,255,255,0.9)', backdropFilter: 'blur(8px)' }} />
                                 </PieChart>
                             </ResponsiveContainer>
                             <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
-                                <span className={`text-2xl font-bold ${overallRisk === 'High' ? 'text-rose-500' : overallRisk === 'Medium' ? 'text-amber-500' : 'text-emerald-500'}`}>{overallRisk}</span>
-                                <span className="text-xs text-slate-500 uppercase tracking-widest font-bold mt-1">Status</span>
+                                <span className={`text-[1.75rem] font-black ${overallRisk === 'High' ? 'text-rose-500 drop-shadow-[0_2px_10px_rgba(244,63,94,0.3)]' : overallRisk === 'Medium' ? 'text-amber-500 drop-shadow-[0_2px_10px_rgba(245,158,11,0.3)]' : 'text-emerald-500 drop-shadow-[0_2px_10px_rgba(16,185,129,0.3)]'}`}>{overallRisk}</span>
+                                <span className="text-[10px] text-slate-400 uppercase tracking-[0.2em] font-extrabold mt-1">Status</span>
                             </div>
                         </div>
                     </div>
 
                     {/* 3. Performance Trend */}
-                    <div className="bg-white rounded-2xl p-6 border border-slate-200 shadow-sm col-span-1 lg:col-span-2 flex flex-col hover:shadow-md transition-shadow">
-                        <h3 className="font-bold text-slate-900 mb-1">Compliance Performance</h3>
+                    <div className="group bg-white/70 backdrop-blur-xl rounded-2xl p-6 border border-white shadow-[0_4px_24px_rgba(0,0,0,0.02)] col-span-1 lg:col-span-2 flex flex-col hover:shadow-[0_8px_30px_rgba(0,0,0,0.06)] transition-all duration-300 relative overflow-hidden">
+                        <div className="absolute top-0 right-0 w-64 h-64 bg-gradient-to-br from-violet-500/5 to-transparent rounded-bl-full pointer-events-none"></div>
+                        <h3 className="font-bold text-slate-900 mb-1 drop-shadow-sm">Compliance Performance</h3>
                         <p className="text-sm text-slate-500 mb-6">7-day adherence trend</p>
                         {hasTrendData ? (
-                            <div className="flex-grow min-h-[200px] w-full">
+                            <div className="flex-grow min-h-[200px] w-full relative z-10">
                                 <ResponsiveContainer width="100%" height="100%">
                                     <LineChart data={trendData} margin={{ top: 30, right: 30, left: 0, bottom: 30 }}>
-                                        <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#E2E8F0" />
-                                        <XAxis dataKey="date" axisLine={{ stroke: '#E2E8F0' }} tickLine={false} tick={{ fontSize: 13, fill: '#64748B', fontWeight: 500 }} padding={{ left: 30, right: 30 }} dy={15} />
+                                        <defs>
+                                            <linearGradient id="colorScore" x1="0" y1="0" x2="0" y2="1">
+                                                <stop offset="5%" stopColor="#8B5CF6" stopOpacity={0.3}/>
+                                                <stop offset="95%" stopColor="#8B5CF6" stopOpacity={0}/>
+                                            </linearGradient>
+                                        </defs>
+                                        <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#E2E8F0" opacity={0.5} />
+                                        <XAxis dataKey="date" axisLine={false} tickLine={false} tick={{ fontSize: 13, fill: '#64748B', fontWeight: 500 }} padding={{ left: 30, right: 30 }} dy={15} />
                                         <YAxis type="number" domain={[0, 100]} ticks={[0, 25, 50, 75, 100]} axisLine={false} tickLine={false} tick={{ fontSize: 13, fill: '#64748B', fontWeight: 500 }} dx={-10} />
                                         <Tooltip
-                                            contentStyle={{ borderRadius: '12px', border: '1px solid #E2E8F0', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)', background: '#fff' }}
-                                            itemStyle={{ color: '#0F172A', fontWeight: 600 }}
+                                            contentStyle={{ borderRadius: '16px', border: '1px solid rgba(255,255,255,0.5)', boxShadow: '0 10px 40px -10px rgba(0,0,0,0.1)', background: 'rgba(255,255,255,0.9)', backdropFilter: 'blur(8px)' }}
+                                            itemStyle={{ color: '#0F172A', fontWeight: 700 }}
+                                            cursor={{ stroke: '#8B5CF6', strokeWidth: 1, strokeDasharray: '4 4' }}
                                         />
-                                        <Line type="monotone" dataKey="score" stroke="#8B5CF6" strokeWidth={3} dot={{ r: 5, fill: '#fff', stroke: '#8B5CF6', strokeWidth: 2 }} activeDot={{ r: 7 }} />
+                                        <Line type="monotone" dataKey="score" stroke="url(#colorScore)" strokeWidth={0} fill="url(#colorScore)" />
+                                        <Line type="monotone" dataKey="score" stroke="#8B5CF6" strokeWidth={4} dot={{ r: 6, fill: '#fff', stroke: '#8B5CF6', strokeWidth: 3 }} activeDot={{ r: 8, fill: '#8B5CF6', stroke: '#fff', strokeWidth: 3 }} animationDuration={1500} animationEasing="ease-in-out" />
                                     </LineChart>
                                 </ResponsiveContainer>
                             </div>
                         ) : (
-                            <div className="flex-grow min-h-[200px] border border-dashed border-slate-200 rounded-xl flex items-center justify-center text-sm font-medium text-slate-500">
+                            <div className="flex-grow min-h-[200px] border border-dashed border-slate-200/60 bg-slate-50/50 rounded-2xl flex items-center justify-center text-sm font-medium text-slate-500 backdrop-blur-sm relative z-10">
                                 No data available
                             </div>
                         )}
@@ -778,7 +804,7 @@ export default function Dashboard() {
 
                 <div className="grid lg:grid-cols-3 gap-6 mb-8">
                     {/* 5. Regulatory Changes List */}
-                    <div className="bg-white rounded-2xl p-6 border border-slate-200 shadow-sm flex flex-col max-h-[400px] overflow-hidden hover:shadow-md transition-shadow">
+                    <div className="group bg-white/70 backdrop-blur-xl rounded-2xl p-6 border border-white shadow-[0_4px_24px_rgba(0,0,0,0.02)] flex flex-col max-h-[400px] hover:shadow-[0_8px_30px_rgba(0,0,0,0.06)] transition-all duration-300">
                         <h3 className="font-bold text-slate-900 mb-1">Regulatory Changes</h3>
                         <p className="text-sm text-slate-500 mb-4">Recent policy deltas from latest analysis</p>
 
@@ -834,7 +860,7 @@ export default function Dashboard() {
                     </div>
 
                     {/* 6. Impact Analysis Horizontal Bar */}
-                    <div className="bg-white rounded-2xl p-6 border border-slate-200 shadow-sm lg:col-span-1 flex flex-col hover:shadow-md transition-shadow">
+                    <div className="group bg-white/70 backdrop-blur-xl rounded-2xl p-6 border border-white shadow-[0_4px_24px_rgba(0,0,0,0.02)] lg:col-span-1 flex flex-col hover:shadow-[0_8px_30px_rgba(0,0,0,0.06)] transition-all duration-300">
                         <div className="flex items-center justify-between gap-3 mb-1">
                             <h3 className="font-bold text-slate-900">Impact Severity</h3>
                             <button
@@ -880,7 +906,7 @@ export default function Dashboard() {
                     </div>
 
                     {/* 4. Compliance Gaps List */}
-                    <div className="bg-white rounded-2xl p-6 border border-slate-200 shadow-sm flex flex-col max-h-[400px] overflow-hidden hover:shadow-md transition-shadow">
+                    <div className="group bg-white/70 backdrop-blur-xl rounded-2xl p-6 border border-white shadow-[0_4px_24px_rgba(0,0,0,0.02)] flex flex-col max-h-[400px] hover:shadow-[0_8px_30px_rgba(0,0,0,0.06)] transition-all duration-300">
                         <h3 className="font-bold text-slate-900 mb-1">Compliance Gaps</h3>
                         <p className="text-sm text-slate-500 mb-4">Urgent review required</p>
                         <div className="overflow-y-auto pr-2 space-y-4">
@@ -929,8 +955,8 @@ export default function Dashboard() {
                     </div>
                 </div>
 
-                <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-6 mb-8 hover:shadow-md transition-shadow">
-                    <h3 className="font-bold text-slate-900 mb-1">Impacted Departments</h3>
+                <div className="group bg-white/70 backdrop-blur-xl rounded-2xl border border-white shadow-[0_4px_24px_rgba(0,0,0,0.02)] p-6 mb-8 hover:shadow-[0_8px_30px_rgba(0,0,0,0.06)] transition-all duration-300">
+                    <h3 className="font-bold text-slate-900 mb-1 drop-shadow-sm">Impacted Departments</h3>
                     <p className="text-sm text-slate-500 mb-4">Teams affected by current regulatory updates</p>
                     {departmentRisk.length > 0 ? (
                         <div className="space-y-3">
@@ -969,7 +995,7 @@ export default function Dashboard() {
                 </div>
 
                 {/* 7. Action Plan / Remediation Timeline */}
-                <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden mb-12 hover:shadow-md transition-shadow">
+                <div className="group bg-white/70 backdrop-blur-xl rounded-2xl border border-white shadow-[0_4px_24px_rgba(0,0,0,0.02)] overflow-hidden mb-12 hover:shadow-[0_8px_30px_rgba(0,0,0,0.06)] transition-all duration-300">
                     <div className="p-6 border-b border-slate-100 flex items-center justify-between">
                         <div>
                             <h3 className="font-bold text-slate-900 mb-1">Remediation Action Plan</h3>
@@ -1049,7 +1075,7 @@ export default function Dashboard() {
                 </div>
 
                 {/* 8. Recent Analysis History Section */}
-                <div id="analysis-history" className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden mb-12 hover:shadow-md transition-shadow">
+                <div id="analysis-history" className="group bg-white/70 backdrop-blur-xl rounded-2xl border border-white shadow-[0_4px_24px_rgba(0,0,0,0.02)] overflow-hidden mb-12 hover:shadow-[0_8px_30px_rgba(0,0,0,0.06)] transition-all duration-300">
                     <div className="p-6 border-b border-slate-100 flex items-center justify-between">
                         <div>
                             <h3 className="font-bold text-slate-900 mb-1">Recent Analysis History</h3>
@@ -1104,6 +1130,7 @@ export default function Dashboard() {
                 </div>
 
             </div>
+            </div>
 
             <SourceViewerModal
                 isOpen={sourceViewer.open}
@@ -1130,24 +1157,25 @@ function TopNavbar({ user }) {
     };
 
     return (
-        <div className="sticky top-0 z-50 w-full bg-white border-b border-slate-200 shadow-sm px-6 h-16 flex items-center justify-between">
+        <div className="sticky top-0 z-50 w-full bg-white/70 backdrop-blur-2xl border-b border-slate-200/60 shadow-[0_2px_20px_rgba(0,0,0,0.02)] px-6 h-18 flex items-center justify-between transition-all duration-300 py-3">
             <div className="flex items-center gap-2.5">
                 <Link href="/dashboard" className="flex items-center gap-2.5 group">
-                    <div className="w-8 h-8 bg-gradient-to-br from-violet-600 to-indigo-600 rounded-lg flex items-center justify-center shadow-md group-hover:scale-105 transition-transform">
-                        <Shield className="w-4 h-4 text-white" />
+                    <div className="w-9 h-9 bg-gradient-to-br from-violet-600 to-indigo-600 rounded-xl flex items-center justify-center shadow-lg shadow-violet-500/30 group-hover:scale-105 group-hover:shadow-violet-500/50 transition-all duration-300 relative overflow-hidden">
+                        <div className="absolute inset-0 bg-white/20 opacity-0 group-hover:opacity-100 transition-opacity"></div>
+                        <Shield className="w-5 h-5 text-white relative z-10" />
                     </div>
-                    <span className="font-bold text-lg tracking-tight text-slate-900 hidden sm:block">RegIntel AI</span>
+                    <span className="font-extrabold text-xl tracking-tight text-slate-900 hidden sm:block group-hover:text-violet-600 transition-colors">RegIntel AI</span>
                 </Link>
             </div>
 
             <div className="flex items-center gap-6 ml-10 hidden lg:flex">
-                <Link href="/select-mode" className="text-sm font-bold text-slate-500 hover:text-violet-600 transition-colors flex items-center gap-2">
+                <Link href="/select-mode" className="text-sm font-bold text-slate-500 hover:text-violet-600 transition-colors flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-violet-50/50">
                     <Upload className="w-4 h-4" />
                     New Analysis
                 </Link>
                 <button
                     onClick={() => document.getElementById('analysis-history')?.scrollIntoView({ behavior: 'smooth' })}
-                    className="text-sm font-bold text-slate-500 hover:text-violet-600 transition-colors flex items-center gap-2"
+                    className="text-sm font-bold text-slate-500 hover:text-violet-600 transition-colors flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-violet-50/50"
                 >
                     <Clock className="w-4 h-4" />
                     History
@@ -1157,24 +1185,24 @@ function TopNavbar({ user }) {
             <div className="flex-1 max-w-sm mx-6 hidden xl:block">
                 <div className="relative group">
                     <Search className="absolute left-3.5 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400 group-focus-within:text-violet-500 transition-colors" />
-                    <input type="text" placeholder="Search..."
-                        className="w-full bg-slate-100 border-none rounded-full py-2.5 pl-10 pr-4 text-sm text-slate-900 font-medium focus:outline-none focus:ring-2 focus:ring-violet-500/20 transition-all placeholder:text-slate-500" />
+                    <input type="text" placeholder="Search insights, documents, gaps..."
+                        className="w-full bg-slate-100/50 border border-slate-200/50 rounded-full py-2.5 pl-10 pr-4 text-sm text-slate-900 font-medium focus:outline-none focus:ring-2 focus:ring-violet-500/20 focus:bg-white transition-all placeholder:text-slate-400 hover:bg-slate-100/80 shadow-inner" />
                 </div>
             </div>
 
             <div className="flex items-center gap-4">
-                <button className="relative p-2 text-slate-500 hover:text-slate-900 transition-colors rounded-full hover:bg-slate-100">
-                    <Bell className="w-5 h-5" />
-                    <span className="absolute top-1.5 right-2 w-2 h-2 bg-rose-500 rounded-full border-2 border-white" />
+                <button className="relative p-2.5 text-slate-500 hover:text-violet-600 transition-all rounded-full hover:bg-violet-50">
+                    <Bell className="w-5 h-5 flex-shrink-0 group-hover:animate-swing" />
+                    <span className="absolute top-2 right-2 w-2 h-2 bg-rose-500 rounded-full border-2 border-white animate-pulse" />
                 </button>
                 <div className="h-6 border-l border-slate-200 hidden sm:block" />
-                <div className="flex items-center gap-3">
+                <div className="flex items-center gap-3 bg-slate-50 hover:bg-slate-100 border border-slate-100 hover:border-slate-200 rounded-full pl-4 pr-1.5 py-1.5 transition-all cursor-pointer">
                     <div className="hidden sm:block text-right">
-                        <p className="text-sm font-bold text-slate-900 leading-tight">{user?.name || "Jane Doe"}</p>
-                        <button onClick={handleLogout} className="text-[10px] font-bold text-violet-600 uppercase tracking-widest mt-0.5 hover:text-violet-700 transition-colors">Log Out</button>
+                        <p className="text-sm font-extrabold text-slate-900 leading-tight">{user?.name || "Jane Doe"}</p>
+                        <button onClick={handleLogout} className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mt-0.5 hover:text-rose-600 transition-colors">Log Out</button>
                     </div>
-                    <div className="w-9 h-9 rounded-full bg-slate-100 flex items-center justify-center border border-slate-200">
-                        <User className="w-4 h-4 text-slate-600" />
+                    <div className="w-9 h-9 rounded-full bg-gradient-to-r from-violet-100 to-indigo-100 flex items-center justify-center border border-white shadow-sm shrink-0">
+                        <User className="w-4 h-4 text-violet-600" />
                     </div>
                 </div>
             </div>
@@ -1184,16 +1212,20 @@ function TopNavbar({ user }) {
 
 function KPICard({ title, value, icon, color }) {
     const bgColors = {
-        rose: 'bg-rose-50', violet: 'bg-violet-50', amber: 'bg-amber-50', emerald: 'bg-emerald-50'
+        rose: 'bg-rose-500/10 text-rose-600 border-rose-500/20',
+        violet: 'bg-violet-500/10 text-violet-600 border-violet-500/20',
+        amber: 'bg-amber-500/10 text-amber-600 border-amber-500/20',
+        emerald: 'bg-emerald-500/10 text-emerald-600 border-emerald-500/20'
     };
     return (
-        <div className="bg-white rounded-2xl p-6 border border-slate-200 shadow-sm flex items-center gap-5 hover:shadow-md transition-shadow">
-            <div className={`w-14 h-14 rounded-[14px] ${bgColors[color]} flex items-center justify-center flex-shrink-0`}>
+        <div className="group bg-white/70 backdrop-blur-xl rounded-2xl p-6 border border-white shadow-[0_4px_24px_rgba(0,0,0,0.02)] flex items-center gap-5 hover:shadow-[0_8px_30px_rgba(0,0,0,0.06)] hover:-translate-y-1 transition-all duration-300 relative overflow-hidden">
+            <div className="absolute top-0 right-0 w-32 h-32 bg-gradient-to-br from-white/40 to-transparent rounded-bl-full pointer-events-none mix-blend-overlay"></div>
+            <div className={`w-14 h-14 rounded-2xl ${bgColors[color]} flex items-center justify-center flex-shrink-0 border shadow-inner group-hover:scale-110 transition-transform duration-300`}>
                 {icon}
             </div>
-            <div>
-                <p className="text-xs font-bold text-slate-500 uppercase tracking-widest mb-1">{title}</p>
-                <p className="text-3xl font-extrabold text-slate-900 tracking-tight">{value}</p>
+            <div className="relative z-10">
+                <p className="text-xs font-bold text-slate-500 uppercase tracking-widest mb-1 group-hover:text-slate-700 transition-colors">{title}</p>
+                <p className="text-3xl font-black text-slate-900 tracking-tight">{value}</p>
             </div>
         </div>
     );

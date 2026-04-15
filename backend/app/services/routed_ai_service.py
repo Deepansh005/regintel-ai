@@ -14,16 +14,11 @@ logger = logging.getLogger(__name__)
 AI_ROUTER_ENABLED = os.getenv("AI_ROUTER_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _safe_fallback_response(endpoint: str) -> dict:
-    if endpoint == "/worker/detect-changes":
-        return {"changes": [], "error": "LLM failed"}
-    if endpoint == "/worker/detect-compliance-gaps":
-        return {"compliance_gaps": [], "error": "LLM failed"}
-    if endpoint == "/worker/generate-impacts":
-        return {"impacts": [], "error": "LLM failed"}
-    if endpoint == "/worker/generate-actions":
-        return {"actions": [], "error": "LLM failed"}
-    return {"error": "LLM failed"}
+def _raise_pipeline_error(endpoint: str, exc: Exception | None = None) -> None:
+    detail = f"Pipeline failed before LLM response (endpoint={endpoint})"
+    if exc is not None:
+        detail = f"{detail}: {exc}"
+    raise RuntimeError(detail)
 
 
 def _run_async(coro):
@@ -43,7 +38,7 @@ def _route_or_fallback(endpoint: str, payload: dict, fallback_fn, *fallback_args
             return fallback_fn(*fallback_args)
         except Exception as exc:
             logger.error("Local fallback failed endpoint=%s error=%s", endpoint, exc)
-            return _safe_fallback_response(endpoint)
+            _raise_pipeline_error(endpoint, exc)
 
     try:
         logger.info("Routing AI request endpoint=%s", endpoint)
@@ -54,7 +49,7 @@ def _route_or_fallback(endpoint: str, payload: dict, fallback_fn, *fallback_args
             return fallback_fn(*fallback_args)
         except Exception as fallback_exc:
             logger.error("Router fallback failed endpoint=%s error=%s", endpoint, fallback_exc)
-            return _safe_fallback_response(endpoint)
+            _raise_pipeline_error(endpoint, fallback_exc)
 
 
 def detect_changes(old_text: str, new_text: str) -> dict:

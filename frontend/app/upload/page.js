@@ -15,7 +15,7 @@ export default function UploadPage() {
     const [user, setUser] = useState(null);
     const [progress, setProgress] = useState(0);
     const [errors, setErrors] = useState({});
-    const [, setResult] = useState({});
+    const [analysis, setAnalysis] = useState({ changes: [], compliance_gaps: [], impacts: [], actions: [] });
     const mode = typeof window !== 'undefined' ? new URLSearchParams(window.location.search).get("mode") || "old" : "old";
 
     // =============================
@@ -99,6 +99,8 @@ export default function UploadPage() {
     const handleSubmit = async () => {
         // Clear previous errors
         setErrors({});
+        setAnalysis({ changes: [], compliance_gaps: [], impacts: [], actions: [] });
+        localStorage.removeItem("analysisData");
 
         // ✅ VALIDATE REQUIRED FILES
         const newErrors = {};
@@ -187,8 +189,14 @@ export default function UploadPage() {
                 console.log("FULL API RESPONSE:", data);
 
                 if (data?.result && typeof data.result === "object") {
-                    setResult((prev) => {
-                        const merged = { ...prev, ...data.result };
+                    setAnalysis((prev) => {
+                        const merged = {
+                            ...prev,
+                            changes: Array.isArray(data.result.changes) ? data.result.changes : (Array.isArray(prev.changes) ? prev.changes : []),
+                            compliance_gaps: Array.isArray(data.result.compliance_gaps) ? data.result.compliance_gaps : (Array.isArray(prev.compliance_gaps) ? prev.compliance_gaps : []),
+                            impacts: Array.isArray(data.result.impacts) ? data.result.impacts : (Array.isArray(prev.impacts) ? prev.impacts : []),
+                            actions: Array.isArray(data.result.actions) ? data.result.actions : (Array.isArray(prev.actions) ? prev.actions : []),
+                        };
                         localStorage.setItem("analysisData", JSON.stringify(merged));
                         return merged;
                     });
@@ -337,7 +345,7 @@ export default function UploadPage() {
 
                 {files.length > 0 && !error && (
                     <p className="text-xs font-semibold text-slate-600 mt-2 text-center break-all px-3">
-                        {files[0].name}{files.length > 1 ? ` + ${files.length - 1} more` : ""}
+                        {files.map((file) => file.name).join(", ")}
                     </p>
                 )}
                 

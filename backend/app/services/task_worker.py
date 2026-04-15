@@ -14,10 +14,7 @@ from db.database import update_task
 from app.services.pdf_service import extract_pdf_pages
 from app.services.ai_service import (
     deduplicate_items,
-    detect_changes,
-    detect_compliance_gaps,
-    analyze_impact as llm_analyze_impact,
-    generate_actions as llm_generate_actions,
+    run_full_analysis,
 )
 from app.services.context_optimizer import optimize_context_chunks
 from app.services.semantic_block_extractor import extract_semantic_blocks, extract_semantic_blocks_from_pages
@@ -254,6 +251,17 @@ _INVALID_TEXT_VALUES = {
     "tbd",
 }
 
+_PLACEHOLDER_REF_VALUES = {
+    "",
+    "-",
+    "n/a",
+    "na",
+    "none",
+    "null",
+    "not specified in provided documents",
+    "not specified",
+}
+
 
 def _clean_text(value, fallback: str) -> str:
     text = str(value or "").strip()
@@ -299,6 +307,222 @@ def _semantic_key(text: str) -> str:
         if token and token not in _SEMANTIC_STOP_WORDS and len(token) > 2
     ]
     return "|".join(sorted(set(tokens))[:20])
+
+
+def _is_placeholder_reference(value: str) -> bool:
+    return str(value or "").strip().lower() in _PLACEHOLDER_REF_VALUES
+
+
+def _best_gap_match(gaps: list[dict], text: str) -> dict | None:
+    target_tokens = _tokenize(text)
+    if not target_tokens:
+        return None
+
+    best_gap = None
+    best_score = -1
+    for gap in gaps or []:
+        if not isinstance(gap, dict):
+            continue
+        gap_text = " ".join(
+            [
+                str(gap.get("gap") or ""),
+                str(gap.get("title") or ""),
+                str(gap.get("description") or ""),
+                str(gap.get("reference") or ""),
+                str(gap.get("regulation_reference") or ""),
+            ]
+        )
+        score = len(target_tokens & _tokenize(gap_text))
+        if score > best_score:
+            best_gap = gap
+            best_score = score
+    return best_gap if best_score > 0 else None
+
+
+def _resolve_gap_link(
+    provided_gap_id: str,
+    provided_gap_reference: str,
+    evidence_text: str,
+    gaps: list[dict],
+) -> tuple[str, str, dict | None]:
+    gap_id = str(provided_gap_id or "").strip()
+    gap_reference = str(provided_gap_reference or "").strip()
+
+    for gap in gaps or []:
+        if not isinstance(gap, dict):
+            continue
+        candidate_id = str(gap.get("gap_id") or "").strip()
+        candidate_ref = str(gap.get("reference") or gap.get("regulation_reference") or "").strip()
+        if gap_id and (gap_id == candidate_id or gap_id == candidate_ref):
+            return candidate_id or candidate_ref, candidate_ref or candidate_id, gap
+        if gap_reference and (gap_reference == candidate_ref or gap_reference == candidate_id):
+            return candidate_id or candidate_ref, candidate_ref or candidate_id, gap
+
+    best = _best_gap_match(gaps, evidence_text)
+    if isinstance(best, dict):
+        candidate_id = str(best.get("gap_id") or "").strip()
+        candidate_ref = str(best.get("reference") or best.get("regulation_reference") or "").strip()
+        return candidate_id or candidate_ref, candidate_ref or candidate_id, best
+
+    return gap_id, gap_reference, None
+
+
+def _chunk_ids_to_block_ids(chunk_ids: list[str], lookups: list[dict]) -> list[str]:
+    block_ids = []
+    seen = set()
+    for chunk_id in chunk_ids or []:
+        if not chunk_id:
+            continue
+        for lookup in lookups:
+            record = lookup.get(chunk_id) if isinstance(lookup, dict) else None
+            if not isinstance(record, dict):
+                continue
+            block_id = str(record.get("block_id") or "").strip()
+            if block_id and block_id not in seen:
+                seen.add(block_id)
+                block_ids.append(block_id)
+    return block_ids
+
+
+def _sanitize_results_payload(results_payload: list[dict], gaps: list[dict]) -> list[dict]:
+    if not isinstance(results_payload, list):
+        return []
+
+    valid_ids = {
+        str((gap or {}).get("gap_id") or "").strip()
+        for gap in gaps or []
+        if isinstance(gap, dict)
+    }
+    valid_refs = {
+        str((gap or {}).get("reference") or (gap or {}).get("regulation_reference") or "").strip()
+        for gap in gaps or []
+        if isinstance(gap, dict)
+    }
+
+    if not valid_ids and not valid_refs:
+        return []
+
+    cleaned = []
+    for entry in results_payload:
+        if not isinstance(entry, dict):
+            continue
+        impacts = entry.get("impacts") if isinstance(entry.get("impacts"), list) else []
+        actions = entry.get("actions") if isinstance(entry.get("actions"), list) else []
+
+        filtered_impacts = []
+        for impact in impacts:
+            if not isinstance(impact, dict):
+                continue
+            gap_id = str(impact.get("gap_id") or "").strip()
+            gap_ref = str(impact.get("gap_reference") or impact.get("reference") or "").strip()
+            if (gap_id and gap_id in valid_ids) or (gap_ref and gap_ref in valid_refs):
+                filtered_impacts.append(impact)
+
+        filtered_actions = []
+        for action in actions:
+            if not isinstance(action, dict):
+                continue
+            gap_id = str(action.get("gap_id") or "").strip()
+            gap_ref = str(action.get("gap_reference") or action.get("reference") or "").strip()
+            if (gap_id and gap_id in valid_ids) or (gap_ref and gap_ref in valid_refs):
+                filtered_actions.append(action)
+
+        cleaned.append(
+            {
+                "change": entry.get("change") if isinstance(entry.get("change"), dict) else {},
+                "impacts": filtered_impacts,
+                "actions": filtered_actions,
+            }
+        )
+
+    return cleaned
+
+
+def _select_structured_by_gap_refs(items: list[dict], refs: set[str], ids: set[str]) -> list[dict]:
+    selected = []
+    seen = set()
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        gap_id = str(item.get("gap_id") or "").strip()
+        gap_ref = str(item.get("gap_reference") or item.get("reference") or "").strip()
+        if refs and gap_ref not in refs and gap_id not in refs:
+            continue
+        if ids and gap_id not in ids and gap_ref not in ids:
+            continue
+        key = json.dumps(item, sort_keys=True, ensure_ascii=True)
+        if key in seen:
+            continue
+        seen.add(key)
+        selected.append(item)
+    return selected
+
+
+def _build_results_from_structured(
+    results_payload: list[dict],
+    gaps: list[dict],
+    structured_impacts: list[dict],
+    structured_actions: list[dict],
+) -> list[dict]:
+    if not isinstance(results_payload, list):
+        return []
+
+    valid_ids = {
+        str((gap or {}).get("gap_id") or "").strip()
+        for gap in gaps or []
+        if isinstance(gap, dict)
+    }
+    valid_refs = {
+        str((gap or {}).get("reference") or (gap or {}).get("regulation_reference") or "").strip()
+        for gap in gaps or []
+        if isinstance(gap, dict)
+    }
+
+    rebuilt = []
+    for entry in results_payload:
+        if not isinstance(entry, dict):
+            continue
+        change = entry.get("change") if isinstance(entry.get("change"), dict) else None
+        if not isinstance(change, dict) or not _is_real_extra_policy_rule(change):
+            continue
+
+        refs = set()
+        ids = set()
+        for impact in entry.get("impacts") if isinstance(entry.get("impacts"), list) else []:
+            if not isinstance(impact, dict):
+                continue
+            gap_ref = str(impact.get("gap_reference") or impact.get("reference") or "").strip()
+            gap_id = str(impact.get("gap_id") or "").strip()
+            if gap_ref:
+                refs.add(gap_ref)
+            if gap_id:
+                ids.add(gap_id)
+
+        for action in entry.get("actions") if isinstance(entry.get("actions"), list) else []:
+            if not isinstance(action, dict):
+                continue
+            gap_ref = str(action.get("gap_reference") or action.get("reference") or "").strip()
+            gap_id = str(action.get("gap_id") or "").strip()
+            if gap_ref:
+                refs.add(gap_ref)
+            if gap_id:
+                ids.add(gap_id)
+
+        refs = {value for value in refs if value in valid_refs or value in valid_ids}
+        ids = {value for value in ids if value in valid_ids or value in valid_refs}
+        if not refs and not ids:
+            refs = set(valid_refs)
+            ids = set(valid_ids)
+
+        rebuilt.append(
+            {
+                "change": change,
+                "impacts": _select_structured_by_gap_refs(structured_impacts, refs, ids),
+                "actions": _select_structured_by_gap_refs(structured_actions, refs, ids),
+            }
+        )
+
+    return rebuilt
 
 
 def _select_best_impact_for_gap(gap: dict, impacts: list[dict]) -> dict | None:
@@ -356,27 +580,22 @@ def _select_best_action_for_gap(gap: dict, actions: list[dict]) -> dict | None:
 
 
 def _build_fallback_impact(gap: dict) -> dict:
-    gap_text = _clean_text(gap.get("gap") or gap.get("title") or "Compliance gap identified", "Compliance gap identified")
-    severity = _normalize_level(gap.get("severity"), default="Medium")
-    level = severity.lower()
-    department = "Compliance"
-    lowered = gap_text.lower()
-    if any(token in lowered for token in ["system", "api", "encryption", "retention", "log", "script", "automation"]):
-        department = "IT"
-    elif any(token in lowered for token in ["legal", "statutory", "act", "clause"]):
-        department = "Legal"
-
-    reason = f"{gap_text} creates a {level} compliance exposure in {department} workflows and requires control correction."
+    gap_text = _clean_text(gap.get("gap") or gap.get("title") or gap.get("description"), "Compliance gap identified")
+    reason = _clean_text(
+        gap.get("description") or gap.get("regulation_evidence") or gap.get("regulation_requirement"),
+        f"Non-alignment detected for: {gap_text}",
+    )
+    risk = _clean_text(gap.get("severity") or gap.get("risk_level") or gap.get("risk"), "Medium").title()
     return {
-        "department": department,
-        "risk_level": level,
+        "department": "Compliance",
+        "risk_level": risk,
         "reason": reason,
     }
 
 
 def _build_fallback_action(gap: dict) -> str:
-    gap_text = _clean_text(gap.get("gap") or gap.get("title") or "Compliance gap", "Compliance gap")
-    return f"Update policy control for '{gap_text}' and deploy a tracked implementation change in the responsible workflow."
+    gap_text = _clean_text(gap.get("gap") or gap.get("title") or gap.get("description"), "Compliance gap identified")
+    return f"Update policy controls and procedures to fully address: {gap_text}."
 
 
 def _build_strict_changes(changes: list[dict]) -> list[dict]:
@@ -410,19 +629,28 @@ def _build_strict_gaps(gaps: list[dict], impacts: list[dict], actions: list[dict
             continue
         seen.add(semantic)
 
-        selected_impact = _select_best_impact_for_gap(gap, impacts) or _build_fallback_impact(gap)
+        selected_impact = _select_best_impact_for_gap(gap, impacts)
         selected_action = _select_best_action_for_gap(gap, actions)
 
-        impact_obj = {
-            "department": _clean_text((selected_impact or {}).get("department"), "Compliance"),
-            "risk_level": _clean_text((selected_impact or {}).get("risk_level") or (selected_impact or {}).get("severity"), "Medium").title(),
-            "reason": _clean_text((selected_impact or {}).get("reason") or (selected_impact or {}).get("description") or (selected_impact or {}).get("impact"), _build_fallback_impact(gap).get("reason")),
-        }
+        if not isinstance(selected_impact, dict):
+            selected_impact = _build_fallback_impact(gap)
+        if not isinstance(selected_action, dict):
+            selected_action = {"action": _build_fallback_action(gap)}
 
+        impact_reason = _clean_text(
+            selected_impact.get("reason") or selected_impact.get("description") or selected_impact.get("impact"),
+            _build_fallback_impact(gap).get("reason"),
+        )
         action_text = _clean_text(
-            (selected_action or {}).get("action") or (selected_action or {}).get("description") or (selected_action or {}).get("title"),
+            selected_action.get("action") or selected_action.get("description") or selected_action.get("title"),
             _build_fallback_action(gap),
         )
+
+        impact_obj = {
+            "department": _clean_text(selected_impact.get("department"), "Compliance"),
+            "risk_level": _clean_text(selected_impact.get("risk_level") or selected_impact.get("severity"), "Medium").title(),
+            "reason": impact_reason,
+        }
 
         strict.append(
             {
@@ -488,6 +716,7 @@ def _to_structured_changes(changes: list[dict]) -> list[dict]:
                 "type": _normalize_change_type(change.get("type")),
                 "summary": _build_change_summary(change),
                 "source": _clean_text(change.get("source"), "RBI/POLICY"),
+                "source_blocks": change.get("source_blocks") if isinstance(change.get("source_blocks"), list) else [],
                 "source_chunks": change.get("source_chunks") if isinstance(change.get("source_chunks"), list) else [],
             }
         )
@@ -500,11 +729,12 @@ def _to_structured_changes(changes: list[dict]) -> list[dict]:
             str(item.get("summary") or "").lower(),
         ),
     )
-    return deduped[:15]
+    return deduped
 
 
-def _to_structured_impacts(impacts: list[dict]) -> list[dict]:
+def _to_structured_impacts(impacts: list[dict], gaps: list[dict]) -> list[dict]:
     mapped = []
+    emitted_gap_keys = set()
     for impact in impacts or []:
         if not isinstance(impact, dict):
             continue
@@ -513,12 +743,28 @@ def _to_structured_impacts(impacts: list[dict]) -> list[dict]:
         reason = _clean_text(impact.get("description") or impact.get("reason"), "Regulatory change requires operational control updates.")
         severity = _normalize_level(impact.get("severity") or impact.get("impact_level"), default="Medium")
         risk_level = _clean_text(impact.get("risk_level") or severity.lower(), "medium").lower()
-        gap_reference = _clean_text(impact.get("gap_reference") or impact.get("reference"), "Not specified in provided documents")
+        provided_gap_id = _clean_text(impact.get("gap_id"), "")
+        provided_gap_reference = _clean_text(impact.get("gap_reference") or impact.get("reference"), "")
         impact_text = _clean_text(impact.get("impact") or reason, reason)
-        source = _clean_text(
-            impact.get("source"),
-            "Not specified in provided documents",
+        resolved_gap_id, resolved_gap_reference, matched_gap = _resolve_gap_link(
+            provided_gap_id,
+            provided_gap_reference,
+            f"{impact_text} {reason}",
+            gaps,
         )
+        gap_key = str(resolved_gap_reference or resolved_gap_id or "").strip().lower()
+        if gap_key and gap_key in emitted_gap_keys:
+            continue
+        if _is_placeholder_reference(resolved_gap_id) and _is_placeholder_reference(resolved_gap_reference):
+            continue
+
+        source = _clean_text(impact.get("source"), "")
+        if _is_placeholder_reference(source):
+            source = ""
+        if not source and isinstance(matched_gap, dict):
+            source = _clean_text(matched_gap.get("source") or matched_gap.get("regulation_reference"), "")
+        if not source:
+            source = "Not specified in provided documents"
 
         if not departments and str(impact.get("department") or "").strip():
             departments = [str(impact.get("department") or "").strip()]
@@ -527,7 +773,8 @@ def _to_structured_impacts(impacts: list[dict]) -> list[dict]:
             label = _clean_text(department, "Compliance")
             mapped.append(
                 {
-                    "gap_reference": gap_reference,
+                    "gap_id": _clean_text(resolved_gap_id, resolved_gap_reference),
+                    "gap_reference": _clean_text(resolved_gap_reference, resolved_gap_id),
                     "impact": impact_text,
                     "risk_level": risk_level,
                     "department": label,
@@ -535,9 +782,13 @@ def _to_structured_impacts(impacts: list[dict]) -> list[dict]:
                     "reason": reason,
                     "description": reason,
                     "source": source,
+                    "based_on_blocks": impact.get("based_on_blocks") if isinstance(impact.get("based_on_blocks"), list) else [],
                     "source_chunks": impact.get("source_chunks") if isinstance(impact.get("source_chunks"), list) else [],
                 }
             )
+            if gap_key:
+                emitted_gap_keys.add(gap_key)
+            break
 
     deduped = _dedupe_items(
         mapped,
@@ -573,13 +824,20 @@ def _to_structured_gaps(gaps: list[dict]) -> list[dict]:
         )
         mapped.append(
             {
+                "gap_id": _clean_text(gap.get("gap_id"), reference),
                 "gap": gap_text,
                 "reference": reference,
+                "regulation_reference": _clean_text(gap.get("regulation_reference"), reference),
                 "title": title,
                 "severity": severity.lower(),
                 "description": description,
                 "recommendation": recommendation,
                 "source": source,
+                "policy_blocks": gap.get("policy_blocks") if isinstance(gap.get("policy_blocks"), list) else [],
+                "regulation_blocks": gap.get("regulation_blocks") if isinstance(gap.get("regulation_blocks"), list) else [],
+                "source_blocks": gap.get("source_blocks") if isinstance(gap.get("source_blocks"), list) else [],
+                "policy_evidence": _clean_text(gap.get("policy_evidence"), policy_state),
+                "regulation_evidence": _clean_text(gap.get("regulation_evidence"), regulation_requirement),
                 "source_chunks": gap.get("source_chunks") if isinstance(gap.get("source_chunks"), list) else [],
             }
         )
@@ -609,10 +867,20 @@ def _to_structured_actions(actions: list[dict], gaps: list[dict]) -> list[dict]:
         )
         department = _clean_text(action.get("department") or action.get("owner"), "Compliance")
         priority = _normalize_level(action.get("priority"), default="Medium")
-        gap_reference = _clean_text(action.get("gap_reference") or action.get("reference"), "Not specified in provided documents")
+        provided_gap_id = _clean_text(action.get("gap_id"), "")
+        provided_gap_reference = _clean_text(action.get("gap_reference") or action.get("reference"), "")
+        resolved_gap_id, resolved_gap_reference, matched_gap = _resolve_gap_link(
+            provided_gap_id,
+            provided_gap_reference,
+            f"{action_text} {description}",
+            gaps,
+        )
+        if _is_placeholder_reference(resolved_gap_id) and _is_placeholder_reference(resolved_gap_reference):
+            continue
         mapped.append(
             {
-                "gap_reference": gap_reference,
+                "gap_id": _clean_text(resolved_gap_id, resolved_gap_reference),
+                "gap_reference": _clean_text(resolved_gap_reference, resolved_gap_id),
                 "action": action_text,
                 "title": title,
                 "description": description,
@@ -620,7 +888,9 @@ def _to_structured_actions(actions: list[dict], gaps: list[dict]) -> list[dict]:
                 "priority": priority.lower(),
                 "status": _clean_text(action.get("status"), "Pending"),
                 "deadline": _clean_text(action.get("deadline") or action.get("timeline"), "Current compliance cycle"),
+                "based_on_blocks": action.get("based_on_blocks") if isinstance(action.get("based_on_blocks"), list) else [],
                 "source_chunks": action.get("source_chunks") if isinstance(action.get("source_chunks"), list) else [],
+                "source": _clean_text(action.get("source") or (matched_gap or {}).get("source"), "Not specified in provided documents"),
             }
         )
 
@@ -712,98 +982,15 @@ async def _run_analysis_pipeline(
     Dependency-safe flow: changes -> compliance_gaps -> impacts -> actions
     Stage internals remain batched/parallel in ai_service.
     """
-    changes_payload = {"changes": [], "compliance_gaps": [], "impacts": [], "actions": []}
-    gaps_payload = {"changes": [], "compliance_gaps": [], "impacts": [], "actions": []}
-    impacts_payload = {"changes": [], "compliance_gaps": [], "impacts": [], "actions": []}
-    actions_payload = {"changes": [], "compliance_gaps": [], "impacts": [], "actions": []}
-    results_payload = []
+    logger.warning("task_worker._run_analysis_pipeline: unified analysis path")
+    if not old_context or not new_context or not policy_context:
+        raise ValueError("Missing input data")
 
-    if mode == "all" and old_blocks and new_blocks:
-        changes_payload = await asyncio.to_thread(detect_changes, old_blocks, new_blocks, policy_blocks)
+    analysis_payload = await asyncio.to_thread(run_full_analysis, old_context, new_context, policy_context)
+    if not isinstance(analysis_payload, dict):
+        raise RuntimeError("LLM pipeline failed")
 
-    if mode == "all" and new_context and policy_context:
-        gaps_payload = await asyncio.to_thread(detect_compliance_gaps, new_context, policy_context)
-    elif mode == "old" and old_context and policy_context:
-        gaps_payload = await asyncio.to_thread(detect_compliance_gaps, old_context, policy_context)
-    elif mode == "new" and new_context and policy_context:
-        gaps_payload = await asyncio.to_thread(detect_compliance_gaps, new_context, policy_context)
-
-    detected_changes = (changes_payload or {}).get("changes", []) if isinstance(changes_payload, dict) else []
-    reduced_changes = [item for item in detected_changes if isinstance(item, dict)]
-    reduced_changes = _dedupe_changes_by_field_new(reduced_changes)
-    reduced_actions = []
-    print(f"Final changes count: {len(reduced_changes)}")
-
-    if not reduced_changes:
-        print("No changes found")
-        changes_payload = {
-            "changes": [],
-            "compliance_gaps": [],
-            "impacts": [],
-            "actions": [],
-        }
-        impacts_payload = {
-            "changes": [],
-            "compliance_gaps": [],
-            "impacts": [],
-            "actions": [],
-        }
-        actions_payload = {
-            "changes": [],
-            "compliance_gaps": [],
-            "impacts": [],
-            "actions": [],
-        }
-        return changes_payload, gaps_payload, impacts_payload, actions_payload, []
-
-    print("LLM CALLED")
-    impacts_payload = await asyncio.to_thread(
-        llm_analyze_impact,
-        {
-            "changes": reduced_changes,
-            "compliance_gaps": _extract_gaps(gaps_payload),
-        },
-    )
-    print("LLM RESPONSE:", impacts_payload)
-
-    print("LLM CALLED")
-    actions_payload = await asyncio.to_thread(
-        llm_generate_actions,
-        {
-            "changes": reduced_changes,
-            "compliance_gaps": _extract_gaps(gaps_payload),
-            "impacts": (impacts_payload or {}).get("impacts", []) if isinstance(impacts_payload, dict) else [],
-        },
-    )
-    print("LLM RESPONSE:", actions_payload)
-
-    if isinstance(impacts_payload, dict) and impacts_payload.get("error"):
-        raise RuntimeError(f"Impact generation failed: {impacts_payload.get('error')}")
-    if isinstance(actions_payload, dict) and actions_payload.get("error"):
-        raise RuntimeError(f"Action generation failed: {actions_payload.get('error')}")
-
-    final_output = [
-        {
-            "change": change,
-            "impacts": (impacts_payload or {}).get("impacts", []) if isinstance(impacts_payload, dict) else [],
-            "actions": (actions_payload or {}).get("actions", []) if isinstance(actions_payload, dict) else [],
-        }
-        for change in reduced_changes
-    ]
-
-    changes_payload = {
-        "changes": reduced_changes,
-        "compliance_gaps": [],
-        "impacts": [],
-        "actions": [],
-    }
-    if not isinstance(impacts_payload, dict):
-        impacts_payload = {"changes": [], "compliance_gaps": [], "impacts": [], "actions": []}
-    if not isinstance(actions_payload, dict):
-        actions_payload = {"changes": [], "compliance_gaps": [], "impacts": [], "actions": []}
-    results_payload = final_output
-
-    return changes_payload, gaps_payload, impacts_payload, actions_payload, results_payload
+    return analysis_payload, analysis_payload, analysis_payload, analysis_payload, []
 
 
 def _pick_source_chunks(item_text: str, candidate_chunks: list[dict], max_sources: int = 2):
@@ -957,6 +1144,14 @@ def _normalize_impact(payload):
                 "description": "Impact identified from regulatory changes and policy gaps",
                 "severity": "Medium",
                 "impacted_departments": [],
+                "gap_id": "",
+                "gap_reference": "",
+                "source": "",
+                "impact": "Impact identified from regulatory changes and policy gaps",
+                "reason": "Impact identified from regulatory changes and policy gaps",
+                "risk_level": "medium",
+                "based_on_blocks": [],
+                "source_chunks": [],
             }
 
         departments = item.get("impacted_departments")
@@ -987,6 +1182,14 @@ def _normalize_impact(payload):
             "description": str(item.get("description") or item.get("summary") or "Impact identified from regulatory changes and policy gaps").strip(),
             "severity": _normalize_severity(item.get("severity")),
             "impacted_departments": normalized_departments,
+            "gap_id": str(item.get("gap_id") or "").strip(),
+            "gap_reference": str(item.get("gap_reference") or item.get("reference") or "").strip(),
+            "impact": str(item.get("impact") or item.get("description") or item.get("summary") or "").strip(),
+            "reason": str(item.get("reason") or item.get("description") or item.get("summary") or "").strip(),
+            "risk_level": str(item.get("risk_level") or "").strip(),
+            "source": str(item.get("source") or item.get("evidence") or "").strip(),
+            "based_on_blocks": item.get("based_on_blocks") if isinstance(item.get("based_on_blocks"), list) else [],
+            "source_chunks": item.get("source_chunks") if isinstance(item.get("source_chunks"), list) else [],
         }
 
     raw_impacts = []
@@ -1221,12 +1424,12 @@ def process_task(task_id: str, file_paths: dict, file_hashes: dict | None = None
         )
 
         changes_items_raw = _extract_changes(changes_payload)
-        changes_items_raw = _dedupe_changes_by_field_new(changes_items_raw)[:15]
+        changes_items_raw = _dedupe_changes_by_field_new(changes_items_raw)
         gaps_items_raw = _extract_gaps(compliance_gaps_payload)
         gaps_items_raw = sorted(gaps_items_raw, key=lambda item: _risk_priority((item or {}).get("risk") or (item or {}).get("risk_level")), reverse=True)
-        gaps_items_raw = deduplicate_items(gaps_items_raw[:15])
-        impacts_items_raw = deduplicate_items(_normalize_impact(impacts_payload)[:30])
-        actions_items_raw = deduplicate_items(_normalize_actions(actions_payload)[:30])
+        gaps_items_raw = deduplicate_items(gaps_items_raw)
+        impacts_items_raw = deduplicate_items(_normalize_impact(impacts_payload))
+        actions_items_raw = deduplicate_items(_normalize_actions(actions_payload))
 
         old_lookup = _build_source_lookup(old_source_chunks)
         new_lookup = _build_source_lookup(new_source_chunks)
@@ -1270,8 +1473,30 @@ def process_task(task_id: str, file_paths: dict, file_hashes: dict | None = None
 
         changes_items = _to_structured_changes(changes_items_raw)
         gaps_items = _to_structured_gaps(gaps_items_raw)
-        impacts_items = _to_structured_impacts(impacts_items_raw)
+        impacts_items = _to_structured_impacts(impacts_items_raw, gaps_items)
         actions_items = _to_structured_actions(actions_items_raw, gaps_items)
+
+        lookup_list = [old_lookup, new_lookup, policy_lookup]
+        for gap in gaps_items:
+            if not isinstance(gap, dict):
+                continue
+            if not isinstance(gap.get("source_blocks"), list) or not gap.get("source_blocks"):
+                gap["source_blocks"] = _chunk_ids_to_block_ids(gap.get("source_chunks") or [], lookup_list)
+
+        for impact in impacts_items:
+            if not isinstance(impact, dict):
+                continue
+            if not isinstance(impact.get("based_on_blocks"), list) or not impact.get("based_on_blocks"):
+                impact["based_on_blocks"] = _chunk_ids_to_block_ids(impact.get("source_chunks") or [], lookup_list)
+
+        for action in actions_items:
+            if not isinstance(action, dict):
+                continue
+            if not isinstance(action.get("based_on_blocks"), list) or not action.get("based_on_blocks"):
+                action["based_on_blocks"] = _chunk_ids_to_block_ids(action.get("source_chunks") or [], lookup_list)
+
+        results_payload = _sanitize_results_payload(results_payload, gaps_items)
+        results_payload = _build_results_from_structured(results_payload, gaps_items, impacts_items, actions_items)
         strict_changes = _build_strict_changes(changes_items)
         strict_gaps = _build_strict_gaps(gaps_items, impacts_items, actions_items)
 
@@ -1311,13 +1536,6 @@ def process_task(task_id: str, file_paths: dict, file_hashes: dict | None = None
             },
         }
         response["file_clause_map"] = response.get("file_block_map", {})
-
-        print("\n✅ FINAL:")
-        print(f"Changes: {len(changes_items)}")
-        print(f"Impact: {len(impacts_items)}")
-        print(f"Actions: {len(actions_items)}")
-        print("==========")
-
         # ✅ SAVE SUCCESS
         update_task(task_id, status="completed", result=response)
 

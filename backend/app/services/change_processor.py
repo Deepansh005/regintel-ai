@@ -194,17 +194,14 @@ def deduplicate_changes(changes: List[Dict]) -> Tuple[List[Dict], Dict]:
 
 def limit_output_changes(changes: List[Dict], max_count: int = 15) -> List[Dict]:
     """Limit output to top N most relevant changes."""
-    
-    if len(changes) <= max_count:
-        return changes
-    
-    # Simple heuristic: prioritize "modified" over "added/removed"
+
+    if not changes:
+        return []
+
+    # Preserve the full set of validated changes in output order.
     modified = [c for c in changes if c.get("type") == "modified"]
     rest = [c for c in changes if c.get("type") != "modified"]
-    
-    # Return modified first, then others
-    combined = modified + rest
-    return combined[:max_count]
+    return modified + rest
 
 
 def render_final_output(changes: List[Dict]) -> str:

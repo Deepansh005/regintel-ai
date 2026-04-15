@@ -129,6 +129,189 @@ def _schema_response(
     return payload.model_dump()
 
 
+def _ensure_list_of_dicts(value: Any) -> list[dict]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
+def _normalize_gap_identity(gap: dict, index: int) -> tuple[str, str]:
+    gap_id = str(gap.get("gap_id") or f"GAP-{index:03d}").strip()
+    gap_reference = str(gap.get("gap_reference") or gap.get("reference") or gap.get("regulation_reference") or gap_id).strip()
+    return gap_id, gap_reference
+
+
+def _build_gap_impact_from_gap(gap: dict, index: int) -> dict:
+    gap_id, gap_reference = _normalize_gap_identity(gap, index)
+    severity = _strict_level(gap.get("severity") or gap.get("risk") or gap.get("risk_level"), default="medium")
+    gap_text = str(gap.get("gap") or gap.get("title") or gap.get("issue") or "Compliance gap identified").strip()
+    reason = str(
+        gap.get("reason")
+        or gap.get("description")
+        or gap.get("regulation_evidence")
+        or gap.get("regulation_requirement")
+        or "Not specified in provided documents"
+    ).strip()
+    source = str(gap.get("source") or gap.get("regulation_reference") or "Not specified in provided documents").strip()
+    return {
+        "gap_id": gap_id,
+        "gap_reference": gap_reference,
+        "impact": reason if reason else gap_text,
+        "risk_level": severity,
+        "department": "Compliance",
+        "severity": severity.title(),
+        "reason": reason if reason else gap_text,
+        "description": reason if reason else gap_text,
+        "source": source,
+        "based_on_blocks": gap.get("source_blocks") if isinstance(gap.get("source_blocks"), list) else [],
+        "source_chunks": gap.get("source_chunks") if isinstance(gap.get("source_chunks"), list) else [],
+    }
+
+
+def _build_gap_action_from_gap(gap: dict, index: int) -> dict:
+    gap_id, gap_reference = _normalize_gap_identity(gap, index)
+    severity = _strict_level(gap.get("severity") or gap.get("risk") or gap.get("risk_level"), default="medium")
+    gap_text = str(gap.get("gap") or gap.get("title") or gap.get("issue") or "Compliance gap identified").strip()
+    action_text = f"Update controls and policy wording to align with {gap_text}."
+    source = str(gap.get("source") or gap.get("regulation_reference") or "Not specified in provided documents").strip()
+    return {
+        "gap_id": gap_id,
+        "gap_reference": gap_reference,
+        "action": action_text,
+        "priority": severity,
+        "title": action_text,
+        "description": action_text,
+        "department": "Compliance",
+        "source": source,
+        "based_on_blocks": gap.get("source_blocks") if isinstance(gap.get("source_blocks"), list) else [],
+        "source_chunks": gap.get("source_chunks") if isinstance(gap.get("source_chunks"), list) else [],
+    }
+
+
+def _align_master_items(items: list[dict], gaps: list[dict], builder) -> list[dict]:
+    aligned: list[dict] = []
+    remaining = [item for item in items if isinstance(item, dict)]
+
+    for index, gap in enumerate(gaps, start=1):
+        gap_id, gap_reference = _normalize_gap_identity(gap, index)
+        selected = None
+
+        for candidate_index, candidate in enumerate(remaining):
+            candidate_gap_id = str(candidate.get("gap_id") or candidate.get("gap_reference") or candidate.get("reference") or "").strip()
+            candidate_reference = str(candidate.get("gap_reference") or candidate.get("reference") or candidate.get("gap_id") or "").strip()
+            if candidate_gap_id == gap_id or candidate_reference == gap_reference:
+                selected = remaining.pop(candidate_index)
+                break
+
+        if selected is None and len(remaining) >= len(gaps) - index + 1:
+            selected = remaining.pop(0)
+
+        if selected is None:
+            selected = builder(gap, index)
+
+        normalized = dict(selected)
+        normalized["gap_id"] = gap_id
+        normalized["gap_reference"] = gap_reference
+        normalized["reference"] = gap_reference
+        normalized.setdefault("source", str(gap.get("source") or gap.get("regulation_reference") or "Not specified in provided documents").strip())
+        aligned.append(normalized)
+
+    return aligned
+
+
+def build_master_prompt(old_text: str, new_text: str, reg_text: str) -> str:
+    return f"""
+{RBI_ANALYSIS_RULES}
+
+You must perform clause-level semantic analysis only.
+Do not use keyword matching.
+Ignore table of contents, headings, page numbers, section labels, and single-word fragments.
+Detect only real regulatory differences in rules, conditions, thresholds, eligibility criteria, restrictions, and prohibitions.
+Allow multiple gaps when multiple mismatches exist.
+Do not force any minimum output size.
+
+Return a single JSON object with this exact top-level structure:
+{{
+  "changes": [],
+  "compliance_gaps": [],
+  "impacts": [],
+  "actions": []
+}}
+
+Mapping rules:
+- Each compliance gap must represent one specific regulatory mismatch.
+- Each gap must have exactly one impact.
+- Each gap must have exactly one action.
+- Use a unique gap_id for every gap, impact, and action that belong together.
+- Do not repeat the same gap in multiple forms.
+- If no difference exists, return empty arrays for all four keys.
+- Do not invent data or use placeholder text.
+
+Output requirements:
+- changes: only meaningful rule/condition/threshold additions, removals, or modifications.
+- compliance_gaps: one item per distinct mismatch.
+- impacts: exactly one item per gap.
+- actions: exactly one item per gap.
+- Every statement must be supported by the supplied clauses.
+- If a field is not supported by the evidence, use "Not specified in provided documents".
+
+OLD POLICY:
+{_truncate_text_for_tokens(old_text, max_tokens=MAX_INPUT_TOKENS)}
+
+NEW POLICY:
+{_truncate_text_for_tokens(new_text, max_tokens=MAX_INPUT_TOKENS)}
+
+RBI REGULATION:
+{_truncate_text_for_tokens(reg_text, max_tokens=MAX_INPUT_TOKENS)}
+""".strip()
+
+
+def _validate_master_analysis(payload: dict) -> dict:
+    if not isinstance(payload, dict):
+        raise RuntimeError("LLM pipeline failed")
+
+    changes = deduplicate_items(_ensure_list_of_dicts(payload.get("changes")))
+    compliance_gaps = deduplicate_items(_ensure_list_of_dicts(payload.get("compliance_gaps")))
+    impacts = _ensure_list_of_dicts(payload.get("impacts"))
+    actions = _ensure_list_of_dicts(payload.get("actions"))
+
+    if not compliance_gaps:
+        return _schema_response(changes=changes, compliance_gaps=[], impacts=[], actions=[])
+
+    normalized_gaps = []
+    for index, gap in enumerate(compliance_gaps, start=1):
+        normalized_gap = dict(gap)
+        gap_id, gap_reference = _normalize_gap_identity(normalized_gap, index)
+        normalized_gap["gap_id"] = gap_id
+        normalized_gap["gap_reference"] = gap_reference
+        normalized_gap["reference"] = gap_reference
+        normalized_gaps.append(normalized_gap)
+
+    normalized_impacts = deduplicate_items(_align_master_items(impacts, normalized_gaps, _build_gap_impact_from_gap))
+    normalized_actions = deduplicate_items(_align_master_items(actions, normalized_gaps, _build_gap_action_from_gap))
+
+    if len(normalized_impacts) != len(normalized_gaps):
+        normalized_impacts = [_build_gap_impact_from_gap(gap, index) for index, gap in enumerate(normalized_gaps, start=1)]
+    if len(normalized_actions) != len(normalized_gaps):
+        normalized_actions = [_build_gap_action_from_gap(gap, index) for index, gap in enumerate(normalized_gaps, start=1)]
+
+    return _schema_response(
+        changes=changes,
+        compliance_gaps=normalized_gaps,
+        impacts=normalized_impacts,
+        actions=normalized_actions,
+    )
+
+
+def run_full_analysis(old_text: str, new_text: str, reg_text: str) -> dict:
+    if not old_text or not new_text or not reg_text:
+        raise ValueError("Missing input data")
+
+    prompt = build_master_prompt(old_text, new_text, reg_text)
+    result = _safe_call(prompt=prompt, max_tokens=1800, retries=2, initial_backoff=4)
+    return _validate_master_analysis(result)
+
+
 def deduplicate_items(items: list[dict]) -> list[dict]:
     if not isinstance(items, list):
         return []
@@ -857,17 +1040,30 @@ def _normalize_gap_records(gaps: list[dict], limit: int = 10) -> list[dict]:
             continue
         raw_reference = str(gap.get("reference") or gap.get("source") or gap.get("regulation_requirement") or "").strip()
         reference = _extract_clause_reference(raw_reference) or _extract_clause_reference(gap_text) or f"GAP-{index:03d}"
+        gap_id = str(gap.get("gap_id") or f"GAP-{index:03d}").strip()
+        policy_blocks = gap.get("policy_blocks") if isinstance(gap.get("policy_blocks"), list) else []
+        regulation_blocks = gap.get("regulation_blocks") if isinstance(gap.get("regulation_blocks"), list) else []
+        source_blocks = gap.get("source_blocks") if isinstance(gap.get("source_blocks"), list) else []
+        source_chunks = gap.get("source_chunks") if isinstance(gap.get("source_chunks"), list) else []
         severity = _strict_level(gap.get("severity") or gap.get("risk") or gap.get("risk_level"), default="medium")
-        key = (gap_text.lower(), reference.lower(), severity)
+        key = (gap_text.lower(), reference.lower(), severity, gap_id.lower())
         if key in seen:
             continue
         seen.add(key)
         records.append(
             {
+                "gap_id": gap_id,
                 "gap": trim_text(gap_text, 240),
                 "reference": reference,
+                "regulation_reference": str(gap.get("regulation_reference") or reference).strip(),
                 "severity": severity,
                 "source": str(gap.get("source") or gap.get("regulation_requirement") or "Not specified in provided documents").strip() or "Not specified in provided documents",
+                "policy_blocks": [item for item in policy_blocks if item],
+                "regulation_blocks": [item for item in regulation_blocks if item],
+                "source_blocks": [item for item in source_blocks if item],
+                "source_chunks": [item for item in source_chunks if item],
+                "policy_evidence": str(gap.get("policy_evidence") or gap.get("policy_current_state") or "").strip(),
+                "regulation_evidence": str(gap.get("regulation_evidence") or gap.get("regulation_requirement") or "").strip(),
             }
         )
         if len(records) >= limit:
@@ -883,6 +1079,7 @@ def _impact_from_gap_record(gap_record: dict) -> dict:
     department = departments[0] if departments else "Compliance"
     impact_text = _build_impact_description(gap_text, department, severity.title())
     return {
+        "gap_id": str(gap_record.get("gap_id") or "").strip() or reference,
         "gap_reference": reference,
         "impact": trim_text(impact_text, 260),
         "risk_level": severity,
@@ -891,6 +1088,8 @@ def _impact_from_gap_record(gap_record: dict) -> dict:
         "description": trim_text(impact_text, 260),
         "reason": trim_text(impact_text, 260),
         "source": str(gap_record.get("source") or "Not specified in provided documents").strip() or "Not specified in provided documents",
+        "based_on_blocks": [item for item in ((gap_record.get("source_blocks") or []) + (gap_record.get("regulation_blocks") or [])) if item],
+        "source_chunks": gap_record.get("source_chunks") if isinstance(gap_record.get("source_chunks"), list) else [],
     }
 
 
@@ -901,12 +1100,15 @@ def _action_from_gap_record(gap_record: dict) -> dict:
     department = (_infer_impact_departments(gap_text) or ["Compliance"])[0]
     action_text = f"Update control and policy wording for {gap_text} and enforce implementation in operating procedures."
     return {
+        "gap_id": str(gap_record.get("gap_id") or "").strip() or reference,
         "gap_reference": reference,
         "action": trim_text(action_text, 260),
         "priority": level,
         "title": trim_text(action_text, 120),
         "description": trim_text(action_text, 260),
         "department": department,
+        "based_on_blocks": [item for item in ((gap_record.get("source_blocks") or []) + (gap_record.get("policy_blocks") or []) + (gap_record.get("regulation_blocks") or [])) if item],
+        "source_chunks": gap_record.get("source_chunks") if isinstance(gap_record.get("source_chunks"), list) else [],
     }
 
 
@@ -927,12 +1129,23 @@ def _normalize_impacts_by_gap(result_impacts: list[dict], gap_records: list[dict
         risk_level = _strict_level(item.get("risk_level") or item.get("severity"), default="medium")
         source = str(item.get("source") or (gap_map.get(gap_reference) or {}).get("source") or "Not specified in provided documents").strip()
         department = str(item.get("department") or "").strip() or ((_infer_impact_departments(impact_text) or ["Compliance"])[0])
+        gap_record = gap_map.get(gap_reference) or {}
+        based_on_blocks = item.get("based_on_blocks") if isinstance(item.get("based_on_blocks"), list) else []
+        if not based_on_blocks:
+            based_on_blocks = [
+                *([val for val in (gap_record.get("source_blocks") or []) if val]),
+                *([val for val in (gap_record.get("regulation_blocks") or []) if val]),
+            ]
+        source_chunks = item.get("source_chunks") if isinstance(item.get("source_chunks"), list) else []
+        if not source_chunks:
+            source_chunks = [val for val in (gap_record.get("source_chunks") or []) if val]
         key = (gap_reference.lower(), impact_text.lower(), risk_level)
         if key in seen:
             continue
         seen.add(key)
         normalized.append(
             {
+                "gap_id": str(item.get("gap_id") or gap_record.get("gap_id") or gap_reference).strip(),
                 "gap_reference": gap_reference,
                 "impact": trim_text(impact_text, 260),
                 "risk_level": risk_level,
@@ -941,6 +1154,8 @@ def _normalize_impacts_by_gap(result_impacts: list[dict], gap_records: list[dict
                 "description": trim_text(impact_text, 260),
                 "reason": trim_text(impact_text, 260),
                 "source": source or "Not specified in provided documents",
+                "based_on_blocks": based_on_blocks,
+                "source_chunks": source_chunks,
             }
         )
 
@@ -970,18 +1185,32 @@ def _normalize_actions_by_gap(result_actions: list[dict], gap_records: list[dict
             continue
         priority = _strict_level(item.get("priority"), default="medium")
         department = str(item.get("department") or "").strip() or ((_infer_impact_departments(action_text) or ["Compliance"])[0])
+        gap_record = gap_map.get(gap_reference) or {}
+        based_on_blocks = item.get("based_on_blocks") if isinstance(item.get("based_on_blocks"), list) else []
+        if not based_on_blocks:
+            based_on_blocks = [
+                *([val for val in (gap_record.get("source_blocks") or []) if val]),
+                *([val for val in (gap_record.get("policy_blocks") or []) if val]),
+                *([val for val in (gap_record.get("regulation_blocks") or []) if val]),
+            ]
+        source_chunks = item.get("source_chunks") if isinstance(item.get("source_chunks"), list) else []
+        if not source_chunks:
+            source_chunks = [val for val in (gap_record.get("source_chunks") or []) if val]
         key = (gap_reference.lower(), action_text.lower(), priority)
         if key in seen:
             continue
         seen.add(key)
         normalized.append(
             {
+                "gap_id": str(item.get("gap_id") or gap_record.get("gap_id") or gap_reference).strip(),
                 "gap_reference": gap_reference,
                 "action": trim_text(action_text, 260),
                 "priority": priority,
                 "title": trim_text(action_text, 120),
                 "description": trim_text(action_text, 260),
                 "department": department,
+                "based_on_blocks": based_on_blocks,
+                "source_chunks": source_chunks,
             }
         )
 
@@ -1146,7 +1375,7 @@ def _call_groq_safe(
             )
 
         if not content:
-            return {"error": "Empty response from Groq"}
+            raise RuntimeError("Empty response from Groq")
 
         logger.info("llm_raw_response=%s", content[:1200])
 
@@ -1157,7 +1386,7 @@ def _call_groq_safe(
 
         if parsed is None:
             logger.warning("Could not parse JSON response: %s", content[:200])
-            return UnifiedResponseSchema().model_dump() if expect_schema else {"error": "Could not parse JSON response"}
+            raise RuntimeError("Could not parse JSON response from Groq")
 
         if expect_schema:
             parsed = UnifiedResponseSchema.model_validate(parsed).model_dump()
@@ -1168,7 +1397,7 @@ def _call_groq_safe(
 
     except Exception as exc:
         logger.error("Groq call failed: %s", exc)
-        return {"error": str(exc)}
+        raise RuntimeError(str(exc)) from exc
 
 
 def _safe_call(
@@ -1184,20 +1413,19 @@ def _safe_call(
     last_error = "Groq failed after retries"
 
     for attempt in range(retries):
-        # Retry never accumulates partial outputs; only the final successful payload is returned.
-        result = _call_groq_safe(
-            prompt=prompt,
-            max_tokens=max_tokens,
-            retries=2,
-            expect_schema=expect_schema,
-            preferred_key_index=preferred_key_index,
-            invalid_previous_response=(attempt > 0),
-        )
-        if isinstance(result, dict) and "error" not in result:
-            return result
-
-        if isinstance(result, dict) and isinstance(result.get("error"), str):
-            last_error = result.get("error")
+        try:
+            # Retry never accumulates partial outputs; only the final successful payload is returned.
+            return _call_groq_safe(
+                prompt=prompt,
+                max_tokens=max_tokens,
+                retries=2,
+                expect_schema=expect_schema,
+                preferred_key_index=preferred_key_index,
+                invalid_previous_response=(attempt > 0),
+            )
+        except Exception as exc:
+            last_error = str(exc)
+            print(f"[LLM ERROR] {last_error}")
 
         logger.warning("safe_call failed on attempt %s/%s. Backoff=%ss", attempt + 1, retries, backoff)
         is_last_attempt = attempt >= (retries - 1)
@@ -1207,7 +1435,7 @@ def _safe_call(
         time.sleep(backoff)
         backoff *= 2
 
-    return {"error": f"Groq failed after retries: {last_error}"}
+    raise RuntimeError(f"Groq failed after retries: {last_error}")
 
 
 def _optional_summary(label: str, text: str, call_budget: int) -> str:
@@ -1230,11 +1458,13 @@ DOCUMENT:
 {_truncate_text_for_tokens(value, max_tokens=MAX_INPUT_TOKENS)}
 """
 
-    result = _safe_call(prompt=prompt, max_tokens=450, retries=2, initial_backoff=4, expect_schema=False)
-    if isinstance(result, dict) and "error" not in result:
-        summary_text = result.get("summary") if isinstance(result.get("summary"), str) else None
+    try:
+        result = _safe_call(prompt=prompt, max_tokens=450, retries=2, initial_backoff=4, expect_schema=False)
+        summary_text = result.get("summary") if isinstance(result, dict) and isinstance(result.get("summary"), str) else None
         if summary_text and summary_text.strip():
             return summary_text.strip()
+    except Exception as exc:
+        logger.warning("optional summary skipped due to LLM failure: %s", exc)
 
     return ""
 
@@ -1265,11 +1495,10 @@ PARTIAL_ANALYSES:
 """
 
     merged = _safe_call(prompt=prompt, max_tokens=1200, retries=2, initial_backoff=4)
-    if isinstance(merged, dict) and "error" not in merged and isinstance(merged.get("changes"), list):
+    if isinstance(merged, dict) and isinstance(merged.get("changes"), list):
         return {"changes": merged.get("changes", [])[:5]}
 
-    fallback = merge_chunk_results(partials, "changes")
-    return {"changes": fallback[:5] if fallback else []}
+    raise RuntimeError("Final merge for changes returned invalid payload")
 
 
 def _final_merge_gaps(partials: list[dict]) -> dict:
@@ -1298,14 +1527,12 @@ PARTIAL_ANALYSES:
 """
 
     merged = _safe_call(prompt=prompt, max_tokens=1200, retries=2, initial_backoff=4)
-    if isinstance(merged, dict) and "error" not in merged and isinstance(merged.get("compliance_gaps"), list):
+    if isinstance(merged, dict) and isinstance(merged.get("compliance_gaps"), list):
         gaps = merged.get("compliance_gaps", [])
         gaps = sorted(gaps, key=lambda g: _priority_value((g or {}).get("risk", "Low")), reverse=True)
         return _schema_response(compliance_gaps=gaps[:6])
 
-    fallback = merge_chunk_results(partials, "compliance_gaps")
-    fallback = sorted(fallback, key=lambda g: _priority_value((g or {}).get("risk", "Low")), reverse=True)
-    return _schema_response(compliance_gaps=fallback[:6] if fallback else [])
+    raise RuntimeError("Final merge for compliance gaps returned invalid payload")
 
 
 
@@ -2654,14 +2881,7 @@ INPUT_CHANGES:
 
         logger.warning("reduce_changes_and_actions invalid JSON attempt=%s", attempt + 1)
 
-    fallback_actions = default_actions().get("actions", [])[:10]
-    fallback_result = {
-        "changes": candidate_changes[:10],
-        "actions": _normalize_reduce_actions(fallback_actions),
-    }
-    logger.info("REDUCE phase: final_changes_count=%s", len(fallback_result.get("changes") or []))
-    print(f"Final changes count: {len(fallback_result.get('changes') or [])}")
-    return fallback_result
+    raise RuntimeError("REDUCE phase failed: unable to generate valid JSON from LLM")
 
 
 def detect_changes(old_blocks: Any, new_blocks: Any, policy_blocks: Any = None) -> dict:
@@ -2681,6 +2901,8 @@ def detect_changes(old_blocks: Any, new_blocks: Any, policy_blocks: Any = None) 
                             "block_id": str(item.get("block_id") or item.get("chunk_id") or f"{prefix}-{index}"),
                             "heading": str(item.get("heading") or item.get("title") or "").strip(),
                             "content": content,
+                            "source": str(item.get("source") or prefix).strip().upper(),
+                            "source_chunks": item.get("source_chunks") if isinstance(item.get("source_chunks"), list) else [],
                         }
                     )
                 return normalized
@@ -2697,6 +2919,8 @@ def detect_changes(old_blocks: Any, new_blocks: Any, policy_blocks: Any = None) 
                     "block_id": str(block.get("block_id") or f"{prefix}-{index}"),
                     "heading": str(block.get("heading") or block.get("title") or "").strip(),
                     "content": str(block.get("content") or "").strip(),
+                    "source": str(block.get("source") or prefix).strip().upper(),
+                    "source_chunks": block.get("source_chunks") if isinstance(block.get("source_chunks"), list) else [],
                 }
                 for index, block in enumerate(blocks, start=1)
                 if isinstance(block, dict) and str(block.get("content") or "").strip()
@@ -2728,11 +2952,17 @@ def detect_changes(old_blocks: Any, new_blocks: Any, policy_blocks: Any = None) 
                 "old_heading": str(pair.get("old_heading") or "").strip(),
                 "new_heading": str(pair.get("new_heading") or "").strip(),
                 "match_score": float(pair.get("match_score") or 0.0),
+                "old_block_id": str(((pair.get("old_block") or {}).get("block_id") or "")).strip(),
+                "new_block_id": str(((pair.get("new_block") or {}).get("block_id") or "")).strip(),
+                "old_source_chunks": ((pair.get("old_block") or {}).get("source_chunks") if isinstance((pair.get("old_block") or {}).get("source_chunks"), list) else []),
+                "new_source_chunks": ((pair.get("new_block") or {}).get("source_chunks") if isinstance((pair.get("new_block") or {}).get("source_chunks"), list) else []),
             }
             for pair in matched_blocks
             if isinstance(pair, dict)
             and (str(pair.get("old") or "").strip() or str(pair.get("new") or "").strip())
         ]
+
+        pair_meta = {str(item.get("pair_id") or "").strip(): item for item in compare_pairs if str(item.get("pair_id") or "").strip()}
 
         MAX_BLOCKS_PER_CALL = 5
         MAX_TOTAL_COMPARE_BLOCKS = 20
@@ -2789,6 +3019,20 @@ def detect_changes(old_blocks: Any, new_blocks: Any, policy_blocks: Any = None) 
                     "new": new_value or None,
                     "evidence": evidence,
                     "source": "RBI" if change_type != "extra_policy_rule" else "POLICY",
+                    "source_blocks": [
+                        val
+                        for val in [
+                            str((pair_meta.get(str(item.get("block_id") or "").strip(), {}) or {}).get("old_block_id") or "").strip(),
+                            str((pair_meta.get(str(item.get("block_id") or "").strip(), {}) or {}).get("new_block_id") or "").strip(),
+                            str(item.get("block_id") or "").strip(),
+                        ]
+                        if val
+                    ],
+                    "source_chunks": (
+                        (pair_meta.get(str(item.get("block_id") or "").strip(), {}) or {}).get("new_source_chunks")
+                        or (pair_meta.get(str(item.get("block_id") or "").strip(), {}) or {}).get("old_source_chunks")
+                        or []
+                    ),
                 }
             )
 
@@ -2821,7 +3065,20 @@ def detect_changes(old_blocks: Any, new_blocks: Any, policy_blocks: Any = None) 
                     "new": trim_text(new_text, 220),
                     "evidence": trim_text(new_text, 220),
                     "source": "RBI",
+                    "source_blocks": [
+                        str(pair.get("old_block_id") or "").strip(),
+                        str(pair.get("new_block_id") or "").strip(),
+                    ],
+                    "source_chunks": list(
+                        dict.fromkeys(
+                            [
+                                *([chunk for chunk in (pair.get("old_source_chunks") or []) if chunk]),
+                                *([chunk for chunk in (pair.get("new_source_chunks") or []) if chunk]),
+                            ]
+                        )
+                    ),
                 }
+                candidate["source_blocks"] = [item for item in candidate.get("source_blocks") or [] if item]
                 key = (
                     _normalize_change_text(str(candidate.get("field") or "")),
                     _normalize_change_text(str(candidate.get("new") or "")),
@@ -2842,7 +3099,7 @@ def detect_changes(old_blocks: Any, new_blocks: Any, policy_blocks: Any = None) 
 
     except Exception as e:
         logger.error("detect_changes failed: %s", e)
-        return _default_changes_response()
+        raise RuntimeError(f"detect_changes failed: {e}") from e
 
 
 def detect_compliance_gaps(new_text: str, policy_text: str, changes: list[dict] | None = None) -> dict:
@@ -2850,7 +3107,7 @@ def detect_compliance_gaps(new_text: str, policy_text: str, changes: list[dict] 
     try:
         if isinstance(changes, list) and changes:
             gaps = []
-            for item in changes:
+            for index, item in enumerate(changes, start=1):
                 if not isinstance(item, dict):
                     continue
                 field = str(item.get("field") or "Regulatory requirement").strip()
@@ -2858,6 +3115,11 @@ def detect_compliance_gaps(new_text: str, policy_text: str, changes: list[dict] 
                 change_type = str(item.get("type") or "").strip().lower()
                 old_value = str(item.get("old") or "").strip()
                 new_value = str(item.get("new") or "").strip()
+                source_blocks = item.get("source_blocks") if isinstance(item.get("source_blocks"), list) else []
+                source_chunks = item.get("source_chunks") if isinstance(item.get("source_chunks"), list) else []
+
+                block_ref = _extract_clause_reference(field) or _extract_clause_reference(evidence) or ""
+                gap_id = f"GAP-{index:03d}"
 
                 severity = "Low"
                 lowered = f"{field} {evidence} {new_value}".lower()
@@ -2880,13 +3142,21 @@ def detect_compliance_gaps(new_text: str, policy_text: str, changes: list[dict] 
 
                 gaps.append(
                     {
+                        "gap_id": gap_id,
                         "gap": trim_text(gap_text, 220),
+                        "regulation_reference": block_ref or f"Regulation/{field}",
                         "severity": severity,
                         "reason": trim_text(reason, 240),
                         "issue": trim_text(gap_text, 220),
                         "risk": severity,
                         "regulation_requirement": trim_text(f"{field}: {new_value or evidence}", 220),
                         "policy_current_state": trim_text(old_value or "Not implemented in policy", 220),
+                        "policy_evidence": trim_text(old_value or "Not explicitly present in compared policy block", 220),
+                        "regulation_evidence": trim_text(new_value or evidence or "Not specified in provided documents", 220),
+                        "policy_blocks": source_blocks[:1] if source_blocks else [],
+                        "regulation_blocks": source_blocks[:2] if source_blocks else [],
+                        "source_blocks": source_blocks,
+                        "source_chunks": source_chunks,
                     }
                 )
 
@@ -3032,10 +3302,9 @@ DOCUMENT:
                     initial_backoff=4,
                     expect_schema=False,
                 )
-                if isinstance(summary_result, dict) and "error" not in summary_result:
-                    summary_text = summary_result.get("summary") if isinstance(summary_result.get("summary"), str) else None
-                    if summary_text and summary_text.strip():
-                        summary = summary_text.strip()
+                summary_text = summary_result.get("summary") if isinstance(summary_result, dict) and isinstance(summary_result.get("summary"), str) else None
+                if summary_text and summary_text.strip():
+                    summary = summary_text.strip()
 
         batch_entries = []
         for batch_index, batch in enumerate(pair_batches, start=1):
@@ -3056,7 +3325,7 @@ DOCUMENT:
             )
 
         partial_results = asyncio.run(process_batches_parallel(batch_entries, label="gaps")) if batch_entries else []
-        partial_results = [result for result in partial_results if isinstance(result, dict) and "error" not in result]
+        partial_results = [result for result in partial_results if isinstance(result, dict)]
 
         if not partial_results:
             return _default_gaps_response()
@@ -3085,7 +3354,7 @@ PARTIAL_ANALYSES:
         merge_prompt = _ensure_prompt_token_safe(merge_prompt)
         if reserve_tokens(merge_prompt, MERGE_OUTPUT_TOKENS):
             merged = _safe_call(prompt=merge_prompt, max_tokens=MERGE_OUTPUT_TOKENS, retries=2, initial_backoff=4)
-            if isinstance(merged, dict) and "error" not in merged and isinstance(merged.get("compliance_gaps"), list):
+            if isinstance(merged, dict) and isinstance(merged.get("compliance_gaps"), list):
                 gaps = merged.get("compliance_gaps", [])
                 gaps = sorted(gaps, key=lambda g: _priority_value((g or {}).get("risk", "Low")), reverse=True)
                 deduped = deduplicate_items(gaps[:6])
@@ -3093,16 +3362,11 @@ PARTIAL_ANALYSES:
                 logger.info("deduplicated_output=%s", json.dumps({"compliance_gaps": deduped}, ensure_ascii=True)[:1200])
                 return _schema_response(compliance_gaps=strict_gaps)
 
-        fallback = merge_chunk_results(partial_results, "compliance_gaps")
-        fallback = sorted(fallback, key=lambda g: _priority_value((g or {}).get("risk", "Low")), reverse=True)
-        deduped = deduplicate_items(fallback[:6] if fallback else [])
-        strict_gaps = _normalize_gap_records(deduped, limit=10)
-        logger.info("deduplicated_output=%s", json.dumps({"compliance_gaps": deduped}, ensure_ascii=True)[:1200])
-        return _schema_response(compliance_gaps=strict_gaps)
+        raise RuntimeError("detect_compliance_gaps failed: merge payload invalid or token budget exhausted")
 
     except Exception as e:
         logger.error("detect_compliance_gaps failed: %s", e)
-        return _default_gaps_response()
+        raise RuntimeError(f"detect_compliance_gaps failed: {e}") from e
 
 
 def analyze_impact(impact_input: dict) -> dict:
@@ -3190,7 +3454,7 @@ Return ONLY valid JSON. No explanation. No markdown. No text outside JSON.\n\nJS
         result = _safe_call(prompt=prompt, max_tokens=BATCH_OUTPUT_TOKENS, retries=2, initial_backoff=4)
         print("LLM RESPONSE:", result)
 
-        if isinstance(result, dict) and "error" not in result and isinstance(result.get("impacts"), list):
+        if isinstance(result, dict) and isinstance(result.get("impacts"), list):
             deduped_impacts = _normalize_impacts_by_gap(result.get("impacts", [])[:30], gap_records)
             logger.info("deduplicated_output=%s", json.dumps({"impacts": deduped_impacts}, ensure_ascii=True)[:1200])
             return _schema_response(impacts=deduped_impacts)
@@ -3290,7 +3554,7 @@ Return ONLY valid JSON. No explanation. No markdown. No text outside JSON.\n\nJS
         result = _safe_call(prompt=prompt, max_tokens=BATCH_OUTPUT_TOKENS, retries=2, initial_backoff=4)
         print("LLM RESPONSE:", result)
 
-        if isinstance(result, dict) and "error" not in result and isinstance(result.get("actions"), list):
+        if isinstance(result, dict) and isinstance(result.get("actions"), list):
             deduped_actions = _normalize_actions_by_gap(result.get("actions", [])[:30], gap_records)
             if not deduped_actions:
                 deduped_actions = _normalize_actions_by_gap([], gap_records)

@@ -181,7 +181,7 @@ def _build_gap_action_from_gap(gap: dict, index: int) -> dict:
         "priority": severity,
         "title": action_text,
         "description": action_text,
-        "department": "Compliance",
+        "department": "LEGAL",
         "source": source,
         "based_on_blocks": gap.get("source_blocks") if isinstance(gap.get("source_blocks"), list) else [],
         "source_chunks": gap.get("source_chunks") if isinstance(gap.get("source_chunks"), list) else [],
@@ -355,48 +355,61 @@ def _normalize_severity(value: Any) -> str:
 def _normalize_impact_item(item: dict) -> dict:
     if not isinstance(item, dict):
         return {
-            "title": "Compliance Impact",
-            "description": "Impact identified from regulatory changes and policy gaps",
-            "severity": "Medium",
-            "impacted_departments": [],
-            "source": "Not specified in provided documents",
+            "impact_id": "IMPACT-000",
+            "title": "Regulatory reference mismatch",
+            "description": "No impact data provided",
+            "affected_departments": [],
+            "overall_risk": "low",
+            "severity_score": 0,
+            "business_impact": "No impact data provided",
+            "recommended_action": "No impact data provided",
         }
 
-    departments = item.get("impacted_departments")
-    if not isinstance(departments, list):
-        departments = item.get("departments")
-    if not isinstance(departments, list):
-        departments = item.get("department")
-
-    if isinstance(departments, str):
-        departments = [departments]
+    departments = item.get("affected_departments")
     if not isinstance(departments, list):
         departments = []
 
     normalized_departments = []
     seen_departments = set()
     for department in departments:
-        label = str(department or "").strip()
-        if not label:
+        if not isinstance(department, dict):
             continue
-        key = label.lower()
+        name = str(department.get("name") or "").strip()
+        impact_level = str(department.get("impact_level") or "low").strip().lower()
+        if impact_level not in {"low", "medium", "high"}:
+            impact_level = "low"
+        risk_score = int(department.get("risk_score") or 0)
+        if not name:
+            continue
+        key = name.lower()
         if key in seen_departments:
             continue
         seen_departments.add(key)
-        normalized_departments.append(label)
+        normalized_departments.append({"name": name, "impact_level": impact_level, "risk_score": max(0, min(100, risk_score))})
 
-    title = str(item.get("title") or item.get("area") or "Compliance Impact").strip()
-    description = str(item.get("description") or item.get("summary") or "Impact identified from regulatory changes and policy gaps").strip()
-    source = str(item.get("source") or item.get("evidence") or "Not specified in provided documents").strip()
-    if not source:
-        source = "Not specified in provided documents"
+    title = str(item.get("title") or item.get("area") or "Regulatory reference mismatch").strip()
+    description = str(item.get("description") or item.get("summary") or item.get("impact") or "Mismatch between regulation clause and policy clause").strip()
+    business_impact = str(item.get("business_impact") or item.get("reason") or "May result in regulatory penalties if not updated.").strip()
+    recommended_action = str(item.get("recommended_action") or item.get("action") or "Update policy to match the regulation clause.").strip()
+    overall_risk = str(item.get("overall_risk") or "low").strip().lower()
+    if overall_risk not in {"low", "medium", "high"}:
+        overall_risk = "low"
+
+    severity_score = int(item.get("severity_score") or calculate_risk(item) or 0)
+    severity_score = max(0, min(100, severity_score))
 
     return {
+        "impact_id": str(item.get("impact_id") or item.get("gap_id") or "").strip(),
         "title": title,
         "description": description,
-        "severity": _normalize_severity(item.get("severity")),
-        "impacted_departments": normalized_departments,
-        "source": source,
+        "affected_departments": normalized_departments,
+        "overall_risk": overall_risk,
+        "severity_score": severity_score,
+        "business_impact": business_impact,
+        "recommended_action": recommended_action,
+        "severity": _normalize_severity(item.get("severity") or overall_risk),
+        "impacted_departments": [entry.get("name") for entry in normalized_departments if entry.get("name")],
+        "source": str(item.get("source") or item.get("evidence") or "Not specified in provided documents").strip() or "Not specified in provided documents",
     }
 
 
@@ -408,31 +421,14 @@ def _normalize_impacts_list(items: list[dict]) -> list[dict]:
     if not normalized:
         return []
 
-    # Keep severity distribution realistic: mostly Medium, some Low, limited High.
-    total = len(normalized)
-    max_high = max(1, math.ceil(total * 0.3))
-    min_high = max(1, math.floor(total * 0.2)) if total >= 4 else 1
-
-    high_indices = [index for index, item in enumerate(normalized) if item.get("severity") == "High"]
-    medium_indices = [index for index, item in enumerate(normalized) if item.get("severity") == "Medium"]
-    low_indices = [index for index, item in enumerate(normalized) if item.get("severity") == "Low"]
-
-    if len(high_indices) > max_high:
-        for index in high_indices[max_high:]:
-            normalized[index]["severity"] = "Medium"
-
-    elif len(high_indices) < min_high and medium_indices:
-        needed = min_high - len(high_indices)
-        for index in medium_indices[:needed]:
-            normalized[index]["severity"] = "High"
-
-    # Ensure there is at least one Low impact when we have enough entries.
-    if total >= 3 and not any(item.get("severity") == "Low" for item in normalized):
-        demote_index = next((idx for idx, item in enumerate(normalized) if item.get("severity") == "Medium"), None)
-        if demote_index is None:
-            demote_index = next((idx for idx, item in enumerate(normalized) if item.get("severity") == "High"), None)
-        if demote_index is not None:
-            normalized[demote_index]["severity"] = "Low"
+    for item in normalized:
+        affected_departments = item.get("affected_departments") if isinstance(item.get("affected_departments"), list) else []
+        if not affected_departments:
+            item["affected_departments"] = [
+                {"name": "LEGAL", "impact_level": item.get("overall_risk") or "low", "risk_score": int(item.get("severity_score") or 25)}
+            ]
+        item["overall_risk"] = str(item.get("overall_risk") or _overall_risk_from_score(int(item.get("severity_score") or 0))).lower()
+        item["severity_score"] = max(0, min(100, int(item.get("severity_score") or calculate_risk(item) or 0)))
 
     return normalized
 
@@ -867,9 +863,7 @@ def _default_gaps_response() -> dict:
 
 def _normalize_impact_department(value: str) -> str:
     label = str(value or "").strip()
-    if not label:
-        return "Compliance"
-    return label
+    return label or "Operations"
 
 
 def _infer_impact_departments(text: str) -> list[str]:
@@ -906,9 +900,123 @@ def _infer_impact_departments(text: str) -> list[str]:
         add_department("Compliance")
 
     if not departments:
+        add_department("Operations")
+
+    return departments[:3]
+
+
+def map_departments(change_type: str, content: str) -> list[str]:
+    text = f"{change_type or ''} {content or ''}".lower()
+    departments: list[str] = []
+
+    def add_department(name: str) -> None:
+        if name not in departments:
+            departments.append(name)
+
+    if any(keyword in text for keyword in ["capital", "threshold", "limit", "crar", "profit", "dividend", "financial", "exposure", "provision", "ratio"]):
+        add_department("Finance")
+        add_department("Risk")
+
+    if any(keyword in text for keyword in ["report", "reporting", "documentation", "filing", "submission", "return", "record"]):
+        add_department("Compliance")
+        add_department("Legal")
+
+    if any(keyword in text for keyword in ["system", "process", "workflow", "automation", "implementation", "operational", "operating"]):
+        add_department("IT")
+        add_department("Operations")
+
+    if any(keyword in text for keyword in ["governance", "board", "committee", "management", "approval", "policy structure"]):
+        add_department("Management")
+        add_department("Legal")
+
+    if any(keyword in text for keyword in ["customer", "client", "service", "onboarding", "facing"]):
+        add_department("Operations")
+        add_department("Customer Service")
+
+    if not departments:
         add_department("Compliance")
 
     return departments[:3]
+
+
+def calculate_risk(change) -> int:
+    text = " ".join(
+        [
+            str(change.get("gap_description") if isinstance(change, dict) else ""),
+            str(change.get("regulation_clause") if isinstance(change, dict) else ""),
+            str(change.get("policy_clause") if isinstance(change, dict) else ""),
+            str(change.get("title") if isinstance(change, dict) else ""),
+        ]
+    ).lower()
+    severity = str(change.get("severity") if isinstance(change, dict) else "").strip().lower()
+
+    critical_signals = ["penalty", "breach", "capital", "threshold", "limit", "crar", "mandatory", "prohibit", "shall", "must"]
+    structural_signals = ["report", "filing", "timeline", "documentation", "process", "workflow", "implementation", "requirement"]
+
+    if severity == "high" or any(token in text for token in critical_signals):
+        return min(100, max(70, 85 if severity == "high" else 78))
+    if severity == "medium" or any(token in text for token in structural_signals):
+        return 55
+    return 25
+
+
+def _overall_risk_from_score(score: int) -> str:
+    if score >= 70:
+        return "high"
+    if score >= 40:
+        return "medium"
+    return "low"
+
+
+def _build_impact_schema_from_gap(gap: dict, index: int) -> dict:
+    gap_text = str(
+        gap.get("gap_description")
+        or gap.get("description")
+        or gap.get("reason")
+        or gap.get("regulation_clause")
+        or gap.get("gap")
+        or "Impact from regulatory mismatch"
+    ).strip()
+    regulation_clause = str(gap.get("regulation_clause") or gap.get("regulation_requirement") or gap.get("regulation_evidence") or "Not specified in provided documents").strip()
+    policy_clause = str(gap.get("policy_clause") or gap.get("policy_current_state") or gap.get("policy_evidence") or "No corresponding policy clause found").strip()
+    impact_departments = map_departments(str(gap.get("severity") or gap.get("risk") or ""), f"{regulation_clause} {policy_clause} {gap_text}")
+    severity_score = calculate_risk(gap)
+    overall_risk = _overall_risk_from_score(severity_score)
+    business_impact = str(
+        gap.get("business_impact")
+        or gap.get("impact_reason")
+        or gap.get("impact", {}).get("reason") if isinstance(gap.get("impact"), dict) else ""
+        or f"May result in regulatory penalties, audit issues, or incorrect processing for {gap_text}."
+    ).strip()
+    recommended_action = str(
+        gap.get("recommended_action")
+        or gap.get("action", {}).get("description") if isinstance(gap.get("action"), dict) else ""
+        or f"Update policy clause to match regulation clause: {regulation_clause}."
+    ).strip()
+
+    affected_departments = []
+    for department in impact_departments:
+        dept_score = severity_score
+        if department in {"IT", "Operations"}:
+            dept_score = min(100, max(0, severity_score - 5))
+        affected_departments.append(
+            {
+                "name": department,
+                "impact_level": overall_risk,
+                "risk_score": dept_score,
+            }
+        )
+
+    return {
+        "impact_id": str(gap.get("gap_id") or f"IMPACT-{index:03d}").strip(),
+        "title": str(gap.get("title") or gap_text[:120] or "Regulatory reference mismatch").strip(),
+        "description": str(gap_text).strip(),
+        "affected_departments": affected_departments,
+        "overall_risk": overall_risk,
+        "severity_score": severity_score,
+        "business_impact": business_impact,
+        "recommended_action": recommended_action,
+    }
 
 
 def _infer_impact_severity(text: str) -> str:
@@ -1035,17 +1143,61 @@ def _normalize_gap_records(gaps: list[dict], limit: int = 10) -> list[dict]:
     for index, gap in enumerate(gaps or [], start=1):
         if not isinstance(gap, dict):
             continue
-        gap_text = str(gap.get("gap") or gap.get("title") or gap.get("issue") or gap.get("description") or "").strip()
+        regulation_clause = str(
+            gap.get("regulation_clause")
+            or gap.get("regulation_requirement")
+            or gap.get("regulation_evidence")
+            or ""
+        ).strip()
+        policy_clause = str(
+            gap.get("policy_clause")
+            or gap.get("policy_current_state")
+            or gap.get("policy_evidence")
+            or ""
+        ).strip()
+        if not policy_clause:
+            policy_clause = "No corresponding policy clause found"
+
+        gap_description = str(
+            gap.get("gap_description")
+            or gap.get("description")
+            or gap.get("reason")
+            or gap.get("issue")
+            or gap.get("gap")
+            or ""
+        ).strip()
+
+        gap_text = str(gap.get("gap") or gap.get("issue") or gap.get("title") or gap_description or "").strip()
         if not gap_text:
             continue
-        raw_reference = str(gap.get("reference") or gap.get("source") or gap.get("regulation_requirement") or "").strip()
-        reference = _extract_clause_reference(raw_reference) or _extract_clause_reference(gap_text) or f"GAP-{index:03d}"
+        raw_reference = str(gap.get("reference") or gap.get("source") or regulation_clause or "").strip()
+        reference = _extract_clause_reference(raw_reference) or _extract_clause_reference(regulation_clause) or _extract_clause_reference(gap_text) or f"GAP-{index:03d}"
         gap_id = str(gap.get("gap_id") or f"GAP-{index:03d}").strip()
         policy_blocks = gap.get("policy_blocks") if isinstance(gap.get("policy_blocks"), list) else []
         regulation_blocks = gap.get("regulation_blocks") if isinstance(gap.get("regulation_blocks"), list) else []
         source_blocks = gap.get("source_blocks") if isinstance(gap.get("source_blocks"), list) else []
         source_chunks = gap.get("source_chunks") if isinstance(gap.get("source_chunks"), list) else []
         severity = _strict_level(gap.get("severity") or gap.get("risk") or gap.get("risk_level"), default="medium")
+
+        impact = gap.get("impact") if isinstance(gap.get("impact"), dict) else {}
+        if not impact:
+            inferred_department = (_infer_impact_departments(gap_text) or ["Compliance"])[0]
+            impact = {
+                "department": inferred_department,
+                "risk_level": severity.title(),
+                "reason": trim_text(gap_description or f"Regulation clause and policy clause are misaligned for {gap_text}.", 260),
+            }
+
+        action = gap.get("action") if isinstance(gap.get("action"), dict) else {}
+        if not action:
+            action = {
+                "title": trim_text(f"Close gap: {gap_text}", 120),
+                "description": trim_text(
+                    str(gap.get("recommendation") or f"Update policy text and controls to satisfy: {regulation_clause or gap_text}"),
+                    260,
+                ),
+            }
+
         key = (gap_text.lower(), reference.lower(), severity, gap_id.lower())
         if key in seen:
             continue
@@ -1054,6 +1206,10 @@ def _normalize_gap_records(gaps: list[dict], limit: int = 10) -> list[dict]:
             {
                 "gap_id": gap_id,
                 "gap": trim_text(gap_text, 240),
+                "title": trim_text(str(gap.get("title") or gap_text), 140),
+                "regulation_clause": trim_text(regulation_clause or "Not specified in provided documents", 260),
+                "policy_clause": trim_text(policy_clause, 260),
+                "gap_description": trim_text(gap_description or f"Policy clause does not satisfy regulation clause for {gap_text}.", 280),
                 "reference": reference,
                 "regulation_reference": str(gap.get("regulation_reference") or reference).strip(),
                 "severity": severity,
@@ -1062,8 +1218,21 @@ def _normalize_gap_records(gaps: list[dict], limit: int = 10) -> list[dict]:
                 "regulation_blocks": [item for item in regulation_blocks if item],
                 "source_blocks": [item for item in source_blocks if item],
                 "source_chunks": [item for item in source_chunks if item],
-                "policy_evidence": str(gap.get("policy_evidence") or gap.get("policy_current_state") or "").strip(),
-                "regulation_evidence": str(gap.get("regulation_evidence") or gap.get("regulation_requirement") or "").strip(),
+                "policy_evidence": str(gap.get("policy_evidence") or policy_clause).strip(),
+                "regulation_evidence": str(gap.get("regulation_evidence") or regulation_clause).strip(),
+                "regulation_requirement": trim_text(regulation_clause or "Not specified in provided documents", 260),
+                "policy_current_state": trim_text(policy_clause, 260),
+                "description": trim_text(gap_description or f"Policy clause does not satisfy regulation clause for {gap_text}.", 280),
+                "recommendation": trim_text(str(action.get("description") or ""), 260),
+                "impact": {
+                    "department": trim_text(str(impact.get("department") or "Compliance"), 80),
+                    "risk_level": trim_text(str(impact.get("risk_level") or severity.title()), 20),
+                    "reason": trim_text(str(impact.get("reason") or "Not specified in provided documents"), 260),
+                },
+                "action": {
+                    "title": trim_text(str(action.get("title") or f"Close gap: {gap_text}"), 120),
+                    "description": trim_text(str(action.get("description") or "Not specified in provided documents"), 260),
+                },
             }
         )
         if len(records) >= limit:
@@ -1732,17 +1901,14 @@ def _build_gap_prompt(batch_index: int, pair_batches: list, batch: list, summary
     regulation_batch = "\n\n".join([f"[REG_{i + 1}]\n{item['left']}" for i, item in enumerate(batch)])
     policy_batch = "\n\n".join([f"[POL_{i + 1}]\n{item['right']}" for i, item in enumerate(batch)])
     return f"""
-You are a compliance auditor assessing gaps ONLY from provided context.
-Avoid repetition. Be concise but complete.
-Limit response to essential insights only. Avoid long explanations.
+You are a regulatory compliance expert performing CLAUSE-LEVEL analysis.
 
-TASK: Identify gaps where POLICY fails to meet REGULATION.
-
-CRITICAL:
-1. Use ONLY info from provided text
-2. Focus on HIGH-IMPACT gaps only
-3. Return empty compliance_gaps array if none found
-4. Do NOT assume unstated requirements
+STRICT RULES:
+1. Use ONLY information from provided regulation and policy text.
+2. Do NOT write generic statements such as "not fully covered", "needs improvement", "enhance monitoring", or "compliance gap identified".
+3. For every gap, include exact regulation clause text, exact policy clause text (or "No corresponding policy clause found"), exact mismatch, specific business impact, and actionable fix.
+4. Every field must be filled.
+5. Return empty compliance_gaps only when there is truly no mismatch.
 
 REFERENCE SUMMARY:
 {summary or "N/A"}
@@ -1759,10 +1925,20 @@ Return ONLY valid JSON. No explanation. No markdown. No text outside JSON.\n\nJS
 {{
   "compliance_gaps": [
     {{
-            "title": "Gap title",
-            "severity": "High | Medium | Low",
-            "description": "Specific mismatch between regulation and policy",
-            "recommendation": "Direct remediation action"
+                        "gap_id": "1",
+                        "regulation_clause": "Exact quoted regulation requirement",
+                        "policy_clause": "Exact quoted policy statement OR No corresponding policy clause found",
+                        "gap_description": "Exact mismatch between regulation clause and policy clause",
+                        "severity": "high | medium | low",
+                        "impact": {{
+                                "department": "Finance | Compliance | Operations | Risk | Legal | IT",
+                                "risk_level": "High | Medium | Low",
+                                "reason": "Specific business/regulatory impact"
+                        }},
+                        "action": {{
+                                "title": "Specific remediation title",
+                                "description": "Actionable implementation fix"
+                        }}
     }}
   ]
 }}
@@ -3250,15 +3426,24 @@ def detect_compliance_gaps(new_text: str, policy_text: str, changes: list[dict] 
 
                 if change_type == "missing_requirement":
                     gap_text = f"Missing RBI requirement: {field}"
-                    reason = f"Policy does not implement RBI rule for {field}; this can create direct non-compliance risk."
+                    reason = f"Policy clause is missing mandatory regulation requirement for {field}."
                 elif change_type == "modified_requirement":
                     gap_text = f"Policy rule differs from RBI for {field}"
                     reason = f"Policy value '{old_value or 'N/A'}' conflicts with RBI value '{new_value or 'N/A'}'."
                 elif change_type == "extra_policy_rule":
                     gap_text = f"Policy has extra rule not mapped to RBI: {field}"
-                    reason = "Policy contains a requirement not aligned to RBI source text and needs rationalization."
+                    reason = "Policy clause introduces a rule not present in regulation text."
                 else:
                     continue
+
+                regulation_clause = trim_text(new_value or evidence or field or "Not specified in provided documents", 260)
+                policy_clause = trim_text(old_value, 260) if old_value else "No corresponding policy clause found"
+                gap_description = trim_text(reason, 280)
+                inferred_department = (_infer_impact_departments(gap_text) or ["Compliance"])[0]
+                action_description = trim_text(
+                    f"Update policy clause to align exactly with regulation requirement: {regulation_clause}",
+                    260,
+                )
 
                 gaps.append(
                     {
@@ -3277,6 +3462,21 @@ def detect_compliance_gaps(new_text: str, policy_text: str, changes: list[dict] 
                         "regulation_blocks": source_blocks[:2] if source_blocks else [],
                         "source_blocks": source_blocks,
                         "source_chunks": source_chunks,
+                        "regulation_clause": regulation_clause,
+                        "policy_clause": policy_clause,
+                        "gap_description": gap_description,
+                        "impact": {
+                            "department": inferred_department,
+                            "risk_level": severity,
+                            "reason": trim_text(
+                                f"Mismatch can cause non-compliant execution for {field}, creating supervisory and penalty risk.",
+                                260,
+                            ),
+                        },
+                        "action": {
+                            "title": trim_text(f"Align policy clause for {field}", 120),
+                            "description": action_description,
+                        },
                     }
                 )
 
@@ -3354,10 +3554,34 @@ def detect_compliance_gaps(new_text: str, policy_text: str, changes: list[dict] 
                         "issue": trim_text(change_description, 220),
                         "risk": risk.title(),
                         "regulation_requirement": trim_text(change_description, 220),
-                        "policy_current_state": explanation or "Policy coverage is incomplete for this change.",
+                        "policy_current_state": explanation or "No corresponding policy clause found",
                         "status": status,
                         "policy_check": policy_check,
                         "relevant_policy_clauses": item.get("relevant_policy_clauses") or [],
+                        "regulation_clause": trim_text(change_description, 260),
+                        "policy_clause": trim_text(
+                            " | ".join([str(clause.get("title") or "").strip() for clause in (item.get("relevant_policy_clauses") or []) if isinstance(clause, dict)]),
+                            260,
+                        ) or "No corresponding policy clause found",
+                        "gap_description": trim_text(
+                            explanation or f"Policy clause does not satisfy regulation clause: {change_description}",
+                            280,
+                        ),
+                        "impact": {
+                            "department": (_infer_impact_departments(change_description) or ["Compliance"])[0],
+                            "risk_level": risk.title(),
+                            "reason": trim_text(
+                                f"Unresolved mismatch for '{change_description}' can cause regulatory breach and operational control failure.",
+                                260,
+                            ),
+                        },
+                        "action": {
+                            "title": trim_text(f"Remediate clause mismatch: {change_description}", 120),
+                            "description": trim_text(
+                                f"Update policy text and workflow controls to match regulation clause: {change_description}",
+                                260,
+                            ),
+                        },
                     }
                 )
 
@@ -3460,10 +3684,20 @@ Return ONLY valid JSON. No explanation. No markdown. No text outside JSON.\n\nJS
 {{
   "compliance_gaps": [
     {{
-      "issue": "Gap description <=2 lines",
-      "risk": "High | Medium | Low",
-      "regulation_requirement": "What regulation requires",
-      "policy_current_state": "What policy says/doesn't say"
+            "gap_id": "1",
+            "regulation_clause": "Exact quoted regulation requirement",
+            "policy_clause": "Exact quoted policy statement OR No corresponding policy clause found",
+            "gap_description": "Exact mismatch between regulation clause and policy clause",
+            "severity": "high | medium | low",
+            "impact": {{
+                "department": "Finance | Compliance | Operations | Risk | Legal | IT",
+                "risk_level": "High | Medium | Low",
+                "reason": "Specific business/regulatory impact"
+            }},
+            "action": {{
+                "title": "Specific remediation title",
+                "description": "Actionable implementation fix"
+            }}
     }}
   ]
 }}
@@ -3476,7 +3710,11 @@ PARTIAL_ANALYSES:
             merged = _safe_call(prompt=merge_prompt, max_tokens=MERGE_OUTPUT_TOKENS, retries=2, initial_backoff=4)
             if isinstance(merged, dict) and isinstance(merged.get("compliance_gaps"), list):
                 gaps = merged.get("compliance_gaps", [])
-                gaps = sorted(gaps, key=lambda g: _priority_value((g or {}).get("risk", "Low")), reverse=True)
+                gaps = sorted(
+                    gaps,
+                    key=lambda g: _priority_value((g or {}).get("risk") or (g or {}).get("severity") or "Low"),
+                    reverse=True,
+                )
                 deduped = deduplicate_items(gaps[:6])
                 strict_gaps = _normalize_gap_records(deduped, limit=10)
                 logger.info("deduplicated_output=%s", json.dumps({"compliance_gaps": deduped}, ensure_ascii=True)[:1200])
@@ -3519,11 +3757,11 @@ def analyze_impact(impact_input: dict) -> dict:
         prompt = f"""
     {RBI_ANALYSIS_RULES}
 
-Analyze business and compliance impacts from detected changes and gaps.
-Return only concrete, non-vague impacts.
-For EVERY compliance_gap, you MUST generate at least 1 impact.
-If no direct impact is found, infer logical business impact.
-Do not return an empty impacts array.
+    Analyze business and compliance impacts from detected changes and gaps.
+    Return only concrete, department-aware, structured impacts.
+    For EVERY compliance_gap, you MUST generate at least 1 impact.
+    If no direct impact is found, infer logical business impact.
+    Do not return an empty impacts array.
 
 Analyze these documents:
 
@@ -3540,9 +3778,14 @@ MAPPING RULES:
 
 IMPACT STRUCTURE:
 Each impact must include:
-- gap_reference (must exactly match a compliance gap reference)
-- impact (direct business/system consequence)
-- risk_level (low | medium | high)
+- impact_id
+- title
+- description
+- affected_departments (array of objects)
+- overall_risk
+- severity_score (0-100)
+- business_impact
+- recommended_action
 
 IMPACT GENERATION RULE:
 - For EACH compliance_gap generate at least one impact.
@@ -3560,11 +3803,20 @@ Return ONLY valid JSON. No explanation. No markdown. No text outside JSON.\n\nJS
 {{
   "impacts": [
     {{
-                        "gap_reference": "must match compliance gap reference",
-                        "impact": "Specific business/system consequence",
-                        "risk_level": "low | medium | high",
-                        "department": "Compliance | Risk | Finance | Operations",
-                        "source": "RBI clause reference or Not specified in provided documents"
+                                                "impact_id": "string",
+                                                "title": "string",
+                                                "description": "string",
+                                                "affected_departments": [
+                                                        {{
+                                                                "name": "string",
+                                                                "impact_level": "low | medium | high",
+                                                                "risk_score": 0
+                                                        }}
+                                                ],
+                                                "overall_risk": "low | medium | high",
+                                                "severity_score": 0,
+                                                "business_impact": "string",
+                                                "recommended_action": "string"
     }}
   ]
 }}

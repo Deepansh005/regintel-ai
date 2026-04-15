@@ -917,6 +917,18 @@ def _compute_department_risk_from_impacts(impacts: list[dict]) -> list[dict]:
     for impact in impacts or []:
         if not isinstance(impact, dict):
             continue
+        affected_departments = impact.get("affected_departments") if isinstance(impact.get("affected_departments"), list) else []
+        if affected_departments:
+            for department_item in affected_departments:
+                if not isinstance(department_item, dict):
+                    continue
+                department = str(department_item.get("name") or "").strip()
+                if not department:
+                    continue
+                risk_score = int(department_item.get("risk_score") or 0)
+                counts[department] = counts.get(department, 0) + max(1, risk_score // 25)
+            continue
+
         department = str(impact.get("department") or "").strip()
         if not department:
             continue
@@ -1209,54 +1221,67 @@ def _normalize_impact(payload):
     def _normalize_item(item):
         if not isinstance(item, dict):
             return {
-                "title": "Compliance Impact",
-                "description": "Impact identified from regulatory changes and policy gaps",
-                "severity": "Medium",
-                "impacted_departments": [],
-                "gap_id": "",
-                "gap_reference": "",
-                "source": "",
-                "impact": "Impact identified from regulatory changes and policy gaps",
-                "reason": "Impact identified from regulatory changes and policy gaps",
-                "risk_level": "medium",
-                "based_on_blocks": [],
-                "source_chunks": [],
+                "impact_id": "IMPACT-000",
+                "title": "Regulatory reference mismatch",
+                "description": "Impact data unavailable",
+                "affected_departments": [],
+                "overall_risk": "low",
+                "severity_score": 0,
+                "business_impact": "Impact data unavailable",
+                "recommended_action": "Impact data unavailable",
             }
 
-        departments = item.get("impacted_departments")
-        if not isinstance(departments, list):
-            departments = item.get("departments")
-        if not isinstance(departments, list):
-            departments = item.get("department")
-
-        if isinstance(departments, str):
-            departments = [departments]
+        departments = item.get("affected_departments")
         if not isinstance(departments, list):
             departments = []
 
         normalized_departments = []
         seen_departments = set()
         for department in departments:
-            label = str(department or "").strip()
-            if not label:
+            if not isinstance(department, dict):
                 continue
-            key = label.lower()
+            name = str(department.get("name") or "").strip()
+            impact_level = str(department.get("impact_level") or "low").strip().lower()
+            if impact_level not in {"low", "medium", "high"}:
+                impact_level = "low"
+            risk_score = int(department.get("risk_score") or 0)
+            if not name:
+                continue
+            key = name.lower()
             if key in seen_departments:
                 continue
             seen_departments.add(key)
-            normalized_departments.append(label)
+            normalized_departments.append({"name": name, "impact_level": impact_level, "risk_score": max(0, min(100, risk_score))})
+
+        overall_risk = str(item.get("overall_risk") or "low").strip().lower()
+        if overall_risk not in {"low", "medium", "high"}:
+            overall_risk = "low"
+
+        severity_score = int(item.get("severity_score") or 0)
+        severity_score = max(0, min(100, severity_score))
+
+        title = str(item.get("title") or item.get("area") or "Regulatory reference mismatch").strip()
+        description = str(item.get("description") or item.get("summary") or item.get("impact") or "Mismatch between regulation and policy clauses").strip()
+        business_impact = str(item.get("business_impact") or item.get("reason") or "May cause regulatory penalties or audit findings if not corrected.").strip()
+        recommended_action = str(item.get("recommended_action") or item.get("action") or "Update policy to match the regulation clause.").strip()
 
         return {
-            "title": str(item.get("title") or item.get("area") or "Compliance Impact").strip(),
-            "description": str(item.get("description") or item.get("summary") or "Impact identified from regulatory changes and policy gaps").strip(),
-            "severity": _normalize_severity(item.get("severity")),
-            "impacted_departments": normalized_departments,
+            "impact_id": str(item.get("impact_id") or item.get("gap_id") or "").strip(),
+            "title": title,
+            "description": description,
+            "affected_departments": normalized_departments,
+            "overall_risk": overall_risk,
+            "severity_score": severity_score,
+            "business_impact": business_impact,
+            "recommended_action": recommended_action,
+            "severity": _normalize_severity(item.get("severity") or overall_risk),
+            "impacted_departments": [entry.get("name") for entry in normalized_departments if entry.get("name")],
             "gap_id": str(item.get("gap_id") or "").strip(),
             "gap_reference": str(item.get("gap_reference") or item.get("reference") or "").strip(),
-            "impact": str(item.get("impact") or item.get("description") or item.get("summary") or "").strip(),
-            "reason": str(item.get("reason") or item.get("description") or item.get("summary") or "").strip(),
-            "risk_level": str(item.get("risk_level") or "").strip(),
-            "source": str(item.get("source") or item.get("evidence") or "").strip(),
+            "impact": description,
+            "reason": business_impact,
+            "risk_level": overall_risk,
+            "source": str(item.get("source") or item.get("evidence") or "Not specified in provided documents").strip() or "Not specified in provided documents",
             "based_on_blocks": item.get("based_on_blocks") if isinstance(item.get("based_on_blocks"), list) else [],
             "source_chunks": item.get("source_chunks") if isinstance(item.get("source_chunks"), list) else [],
         }
@@ -1269,7 +1294,41 @@ def _normalize_impact(payload):
     elif isinstance(payload, list):
         raw_impacts = payload
 
-    return [_normalize_item(item) for item in raw_impacts if isinstance(item, dict)]
+    normalized = [_normalize_item(item) for item in raw_impacts if isinstance(item, dict)]
+    if not normalized and isinstance(payload, dict) and isinstance(payload.get("compliance_gaps"), list):
+        for gap in payload.get("compliance_gaps", []):
+            if not isinstance(gap, dict):
+                continue
+            normalized.append(
+                {
+                    "impact_id": str(gap.get("gap_id") or "").strip(),
+                    "title": str(gap.get("title") or gap.get("gap") or "Regulatory reference mismatch").strip(),
+                    "description": str(gap.get("gap_description") or gap.get("description") or "Mismatch between regulation and policy clauses").strip(),
+                    "affected_departments": [
+                        {
+                            "name": str((gap.get("impact") or {}).get("department") if isinstance(gap.get("impact"), dict) else "Compliance").strip() or "Compliance",
+                            "impact_level": str((gap.get("impact") or {}).get("risk_level") if isinstance(gap.get("impact"), dict) else gap.get("severity") or "low").strip().lower() or "low",
+                            "risk_score": int((gap.get("impact") or {}).get("risk_score") if isinstance(gap.get("impact"), dict) else 25),
+                        }
+                    ],
+                    "overall_risk": str(gap.get("severity") or "low").strip().lower() or "low",
+                    "severity_score": int(gap.get("severity_score") or 25),
+                    "business_impact": str((gap.get("impact") or {}).get("reason") if isinstance(gap.get("impact"), dict) else gap.get("gap_description") or "May result in regulatory penalties if not updated.").strip(),
+                    "recommended_action": str((gap.get("action") or {}).get("description") if isinstance(gap.get("action"), dict) else gap.get("recommendation") or "Update policy to match regulation clause.").strip(),
+                    "severity": str(gap.get("severity") or "medium").strip().title(),
+                    "impacted_departments": ["Compliance"],
+                    "gap_id": str(gap.get("gap_id") or "").strip(),
+                    "gap_reference": str(gap.get("reference") or gap.get("regulation_reference") or "").strip(),
+                    "impact": str(gap.get("gap_description") or gap.get("description") or "").strip(),
+                    "reason": str((gap.get("impact") or {}).get("reason") if isinstance(gap.get("impact"), dict) else gap.get("gap_description") or "").strip(),
+                    "risk_level": str(gap.get("severity") or "low").strip().lower() or "low",
+                    "source": str(gap.get("source") or "Not specified in provided documents").strip() or "Not specified in provided documents",
+                    "based_on_blocks": gap.get("source_blocks") if isinstance(gap.get("source_blocks"), list) else [],
+                    "source_chunks": gap.get("source_chunks") if isinstance(gap.get("source_chunks"), list) else [],
+                }
+            )
+
+    return normalized
 
 
 def _normalize_actions(payload):
